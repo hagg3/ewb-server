@@ -1,0 +1,34 @@
+# --- Local-only, never published ---
+CLAUDE.md
+WORKING/
+
+# --- Compiled server + offline test binaries (rebuilt by build_server.sh) ---
+/edenserver
+/snapz_codec_test
+/region_test
+/protocol_test
+*.o
+*.obj
+
+# --- Runtime state written when ./edenserver is run from the repo root ---
+/eden_players.txt
+/eden_world.model
+/eden_signs.txt
+/eden_world.edits
+
+# --- Logs ---
+logs/*.log
+logs/*.txt
+!logs/.gitkeep
+
+# --- MSVC / Windows build tree (reference project is TCPServer.zip + TCPServer.vcxproj) ---
+x64/
+TCPServer/
+*.pdb
+*.ilk
+*.idb
+*.exe
+*.tlog
+
+# --- OS cruft ---
+.DS_Store
