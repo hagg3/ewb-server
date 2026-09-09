@@ -1,6 +1,7 @@
 #!/bin/bash
 # Create a multiplayer server that hosts a specific (single-player) world file,
 # registered with a matchmaker so it shows up in the in-game server browser.
+# Run ./edenmatch on the matchmaker host first (see docs/matchmaker.md).
 #
 # Usage:
 #   ./host_world.sh <worldFile> [name] [port] [password] [matchmakerHost]

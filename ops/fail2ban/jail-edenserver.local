@@ -1,0 +1,19 @@
+# fail2ban jail — edenserver
+#
+# Install: copy to /etc/fail2ban/jail.d/edenserver.local (alongside the filter at
+# /etc/fail2ban/filter.d/edenserver-auth.conf), then `systemctl reload fail2ban`.
+# Check with `fail2ban-client status edenserver`.
+#
+# Tune `port` to match your --port. The window/count here are deliberately looser
+# than edenserver's own --auth-fail-limit: the server handles the fast burst,
+# this catches the slow persistent guesser (e.g. 1 try/minute for an hour).
+
+[edenserver]
+enabled  = true
+backend  = systemd
+filter   = edenserver-auth
+port     = 27015
+protocol = tcp
+maxretry = 10
+findtime = 1h
+bantime  = 24h

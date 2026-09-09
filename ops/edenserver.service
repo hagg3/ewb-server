@@ -1,0 +1,83 @@
+# edenserver.service — systemd unit for the standalone Eden world-backend server.
+#
+# Install:   cp ops/edenserver.service /etc/systemd/system/edenserver.service
+#            (edit the paths / args below to match your box, then:)
+#            systemctl daemon-reload && systemctl enable --now edenserver
+#
+# See ops/INSTALL.md for the full runbook (creating the user, firewall, backups,
+# verifying the exit criteria).
+#
+# ---------------------------------------------------------------------------
+# Logging / std::unitbuf
+#   edenserver calls `std::cout << std::unitbuf` at startup so every log line is
+#   flushed immediately instead of sitting in a block buffer until the process
+#   exits. That is what makes `journalctl -u edenserver -f` show live output.
+#   To keep it working: run the binary DIRECTLY (as ExecStart does below). Do not
+#   wrap it in a shell pipeline, `stdbuf`, `tee`, or anything that re-buffers its
+#   stdout — that would defeat the unitbuf and logs would only appear in chunks.
+#   StandardOutput=journal already gives journald the raw stream.
+#
+# ---------------------------------------------------------------------------
+# Restart policy — why NOT Restart=always
+#   --idle-timeout makes the server exit(0) *cleanly* once it has had no players
+#   for N seconds (for on-demand / matchmaker-spawned worlds). systemd's
+#   Restart=always restarts a unit on ANY exit, clean or not — so pairing it with
+#   --idle-timeout produces a restart loop: start, sit idle, exit(0), restart,
+#   sit idle, exit(0)... forever, hammering the CPU and the journal.
+#   Restart=on-failure only restarts on a non-zero exit / signal, so a crash is
+#   recovered but a deliberate idle exit is respected. This unit does not pass
+#   --idle-timeout (an always-on server wants to stay up); if you add it, keep
+#   Restart=on-failure. If you switch to Restart=always, remove --idle-timeout.
+# ---------------------------------------------------------------------------
+
+[Unit]
+Description=Eden world-backend server
+Documentation=https://github.com/hagg3/ewb-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Dedicated unprivileged user — see ops/INSTALL.md for `useradd`.
+User=edenserver
+Group=edenserver
+
+# WorkingDirectory is the world directory: edenserver reads/writes
+# eden_world.model, eden_players.txt and eden_signs.txt relative to CWD, and (in
+# a later phase) puts its control socket here too. One directory to back up.
+WorkingDirectory=/var/lib/edenserver/world
+
+# Adjust the port / name to taste. Paths are relative to WorkingDirectory.
+# Add --matchmaker HOST[:PORT] only if you are self-hosting a matchmaker.
+# Do NOT add --idle-timeout here unless you also keep Restart=on-failure (above).
+ExecStart=/usr/local/bin/edenserver --port 27015 --name "Eden Server" --world eden_world.model --signs eden_signs.txt
+
+Restart=on-failure
+RestartSec=2s
+
+# Live logs to the journal: journalctl -u edenserver -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=edenserver
+
+# --- Sandboxing (defence in depth; the server is network-facing) ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# The only path the service may write to:
+ReadWritePaths=/var/lib/edenserver
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

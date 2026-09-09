@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <iterator>
 #include <string>
@@ -204,6 +205,134 @@ class ConnectLimiter {
     double window_;
     size_t max_tracked_;
     std::unordered_map<std::string, std::vector<double>> hits_;
+};
+
+// --- constant-time password compare ----------------------------------------
+
+/// Length-independent byte compare for the `JOIN` password check (stage 1.10).
+/// Not a crypto primitive — network jitter dwarfs any timing signal a LAN peer
+/// could measure — but it removes `a != b`'s data-dependent early-out for free
+/// and is trivial to get right. Runs over the longer of the two lengths, so a
+/// length mismatch costs the same as a content mismatch and folds the size
+/// difference into the result.
+inline bool const_time_eq(const std::string& a, const std::string& b) {
+    const size_t n = a.size() > b.size() ? a.size() : b.size();
+    unsigned char diff = static_cast<unsigned char>((a.size() ^ b.size()) != 0);
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char ca = i < a.size() ? static_cast<unsigned char>(a[i]) : 0;
+        const unsigned char cb = i < b.size() ? static_cast<unsigned char>(b[i]) : 0;
+        diff |= static_cast<unsigned char>(ca ^ cb);
+    }
+    return diff == 0;
+}
+
+// --- per-IP failed-auth limiter --------------------------------------------
+
+/// Per-IP wrong-password throttle (stage 1.10). Mirrors ConnectLimiter — pure,
+/// `now`-injected (seconds, monotonic), sliding window, capped tracking — but
+/// with an escalating lockout: once an IP records `threshold` failures inside
+/// `window` seconds it is `blocked()` for a `cooldown` that starts at
+/// `base_cooldown` and doubles on every further failure up to `max_cooldown`.
+/// An IP that stops guessing for a whole `max_cooldown` has its escalation reset.
+///
+/// ⚠️ Unlike ConnectLimiter this **evicts the oldest entry rather than failing
+/// open** when the tracking table is full: an over-full auth table is an attack
+/// signal, not normal load, and the cost of a wrong eviction is a brief lockout
+/// of one IP, not the memory blow-up a fail-open connect table would risk.
+///
+/// Per-IP only — a distributed guesser (many IPs, few tries each) still slips
+/// through; see ROADMAP-SERVER §1.10 for the layered mitigations (loud global
+/// counter, fail2ban jail, and ultimately an identity allow-list).
+class AuthFailureLimiter {
+  public:
+    AuthFailureLimiter(size_t threshold = 5, double window_sec = 60.0,
+                       double base_cooldown = 60.0, double max_cooldown = 3600.0,
+                       size_t max_tracked = 8192)
+        : threshold_(threshold), window_(window_sec),
+          base_cooldown_(base_cooldown), max_cooldown_(max_cooldown),
+          max_tracked_(max_tracked) {}
+
+    /// 0 threshold = feature off (every call is a no-op / never blocks).
+    void set_threshold(size_t t) { threshold_ = t; }
+    bool enabled() const { return threshold_ > 0; }
+
+    /// True while `ip` is inside its lockout window.
+    bool blocked(const std::string& ip, double now) const {
+        if (!enabled()) return false;
+        auto it = entries_.find(ip);
+        return it != entries_.end() && now < it->second.blocked_until;
+    }
+
+    /// Record one wrong-password attempt from `ip`. Returns the number of
+    /// failures now counted inside the sliding window (0 when disabled).
+    size_t record_failure(const std::string& ip, double now) {
+        if (!enabled()) return 0;
+        auto it = entries_.find(ip);
+        if (it == entries_.end()) {
+            if (entries_.size() >= max_tracked_) {
+                sweep(now);
+                if (entries_.size() >= max_tracked_) evict_oldest();
+            }
+            it = entries_.emplace(ip, Entry{}).first;
+        }
+        Entry& e = it->second;
+        // Reset escalation for an IP that went quiet for a full max_cooldown.
+        if (e.last_failure > 0.0 && now - e.last_failure > max_cooldown_)
+            e.cooldown = 0.0;
+        prune(e.recent, now);
+        e.recent.push_back(now);
+        e.last_failure = now;
+        if (e.recent.size() >= threshold_) {
+            e.cooldown = (e.cooldown <= 0.0)
+                             ? base_cooldown_
+                             : std::min(e.cooldown * 2.0, max_cooldown_);
+            e.blocked_until = now + e.cooldown;
+        }
+        return e.recent.size();
+    }
+
+    size_t tracked() const { return entries_.size(); }
+
+    /// Drop every IP that is neither blocked nor has an in-window failure and has
+    /// been idle for a full max_cooldown.
+    void sweep(double now) {
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            prune(it->second.recent, now);
+            const Entry& e = it->second;
+            const bool idle = e.recent.empty() && now >= e.blocked_until &&
+                              now - e.last_failure > max_cooldown_;
+            it = idle ? entries_.erase(it) : std::next(it);
+        }
+    }
+
+  private:
+    struct Entry {
+        std::vector<double> recent;     // failure timestamps inside the window
+        double blocked_until = 0.0;
+        double cooldown = 0.0;          // current escalation level (seconds)
+        double last_failure = 0.0;
+    };
+
+    void prune(std::vector<double>& v, double now) {
+        const double cutoff = now - window_;
+        size_t keep = 0;
+        while (keep < v.size() && v[keep] <= cutoff) ++keep;
+        if (keep) v.erase(v.begin(), v.begin() + static_cast<long>(keep));
+    }
+
+    void evict_oldest() {
+        auto oldest = entries_.begin();
+        for (auto it = entries_.begin(); it != entries_.end(); ++it)
+            if (it->second.last_failure < oldest->second.last_failure) oldest = it;
+        if (oldest != entries_.end()) entries_.erase(oldest);
+    }
+
+    size_t threshold_;
+    double window_;
+    double base_cooldown_;
+    double max_cooldown_;
+    size_t max_tracked_;
+    std::unordered_map<std::string, Entry> entries_;
 };
 
 }  // namespace ewb

@@ -1,0 +1,100 @@
+#!/bin/sh
+# edenserverctl — thin management wrapper for the edenserver systemd unit.
+#
+#   edenserverctl start | stop | restart | status | logs [N] | backup
+#
+# It is a convenience layer over `systemctl` and `journalctl -u`, plus a
+# world-file backup. Nothing here does anything you could not do by hand with
+# those two tools; it just spares you remembering the unit name and the world
+# path. See ops/INSTALL.md.
+#
+# Configuration (environment overrides, all optional):
+#   EDENSERVER_SERVICE     systemd unit name          (default: edenserver)
+#   EDENSERVER_WORLD_DIR   world directory to back up  (default: /var/lib/edenserver/world)
+#   EDENSERVER_BACKUP_DIR  where backups are written   (default: /var/lib/edenserver/backups)
+
+set -eu
+
+SERVICE="${EDENSERVER_SERVICE:-edenserver}"
+WORLD_DIR="${EDENSERVER_WORLD_DIR:-/var/lib/edenserver/world}"
+BACKUP_DIR="${EDENSERVER_BACKUP_DIR:-/var/lib/edenserver/backups}"
+
+# Files that make up a world. Missing ones are skipped (a fresh world has no
+# signs sidecar, a world nobody has joined has no players file).
+WORLD_FILES="eden_world.model eden_players.txt eden_signs.txt"
+
+usage() {
+    cat <<EOF
+Usage: edenserverctl <command>
+
+  start            systemctl start $SERVICE
+  stop             systemctl stop $SERVICE
+  restart          systemctl restart $SERVICE
+  status           systemctl status $SERVICE (falls back to is-active)
+  logs [N]         journalctl -u $SERVICE -n N (default 200), then follow (-f)
+  backup           copy the world files to a timestamped dir under
+                   $BACKUP_DIR
+
+Environment: EDENSERVER_SERVICE, EDENSERVER_WORLD_DIR, EDENSERVER_BACKUP_DIR
+EOF
+}
+
+do_backup() {
+    # Ask the running server to flush first, so the backup is current rather than
+    # up-to-one-autosave-interval stale. Best-effort: if the control socket is
+    # absent (server stopped, or --no-control-socket) we fall through to a plain
+    # cp, which is still safe — edenserver only ever publishes a world/player file
+    # by writing a temp file and rename(2)-ing it into place (atomic on POSIX), so
+    # a reader never sees a half-written file.
+    sock="${EDENSERVER_CONTROL_SOCKET:-$WORLD_DIR/edenserver.sock}"
+    if [ -S "$sock" ] && command -v edenctl >/dev/null 2>&1; then
+        edenctl -S "$sock" save >/dev/null 2>&1 || true
+    fi
+
+    if [ ! -d "$WORLD_DIR" ]; then
+        echo "edenserverctl: world dir not found: $WORLD_DIR" >&2
+        exit 1
+    fi
+
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    dest="$BACKUP_DIR/$stamp"
+    mkdir -p "$dest"
+
+    copied=0
+    for f in $WORLD_FILES; do
+        if [ -f "$WORLD_DIR/$f" ]; then
+            cp -p "$WORLD_DIR/$f" "$dest/$f"
+            copied=$((copied + 1))
+        fi
+    done
+
+    if [ "$copied" -eq 0 ]; then
+        rmdir "$dest" 2>/dev/null || true
+        echo "edenserverctl: no world files found in $WORLD_DIR" >&2
+        exit 1
+    fi
+
+    echo "Backed up $copied file(s) to $dest"
+    ls -l "$dest"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+    start)   exec systemctl start   "$SERVICE" ;;
+    stop)    exec systemctl stop    "$SERVICE" ;;
+    restart) exec systemctl restart "$SERVICE" ;;
+    status)
+        systemctl status "$SERVICE" --no-pager || systemctl is-active "$SERVICE"
+        ;;
+    logs)
+        n="${2:-200}"
+        exec journalctl -u "$SERVICE" -n "$n" -f
+        ;;
+    backup)  do_backup ;;
+    ""|-h|--help|help) usage ;;
+    *)
+        echo "edenserverctl: unknown command: $cmd" >&2
+        usage >&2
+        exit 2
+        ;;
+esac

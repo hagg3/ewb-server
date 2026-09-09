@@ -1,0 +1,99 @@
+#!/bin/sh
+# edenctl — client for the edenserver Tier 1 operator control socket (stage 3.2).
+#
+#   edenctl [-S <socket>] <command> [args...]
+#
+# The control socket is a 0600 unix domain socket; being able to open it *is* the
+# authorisation (it is owned by the service user, and a UDS has no address to
+# misconfigure into being remote). This wrapper just frames one command line and
+# prints the reply.
+#
+# The line grammar is `verb[:rest]` — edenctl joins the command's arguments with
+# ':' to build it, so `edenctl say hello world` sends `say:hello world` and
+# `edenctl fill 0 0 0 8 8 8 5` sends `fill:0:0:0:8:8:8:5`.
+#
+#   edenctl help
+#   edenctl who
+#   edenctl say "server restarting in 5 minutes"
+#   edenctl kick Griefer "spamming chat"
+#   edenctl ban 203.0.113.9
+#   edenctl setblock 65536 40 65536 5
+#   edenctl fill 65530 33 65530 65542 33 65542 3 14
+#   edenctl signs add 65536 34 65540 0 0 0 "Spawn — no griefing"
+#   edenctl region-stats
+#   edenctl save
+#   edenctl stop
+#
+# Socket path resolution (first hit wins):
+#   -S <path>  ·  $EDENSERVER_CONTROL_SOCKET  ·  ./edenserver.sock
+#   ·  $EDENSERVER_WORLD_DIR/edenserver.sock  ·  /var/lib/edenserver/world/edenserver.sock
+
+set -eu
+
+SOCK=""
+if [ "${1:-}" = "-S" ]; then
+    SOCK="${2:?-S needs a path}"
+    shift 2
+fi
+
+if [ -z "$SOCK" ]; then
+    for cand in \
+        "${EDENSERVER_CONTROL_SOCKET:-}" \
+        "./edenserver.sock" \
+        "${EDENSERVER_WORLD_DIR:+$EDENSERVER_WORLD_DIR/edenserver.sock}" \
+        "/var/lib/edenserver/world/edenserver.sock"
+    do
+        [ -n "$cand" ] || continue
+        if [ -S "$cand" ]; then SOCK="$cand"; break; fi
+    done
+fi
+
+if [ -z "$SOCK" ] || [ ! -S "$SOCK" ]; then
+    echo "edenctl: no control socket found${SOCK:+ at $SOCK}." >&2
+    echo "         pass -S <path> or set EDENSERVER_CONTROL_SOCKET." >&2
+    exit 1
+fi
+
+if [ "$#" -eq 0 ]; then
+    set -- help
+fi
+
+# Build the wire line: first arg is the verb, the rest are joined with ':'.
+verb="$1"; shift
+line="$verb"
+for a in "$@"; do
+    line="$line:$a"
+done
+
+# Send one line, print the reply, close. Prefer a UNIX-socket-capable nc, then
+# socat, then a tiny python fallback so this works on a stock box either way.
+send() {
+    if command -v nc >/dev/null 2>&1 && nc -h 2>&1 | grep -q ' -U'; then
+        printf '%s\n' "$line" | nc -U -w 2 "$SOCK"
+    elif command -v socat >/dev/null 2>&1; then
+        printf '%s\n' "$line" | socat -t2 - "UNIX-CONNECT:$SOCK"
+    elif command -v python3 >/dev/null 2>&1; then
+        LINE="$line" SOCK="$SOCK" python3 - <<'PY'
+import os, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(2)
+s.connect(os.environ["SOCK"])
+s.sendall((os.environ["LINE"] + "\n").encode())
+s.shutdown(socket.SHUT_WR)
+while True:
+    try:
+        b = s.recv(4096)
+    except socket.timeout:
+        break
+    if not b:
+        break
+    sys.stdout.buffer.write(b)
+sys.stdout.flush()
+PY
+    else
+        echo "edenctl: need one of nc (-U), socat, or python3." >&2
+        exit 1
+    fi
+}
+
+send

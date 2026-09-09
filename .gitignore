@@ -4,9 +4,13 @@ WORKING/
 
 # --- Compiled server + offline test binaries (rebuilt by build_server.sh) ---
 /edenserver
+/edenmatch
 /snapz_codec_test
 /region_test
 /protocol_test
+/matchmaker_test
+/control_test
+/worldedit_test
 *.o
 *.obj
 
@@ -15,6 +19,9 @@ WORKING/
 /eden_world.model
 /eden_signs.txt
 /eden_world.edits
+/eden_bans.txt
+/eden_ops.txt
+/edenserver.sock
 
 # --- Logs ---
 logs/*.log

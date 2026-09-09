@@ -1,7 +1,8 @@
-// protocol_test.cpp — offline checks for ROADMAP-SERVER stages 1.5 and 1.7:
+// protocol_test.cpp — offline checks for ROADMAP-SERVER stages 1.5, 1.7 and 1.10:
 // the sign sidecar / `SIGNP` wire format, and the hardening primitives
 // (username validation, `ACTION` payload validation, token bucket, per-IP
-// connect limiter, text sanitisation).
+// connect limiter, constant-time password compare, per-IP failed-auth limiter,
+// text sanitisation).
 //
 //   clang++ -std=c++17 -O2 -Wall protocol_test.cpp -o protocol_test
 //   ./protocol_test
@@ -227,6 +228,53 @@ static void test_connect_limiter() {
     CHECK(small.tracked() <= 4, "and is not tracked");
 }
 
+// --- constant-time compare + auth throttle (stage 1.10) --------------------
+
+static void test_const_time_eq() {
+    CHECK(ewb::const_time_eq("hunter2", "hunter2"), "equal strings compare equal");
+    CHECK(!ewb::const_time_eq("hunter2", "hunter3"), "one byte different");
+    CHECK(!ewb::const_time_eq("hunter2", "hunter22"), "prefix but shorter");
+    CHECK(!ewb::const_time_eq("", "x"), "empty vs non-empty");
+    CHECK(ewb::const_time_eq("", ""), "empty vs empty");
+    CHECK(ewb::const_time_eq(std::string("\x00\x01", 2), std::string("\x00\x01", 2)),
+          "embedded NUL is compared, not treated as terminator");
+}
+
+static void test_auth_failure_limiter() {
+    // threshold 3, 60 s window, 10 s base cooldown doubling to 40 s cap.
+    ewb::AuthFailureLimiter lim(3, 60.0, 10.0, 40.0);
+
+    CHECK(!lim.blocked("10.0.0.1", 0.0), "unknown IP is not blocked");
+    CHECK(lim.record_failure("10.0.0.1", 0.0) == 1, "first failure counted");
+    CHECK(lim.record_failure("10.0.0.1", 1.0) == 2, "second failure counted");
+    CHECK(!lim.blocked("10.0.0.1", 1.5), "still under threshold");
+    CHECK(lim.record_failure("10.0.0.1", 2.0) == 3, "third failure hits threshold");
+    CHECK(lim.blocked("10.0.0.1", 5.0), "blocked at base cooldown");
+    CHECK(lim.blocked("10.0.0.1", 11.9), "still blocked just before cooldown ends");
+    CHECK(!lim.blocked("10.0.0.1", 12.1), "unblocked after 10 s base cooldown");
+
+    // A different IP is independent.
+    CHECK(!lim.blocked("10.0.0.2", 12.1), "other IP unaffected");
+
+    // Next failure doubles the cooldown to 20 s.
+    CHECK(lim.record_failure("10.0.0.1", 13.0) >= 3, "failure while window still has hits");
+    CHECK(lim.blocked("10.0.0.1", 32.0), "still blocked 19 s later (cooldown doubled to 20 s)");
+    CHECK(!lim.blocked("10.0.0.1", 33.1), "unblocked after 20 s");
+
+    // Disabled limiter never blocks.
+    ewb::AuthFailureLimiter off(0);
+    for (int i = 0; i < 100; ++i) off.record_failure("1.2.3.4", (double)i);
+    CHECK(!off.blocked("1.2.3.4", 100.0), "threshold 0 disables the lockout");
+
+    // Table full -> evict oldest rather than fail open.
+    ewb::AuthFailureLimiter small(1, 60.0, 10.0, 40.0, /*max_tracked=*/4);
+    for (int i = 0; i < 4; ++i) small.record_failure("192.168.0." + std::to_string(i), (double)i);
+    CHECK(small.tracked() <= 4, "table capped");
+    small.record_failure("192.168.9.9", 100.0);
+    CHECK(small.tracked() <= 4, "still capped after a new IP");
+    CHECK(small.blocked("192.168.9.9", 100.5), "the new IP is tracked and blocked, not dropped");
+}
+
 // --- text sanitisation (stages 1.5/1.6/1.7) ----------------------------------
 
 static void test_sanitize_text() {
@@ -247,6 +295,8 @@ int main() {
     test_action_extra_validation();
     test_token_bucket();
     test_connect_limiter();
+    test_const_time_eq();
+    test_auth_failure_limiter();
     test_sanitize_text();
 
     if (g_fail) {
