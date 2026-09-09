@@ -51,6 +51,9 @@ static void put_u64(std::vector<uint8_t>& v, uint64_t x) {
     for (int i = 0; i < 8; ++i) v.push_back(uint8_t(x >> (8 * i)));
 }
 static void put_i32(std::vector<uint8_t>& v, int32_t x) { put_u32(v, uint32_t(x)); }
+static void put_u32_at(std::vector<uint8_t>& v, size_t at, uint32_t x) {
+    for (int i = 0; i < 4; ++i) v[at + i] = uint8_t(x >> (8 * i));
+}
 static void put_f32(std::vector<uint8_t>& v, float f) {
     uint32_t u; std::memcpy(&u, &f, 4); put_u32(v, u);
 }
@@ -368,6 +371,73 @@ static void test_detect_min_gap_fallback() {
     w.chunks.push_back(flat_chunk(4, 20, 21));
     EdenWorld world = eden_load(build_world(w));
     CHECK(world.chunk_size == 32768, "min-gap fallback: 32768-apart chunks → 64z");
+
+    // The other half of the fallback, and the one that costs a whole world if
+    // it is wrong: two 256z chunks 131072 apart, again with a creature gap that
+    // is a valid slot count for neither size. The fallback must answer 256z —
+    // answering 64z here reads every chunk at a quarter of its real height.
+    WorldSpec big;
+    big.version = 0;
+    big.creature_gap = 5000;
+    big.chunks.push_back(flat_chunk(16, 20, 20));
+    big.chunks.push_back(flat_chunk(16, 20, 21));
+    EdenWorld bw = eden_load(build_world(big));
+    CHECK(bw.chunk_size == 131072, "min-gap fallback: 131072-apart chunks → 256z");
+    CHECK(bw.bands == 16 && bw.chunks.size() == 2, "min-gap fallback: 256z bands, both chunks");
+    if (bw.chunks.size() == 2)
+        CHECK(bw.chunks[0].span() == 131072, "min-gap fallback: full 256z span");
+
+    // Single chunk, creature-gap abstains: the only evidence is whether a 256z
+    // chunk fits before the directory. A 64z chunk plus its <= 24,000-byte
+    // creature block cannot reach 131,072, so "it fits" means 256z.
+    WorldSpec one;
+    one.version = 0;
+    one.creature_gap = 5000;
+    one.chunks.push_back(flat_chunk(16));
+    CHECK(eden_load(build_world(one)).chunk_size == 131072,
+          "min-gap fallback: lone 256z chunk resolved by directory headroom");
+    WorldSpec one64;
+    one64.version = 0;
+    one64.creature_gap = 5000;
+    one64.chunks.push_back(flat_chunk(4));
+    CHECK(eden_load(build_world(one64)).chunk_size == 32768,
+          "min-gap fallback: lone 64z chunk stays 64z");
+}
+
+// A directory row's `off` is arbitrary bytes out of the file. A row whose
+// offset is near 2^64 must be rejected, not wrapped into range by `off +
+// chunk_size` — the wrapped form passes a naive bounds test and then reads
+// wildly out of the buffer. Same for a row pointing into the directory itself,
+// whose bytes would otherwise be decoded as voxels.
+static void test_hostile_directory_offsets() {
+    WorldSpec w;
+    w.version = 4;
+    w.chunks.push_back(flat_chunk(4, 7, 7));
+    std::vector<uint8_t> bytes = build_world(w);
+
+    const uint64_t dir_offset = 192 + 32768;
+    auto with_extra_row = [&](int32_t cx, int32_t cy, uint64_t off) {
+        std::vector<uint8_t> v = bytes;
+        put_i32(v, cx); put_i32(v, cy); put_u64(v, off);
+        return v;
+    };
+
+    // off + 32768 wraps to 100, which is <= the file size.
+    EdenWorld wrapped = eden_load(with_extra_row(1, 1, ~uint64_t(0) - 32768 + 101));
+    CHECK(wrapped.chunks.size() == 1, "hostile: wrapping offset row rejected");
+    for (auto& c : wrapped.chunks)
+        CHECK(c.off + c.span() <= wrapped.size() && c.end >= c.off,
+              "hostile: every kept chunk stays inside the buffer");
+
+    // A row pointing at the directory would decode directory bytes as voxels.
+    EdenWorld in_dir = eden_load(with_extra_row(2, 2, dir_offset + 16));
+    CHECK(in_dir.chunks.size() == 1, "hostile: row pointing into the directory rejected");
+
+    // Detection must not be skewed by either, and the good chunk survives.
+    CHECK(wrapped.chunk_size == 32768 && in_dir.chunk_size == 32768,
+          "hostile: chunk-size detection ignores unaddressable rows");
+    CHECK(wrapped.chunks[0].cx == 7 && in_dir.chunks[0].cx == 7,
+          "hostile: the real chunk survives");
 }
 
 static void test_short_span_overlap() {
@@ -446,6 +516,17 @@ static void test_sidecar_signs() {
           "inline: untagged rows → empty");
     CHECK(eden_parse_inline_signs(std::vector<uint8_t>(20, 0xff)).empty(),
           "inline: non-16-aligned → empty");
+
+    // A trailer carrying the bare SGN1 container with no outer wrapper row.
+    std::vector<uint8_t> bare = build_sgn1({{9, 8, 7, 1, 2, 3, "bare"}});
+    while (bare.size() % 12 != 0) bare.push_back(0);
+    std::vector<uint8_t> rows;
+    for (size_t i = 0; i < bare.size(); i += 12) {
+        rows.insert(rows.end(), {0xff, 0xff, 0xff, 0xff});
+        rows.insert(rows.end(), bare.begin() + i, bare.begin() + i + 12);
+    }
+    auto bs = eden_parse_inline_signs(rows);
+    CHECK(bs.size() == 1 && bs[0].text == "bare", "inline: unwrapped SGN1 container also parses");
 }
 
 static void test_zip() {
@@ -470,11 +551,28 @@ static void test_zip() {
     EdenWorld z2 = eden_load(zip_deflate);
     CHECK(z2.chunk_size == 32768 && z2.chunks.size() == 1, "zip: deflated member inflates");
 
-    // bomb cap: a tiny ceiling refuses the inflate.
+    // bomb cap, path 1: the declared uncompressed size is over the ceiling.
     bool threw = false;
     try { eden_load(zip_deflate.data(), zip_deflate.size(), /*max_unzip=*/1024); }
     catch (const std::runtime_error&) { threw = true; }
     CHECK(threw, "zip: declared size over the cap is refused (bomb guard)");
+
+    // bomb cap, path 2: the declared size *lies*, so the pre-check passes and
+    // only the growth guard inside the inflate loop can stop it. This is the
+    // real bomb shape — a 167x member whose header claims it is tiny.
+    std::vector<uint8_t> lying = zip_deflate;               // single member
+    size_t eocd   = lying.size() - 22;
+    size_t cd_off = rd_u32(lying.data() + eocd + 16);
+    put_u32_at(lying, 22, 64);            // local header  +22 = uncompressed size
+    put_u32_at(lying, cd_off + 24, 64);   // central entry +24 = uncompressed size
+    CHECK(rd_u32(lying.data() + cd_off) == 0x02014b50, "zip: bomb fixture patched in place");
+    threw = false;
+    try { eden_load(lying.data(), lying.size(), /*max_unzip=*/4096); }
+    catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw, "zip: understated size still refused by the inflate growth guard");
+
+    // and with a truthful, generous ceiling the same archive still parses.
+    CHECK(eden_load(lying).chunks.size() == 1, "zip: honest ceiling still parses the member");
 }
 
 static void test_directory_gate() {
@@ -498,6 +596,7 @@ int main() {
     test_detect_single_chunk_256z_v4();
     test_detect_legacy_12000_gap();
     test_detect_min_gap_fallback();
+    test_hostile_directory_offsets();
     test_short_span_overlap();
     test_inline_sign_trailer();
     test_sidecar_signs();

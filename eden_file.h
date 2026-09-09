@@ -89,8 +89,14 @@ inline constexpr size_t EDEN_MAX_UNZIP     = 512ull * 1024 * 1024;
 inline constexpr size_t EDEN_HEADER_BYTES  = 192;
 inline constexpr size_t EDEN_DIR_ENTRY     = 16;
 inline constexpr int32_t EDEN_CHUNK_COORD_LIMIT = 1 << 15;   // twoToOne gate: 0..32767
-inline constexpr size_t EDEN_MAX_TRAILER_BYTES = 64 * 1024;  // multiple of 16
+// Bounds the appended sign section we are willing to hold. 16 MiB is past what
+// EDEN_MAX_SIGNS can fill (100k signs x 120 B, at 12 payload bytes per 16-byte
+// row), so a real trailer is never silently truncated. Multiple of 16.
+inline constexpr size_t EDEN_MAX_TRAILER_BYTES = 16ull * 1024 * 1024;
 inline constexpr size_t EDEN_MAX_DIR_ENTRIES  = 4'000'000;
+// Initial inflate buffer. The ZIP's declared uncompressed size is untrusted, so
+// take it only as a hint up to this much and double from there.
+inline constexpr size_t EDEN_INFLATE_CHUNK    = 4ull * 1024 * 1024;
 
 // ── little-endian scalar reads ──────────────────────────────────────────────
 
@@ -113,8 +119,10 @@ inline float    rd_f32(const uint8_t* p) {
 // ── ZIP wrapper ─────────────────────────────────────────────────────────────
 
 inline bool eden_is_zip(const uint8_t* b, size_t n) {
-    return n >= 4 && b[0] == 'P' && b[1] == 'K' &&
-           (b[2] == 0x03 || b[2] == 0x05 || b[2] == 0x07);
+    if (n < 4 || b[0] != 'P' || b[1] != 'K') return false;
+    return (b[2] == 0x03 && b[3] == 0x04) ||   // local file header
+           (b[2] == 0x05 && b[3] == 0x06) ||   // end of central directory
+           (b[2] == 0x07 && b[3] == 0x08);     // spanned-archive marker
 }
 
 // Bounded raw-DEFLATE. Refuses to grow the output past `max_out`.
@@ -124,7 +132,8 @@ inline std::vector<uint8_t> raw_inflate_bounded(const uint8_t* data, size_t len,
     if (inflateInit2(&s, -15) != Z_OK)
         throw std::runtime_error("eden_file: inflateInit2 failed");
 
-    size_t cap = std::min(max_out, std::max<size_t>(size_hint ? size_hint : len * 4 + 64, 4096));
+    const size_t want = std::max<size_t>(size_hint ? size_hint : len * 4 + 64, 4096);
+    size_t cap = std::min(max_out, std::min(want, EDEN_INFLATE_CHUNK));
     std::vector<uint8_t> out(cap);
     s.next_in  = const_cast<Bytef*>(data);
     s.avail_in = uInt(len);
@@ -277,12 +286,20 @@ inline std::vector<EdenDirEntry> eden_decode_directory(const uint8_t* b, size_t 
 // of which the min-gap fallback cannot. Returns 0 when ambiguous.
 inline size_t eden_detect_chunk_size_creature_gap(const std::vector<EdenDirEntry>& gated,
                                                   uint64_t dir_offset) {
-    if (gated.empty()) return 0;
+    // Only offsets that could actually address chunk data count: a row pointing
+    // at or past the directory is corruption, and folding it into `max_off`
+    // would both skew the gap and overflow the arithmetic below.
     uint64_t max_off = 0;
-    for (auto& e : gated) max_off = std::max(max_off, e.off);
+    bool any = false;
+    for (auto& e : gated)
+        if (e.off >= EDEN_HEADER_BYTES && e.off < dir_offset) {
+            max_off = std::max(max_off, e.off);
+            any = true;
+        }
+    if (!any) return 0;
     auto valid = [&](uint64_t cs) -> bool {
-        if (max_off + cs > dir_offset) return false;
-        uint64_t gap = dir_offset - (max_off + cs);
+        if (dir_offset - max_off < cs) return false;   // overflow-safe "doesn't fit"
+        uint64_t gap = dir_offset - max_off - cs;
         return gap == 0 || (gap % 60 == 0 && gap / 60 <= 400);
     };
     bool a = valid(131072), b = valid(32768);
@@ -301,10 +318,18 @@ inline size_t eden_detect_chunk_size(const std::vector<EdenDirEntry>& gated,
 
     std::vector<uint64_t> offs;
     for (auto& e : gated)
-        if (e.off >= EDEN_HEADER_BYTES && e.off < n) offs.push_back(e.off);
+        if (e.off >= EDEN_HEADER_BYTES && e.off < n && e.off < dir_offset)
+            offs.push_back(e.off);
     std::sort(offs.begin(), offs.end());
     offs.erase(std::unique(offs.begin(), offs.end()), offs.end());
-    uint64_t min_gap = 32768;
+    if (offs.size() < 2) {
+        // One distinct offset (or none): there is no gap to measure. The only
+        // evidence left is whether a 256z chunk even fits between it and the
+        // directory — a 64z chunk plus its <= 24,000-byte creature block cannot
+        // reach 131,072, so "it fits" means 256z.
+        return !offs.empty() && dir_offset - offs.back() >= 131072 ? 131072 : 32768;
+    }
+    uint64_t min_gap = UINT64_MAX;
     for (size_t i = 1; i < offs.size(); ++i)
         min_gap = std::min(min_gap, offs[i] - offs[i - 1]);
     return min_gap >= 131072 ? 131072 : 32768;
@@ -363,8 +388,12 @@ inline std::vector<EdenSign> eden_parse_inline_signs(const uint8_t* b, size_t n)
     }
     if (payload.size() < EDEN_SIGN_HEADER || std::memcmp(payload.data(), "SGN1", 4) != 0)
         return {};
-    return eden_parse_signs(payload.data() + EDEN_SIGN_HEADER,
-                            payload.size() - EDEN_SIGN_HEADER);
+    std::vector<EdenSign> s = eden_parse_signs(payload.data() + EDEN_SIGN_HEADER,
+                                               payload.size() - EDEN_SIGN_HEADER);
+    if (!s.empty()) return s;
+    // No inner container past the wrapper: this trailer is the bare `SGN1`
+    // container with no outer wrapper row. Parse it in place.
+    return eden_parse_signs(payload.data(), payload.size());
 }
 inline std::vector<EdenSign> eden_parse_inline_signs(const std::vector<uint8_t>& v) {
     return eden_parse_inline_signs(v.data(), v.size());
@@ -444,10 +473,13 @@ inline EdenWorld eden_load(const uint8_t* raw, size_t raw_len,
     w.bands      = int(w.chunk_size / 8192);
     w.z_ceiling  = w.bands * 16 - 1;
 
-    // Pass B: keep only rows whose data provably fits.
+    // Pass B: keep only rows whose data provably fits. `off` is arbitrary bytes
+    // out of the file, so every comparison is written to be overflow-safe — a
+    // row with `off` near 2^64 must be rejected, not wrapped into range.
     std::vector<EdenDirEntry> kept;
     for (auto& e : rows)
-        if (e.off >= EDEN_HEADER_BYTES && e.off + w.chunk_size <= n)
+        if (e.off >= EDEN_HEADER_BYTES && e.off < w.hdr.dir_offset &&
+            e.off < n && n - e.off >= w.chunk_size)
             kept.push_back(e);
     if (kept.empty())
         throw std::runtime_error("eden_file: no addressable chunk in the directory");
@@ -461,8 +493,8 @@ inline EdenWorld eden_load(const uint8_t* raw, size_t raw_len,
     for (auto& e : kept) {
         auto it = std::upper_bound(starts.begin(), starts.end(), e.off);
         uint64_t next = it == starts.end() ? n : *it;
-        uint64_t barrier = w.hdr.dir_offset > e.off ? std::min(next, w.hdr.dir_offset) : next;
-        uint64_t span = std::min<uint64_t>(w.chunk_size, barrier - e.off);
+        uint64_t barrier = std::min<uint64_t>(next, w.hdr.dir_offset);
+        uint64_t span = barrier > e.off ? std::min<uint64_t>(w.chunk_size, barrier - e.off) : 0;
         w.chunks.push_back({e.cx, e.cy, e.off, e.off + span});
     }
 
