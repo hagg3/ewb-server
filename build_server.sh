@@ -75,6 +75,15 @@ echo "Built ./worldedit_test  —  WorldEdit table / permissions / selection cap
 ./eden_names_test
 echo "Built ./eden_names_test  —  block / paint / character name tables + search"
 
+# Offline .eden world-format parser checks: the 192-byte header, chunk-size
+# detection (version / creature-gap / min-gap), the directory coordinate gate,
+# per-chunk derived spans + bounded voxel reads, the sidecar + inline sign
+# parsers, and the ZIP wrapper (member select + decompression-bomb cap)
+# (ROADMAP-SERVER stage 5.0). Links -lz for the ZIP inflate.
+"$CXX" -std=c++17 -O2 -Wall eden_file_test.cpp -lz -o eden_file_test
+./eden_file_test
+echo "Built ./eden_file_test  —  .eden header / chunk detection / spans / signs / ZIP"
+
 # Offline matchmaker checks: name sanitising, REGISTER parsing, SERVER: row /
 # LIST formatting, the TTL registry (ROADMAP-SERVER Phase 2). No zlib needed.
 "$CXX" -std=c++17 -O2 -Wall matchmaker_test.cpp -o matchmaker_test

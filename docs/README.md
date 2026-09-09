@@ -56,6 +56,7 @@ Practically, when you touch a source file, move the doc in the same row:
 | `phase1_live_test.py`, `phase3_live_test.py` — the by-hand live socket tests | [architecture.md](architecture.md) (what each one covers) |
 | `server_posix.cpp` — anything written to the audit channel (`auditLog()`) | [configuration.md](configuration.md) § The audit channel |
 | `host_world.sh`, `run_server.bat` — launcher arguments | [configuration.md](configuration.md), [quickstart.md](quickstart.md) |
+| `eden_file.h` — `.eden` world-format parsing (header, chunks, spans, signs, ZIP wrapper) | [architecture.md](architecture.md) (file map); `docs/import.md` once the `eden_import` converter lands (ROADMAP-SERVER stage 5.1) |
 | A new header + `*_test.cpp` pair | [architecture.md](architecture.md) (the file map) and whichever doc above owns its behaviour |
 | On-disk format: `eden_world.model`, `eden_players.txt`, `eden_signs.txt`, `eden_bans.txt`, `eden_ops.txt` | [configuration.md](configuration.md) |
 

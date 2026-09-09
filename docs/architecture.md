@@ -29,6 +29,11 @@ matchmaker.h         Matchmaker REGISTER parsing, name sanitising, SERVER: row /
                      formatting, the TTL registry. Used by edenmatch.cpp.
 edenmatch.cpp        The standalone matchmaker: sockets, threads, on-demand HOST spawn.
                      A second single translation unit, same style as the server.
+eden_file.h          Clean-room parser for the .eden world file format: ZIP-wrapper
+                     detect + bounded inflate, the 192-byte header, chunk-size
+                     detection, the directory coordinate gate, per-chunk derived
+                     spans, bounded voxel reads, the sidecar + inline sign parsers.
+                     Pure; consumed by the (not-yet-built) eden_import converter.
 ```
 
 Each header has an offline test binary built and run by `build_server.sh`:
@@ -42,6 +47,9 @@ control_test.cpp       Control line grammar, command table, ban/ops files, fill 
 worldedit_test.cpp     Player command table + permission floors, grammar, selection cap,
                        shape predicates, undo byte budget, clipboard rotation.
 matchmaker_test.cpp    Name sanitising, REGISTER parsing, SERVER: row / LIST, the registry.
+eden_file_test.cpp     .eden header decode, chunk-size detection (version / creature-gap /
+                       min-gap), directory gate, derived spans + bounded voxel reads,
+                       sidecar + inline sign parsing, ZIP member select + bomb cap.
 ```
 
 Supporting files: `build_server.sh` (build + run all suites), `host_world.sh`

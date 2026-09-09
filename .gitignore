@@ -11,6 +11,8 @@ WORKING/
 /matchmaker_test
 /control_test
 /worldedit_test
+/eden_names_test
+/eden_file_test
 *.o
 *.obj
 
