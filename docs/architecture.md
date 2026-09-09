@@ -33,7 +33,17 @@ eden_file.h          Clean-room parser for the .eden world file format: ZIP-wrap
                      detect + bounded inflate, the 192-byte header, chunk-size
                      detection, the directory coordinate gate, per-chunk derived
                      spans, bounded voxel reads, the sidecar + inline sign parsers.
-                     Pure; consumed by the (not-yet-built) eden_import converter.
+                     Pure; consumed by eden_import.
+eden_import.h        The .eden -> server-world conversion core: the base terrain profile,
+                     the diff/solid/full emitter, the axis rename for blocks and signs,
+                     the cell and worst-case-REGION projections, the output line
+                     grammars. Pure; no file I/O.
+eden_import.cpp      The eden_import CLI: argument parsing, file I/O, atomic writers,
+                     the summary. A third single translation unit. Offline tool, run
+                     before the server starts — see docs/import.md.
+eden_fixture.h       Test-only: synthesized .eden files for the two suites below, so
+                     there is one writer of the format the parser reads. Not compiled
+                     into any shipped binary.
 ```
 
 Each header has an offline test binary built and run by `build_server.sh`:
@@ -50,12 +60,20 @@ matchmaker_test.cpp    Name sanitising, REGISTER parsing, SERVER: row / LIST, th
 eden_file_test.cpp     .eden header decode, chunk-size detection (version / creature-gap /
                        min-gap), directory gate, derived spans + bounded voxel reads,
                        sidecar + inline sign parsing, ZIP member select + bomb cap.
+eden_import_test.cpp   The base terrain profile, the diff/solid/full emitter, the axis
+                       rename, the two budget projections, the anomaly counters, and the
+                       golden end-to-end: a synthesized .eden converted to an
+                       eden_world.model diffed byte-for-byte against
+                       testdata/carved_64z.model. Its last group shells out to
+                       ./eden_import for the CLI's refusals and --dry-run, so run the
+                       suite from the repo root.
 ```
 
 Supporting files: `build_server.sh` (build + run all suites), `host_world.sh`
 (convenience launcher), `edenctl` (client for the operator control socket), `run_server.bat`
 (Windows/MSVC launcher), the `phase1_*.py` and `phase3_live_test.py` scripts (run by hand,
-not by the build — they bind a port and spawn processes), `worlds/<name>/` (sample worlds).
+not by the build — they bind a port and spawn processes), `worlds/<name>/` (sample worlds),
+`testdata/` (committed golden files for the offline suites).
 
 `phase3_live_test.py` is the adversarial counterpart to the offline suites: the suites prove the
 command-surface bounds are correct, and it tries to break them over real sockets — oversized

@@ -84,6 +84,19 @@ echo "Built ./eden_names_test  —  block / paint / character name tables + sear
 ./eden_file_test
 echo "Built ./eden_file_test  —  .eden header / chunk detection / spans / signs / ZIP"
 
+# The .eden -> server-world converter (ROADMAP-SERVER stage 5.1). Offline tool;
+# run it before the server starts. Links -lz through eden_file.h's ZIP inflate.
+"$CXX" -std=c++17 -O2 -Wall eden_import.cpp -lz -o eden_import
+echo "Built ./eden_import  —  run with: ./eden_import <world.eden> [--help]"
+
+# Offline import-core checks: the base-terrain profile, the diff/solid/full
+# emitter, the axis rename for blocks and signs, the cell + worst-case-REGION
+# projections, and the golden end-to-end (testdata/carved_64z.model). The CLI
+# half shells out to ./eden_import, built just above (stage 5.1).
+"$CXX" -std=c++17 -O2 -Wall eden_import_test.cpp -lz -o eden_import_test
+./eden_import_test
+echo "Built ./eden_import_test  —  base profile / emitter / budgets / golden model"
+
 # Offline matchmaker checks: name sanitising, REGISTER parsing, SERVER: row /
 # LIST formatting, the TTL registry (ROADMAP-SERVER Phase 2). No zlib needed.
 "$CXX" -std=c++17 -O2 -Wall matchmaker_test.cpp -o matchmaker_test

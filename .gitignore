@@ -13,6 +13,8 @@ WORKING/
 /worldedit_test
 /eden_names_test
 /eden_file_test
+/eden_import
+/eden_import_test
 *.o
 *.obj
 

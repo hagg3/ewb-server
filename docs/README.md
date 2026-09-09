@@ -11,6 +11,7 @@ retail client can connect to a world you host yourself.
 | You are… | Read, in order |
 |---|---|
 | **Hosting a server** | [quickstart.md](quickstart.md) → [configuration.md](configuration.md) → [commands.md](commands.md) |
+| **Hosting a world you already have** | [import.md](import.md) → [quickstart.md](quickstart.md) |
 | **Debugging a connection** | [protocol.md](protocol.md) → [configuration.md](configuration.md) |
 | **Changing the code (human or agent)** | [architecture.md](architecture.md) → [protocol.md](protocol.md) → [configuration.md](configuration.md) |
 
@@ -24,6 +25,9 @@ retail client can connect to a world you host yourself.
   environment variables, and on-disk file formats.
 - [matchmaker.md](matchmaker.md) — the matchmaker wire protocol and the standalone `edenmatch`
   server: how a server gets listed in the in-game Server Browser.
+- [import.md](import.md) — converting a saved `.eden` world into one this server can host:
+  the `eden_import` tool, the base terrain profile, the three fill strategies, and the two
+  budget numbers that decide whether an imported world can actually be played.
 - [commands.md](commands.md) — both command surfaces: the operator control socket and `edenctl`
   (kick/ban, live world edits, save/stop, sign editing, `region-stats`), and the player commands
   typed into game chat (`//set`, `//sphere`, `/tp`, …) with their permission levels and bounds.
@@ -56,7 +60,8 @@ Practically, when you touch a source file, move the doc in the same row:
 | `phase1_live_test.py`, `phase3_live_test.py` — the by-hand live socket tests | [architecture.md](architecture.md) (what each one covers) |
 | `server_posix.cpp` — anything written to the audit channel (`auditLog()`) | [configuration.md](configuration.md) § The audit channel |
 | `host_world.sh`, `run_server.bat` — launcher arguments | [configuration.md](configuration.md), [quickstart.md](quickstart.md) |
-| `eden_file.h` — `.eden` world-format parsing (header, chunks, spans, signs, ZIP wrapper) | [architecture.md](architecture.md) (file map); `docs/import.md` once the `eden_import` converter lands (ROADMAP-SERVER stage 5.1) |
+| `eden_file.h` — `.eden` world-format parsing (header, chunks, spans, signs, ZIP wrapper) | [import.md](import.md) § What it reads; [architecture.md](architecture.md) (file map) |
+| `eden_import.h` / `eden_import.cpp` — the converter: base profile, fill strategies, axis rename, budget projections, flags | [import.md](import.md); [configuration.md](configuration.md) for the files it writes |
 | A new header + `*_test.cpp` pair | [architecture.md](architecture.md) (the file map) and whichever doc above owns its behaviour |
 | On-disk format: `eden_world.model`, `eden_players.txt`, `eden_signs.txt`, `eden_bans.txt`, `eden_ops.txt` | [configuration.md](configuration.md) |
 

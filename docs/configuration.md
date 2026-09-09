@@ -216,10 +216,55 @@ A convenience launcher. It builds `edenserver` first if it is missing, then exec
 | 4 `password` | *(none)* | `--password`, omitted if empty |
 | 5 `matchmakerHost` | `127.0.0.1` | `--matchmaker` |
 
+If an `eden_signs.txt` sits in the same directory as `worldFile`, it is passed as `--signs`.
+That is what makes a world written by `eden_import` — which puts every file in its own
+directory — load its signs without a second flag.
+
 ⚠️ It **always** passes `--matchmaker`, defaulting to `127.0.0.1`. With no matchmaker running
 there, the server retries the registration in the background every few seconds; it serves
 clients normally regardless. Run `./edenserver` directly if you want no matchmaker traffic at
 all.
+
+## `eden_import`
+
+The offline `.eden` → server-world converter, built alongside `edenserver` by
+`build_server.sh`. Full walkthrough, the base terrain profile and how to read the two budget
+numbers are in [import.md](import.md); the flags:
+
+```
+./eden_import <world.eden> [flags...]
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--name NAME` | a slug of the world's own name | Output directory name under `worlds/`. |
+| `--out DIR` | `worlds/<name>` | Write here instead. |
+| `--force` | off | Overwrite an existing output directory. |
+| `--dry-run` | off | Project and print the summary; write nothing. |
+| `--air-fill diff\|solid\|full` | `diff` | Which voxels become cells. `diff` emits only what differs from the client's base terrain; `solid` drops air (sub-surface voids fill in); `full` emits every voxel. |
+| `--base-profile default\|none\|FILE` | `default` | The terrain `diff` compares against. Ignored by the other two strategies. |
+| `--signs FILE` | `signs_<input>.dat` beside the input | The sign sidecar. Takes precedence over the world's inline sign trailer. |
+| `--no-signs` | off | Ignore signs entirely. |
+| `--spawn header\|home\|X,Y,Z\|none` | `header` | What goes into `eden_spawn.txt`. |
+| `--max-world-cells N` | `4000000` | Refuse above this many cells. Matches the server's own cap. |
+| `--max-region-records N` | `2000000` | Refuse if any single `REGION` reply would carry more records than this. `0` disables the check. |
+| `--region-radius N` | `224` | Match a server started with `--region-radius`; changes the size of the box the projection slides. |
+| `--strict` | off | Treat unknown block ids and out-of-palette paints as errors instead of warnings. |
+| `-h`, `--help` | — | Usage. |
+
+A block type of `255` is always a hard error: it collides with the server's painted-base
+sentinel, so those cells would be silently dropped from every `REGION` reply.
+
+The base-profile file grammar is one layer per line, `#` comments and blanks skipped;
+unmentioned heights are air:
+
+```
+# height[-height] : type [: paint]
+0:1
+1-15:2
+16-31:3
+32:8
+```
 
 ## `edenmatch`
 
@@ -296,7 +341,7 @@ unset it afterwards.
 
 ## File formats
 
-All three are plain text, LF-terminated, and safe to hand-edit while the server is stopped.
+All of them are plain text, LF-terminated, and safe to hand-edit while the server is stopped.
 `eden_world.model` and `eden_players.txt` are rewritten by the server via a temp file plus
 `rename()`, so an edit made while it is running will be overwritten at the next save.
 
@@ -392,6 +437,37 @@ on that player's next line, with no reconnect. A name with no entry gets `--defa
 # edenserver op levels — <name>:<0..2> per line
 Alice:2
 ```
+
+### `eden_spawn.txt`
+
+A world's default spawn point, one line, written by [`eden_import`](import.md):
+
+```
+x:y:z
+```
+
+Coordinates are floats in server order — `x` and `z` horizontal, `y` height.
+
+> **Written, not yet read.** `eden_import` produces this file today; the server gains the code
+> to load it in ROADMAP stage 5.3. Until then it is inert, and a joining player with no
+> `eden_players.txt` row lands wherever the client puts them.
+
+### `worlds/<name>/`
+
+The layout `eden_import` writes, and the one the server expects when a world lives in its own
+directory:
+
+```
+worlds/<name>/
+  eden_world.model   the world            (--world)
+  eden_signs.txt     signs                (--signs; host_world.sh derives it)
+  eden_spawn.txt     default spawn        (stage 5.3)
+  .gitignore         `*` plus `!.gitignore`
+  edenserver.sock    the control socket, created at run time
+```
+
+The `.gitignore` matters: `worlds/` is tracked in this repository, so without it an imported
+world would be committed by a `git add -A`.
 
 ### Temporary files
 
