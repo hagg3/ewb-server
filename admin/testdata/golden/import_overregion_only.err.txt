@@ -1,0 +1,1 @@
+eden_import: error: a single REGION reply would carry 3,589,952 records, over the 2,000,000 ceiling (7x the largest reply ever captured). Clients re-request regions every ~750 ms, so this stalls the server rather than merely loading it. Use --air-fill diff, or --max-region-records 3589952 to proceed anyway.

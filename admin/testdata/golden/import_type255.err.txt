@@ -1,0 +1,1 @@
+eden_import: error: 12 voxel(s) have block type 255, which collides with the server's painted-base sentinel — such cells would be silently dropped from every REGION reply. First at x 65540, y 33, z 65542.

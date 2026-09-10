@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>edenadmin</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>edenadmin</h1>
+  <span id="active-profile" class="muted">—</span>
+</header>
+
+<nav id="tabs">
+  <button data-panel="connection" class="active">Connection</button>
+  <button data-panel="status">Status</button>
+  <button data-panel="players">Players</button>
+  <button data-panel="bans">Bans</button>
+  <button data-panel="worlds">Worlds</button>
+  <button data-panel="backups">Backups</button>
+  <button data-panel="config">Config</button>
+  <button data-panel="logs">Logs</button>
+  <button data-panel="audit">Audit</button>
+</nav>
+
+<main>
+  <section id="panel-connection" class="panel">
+    <h2>Connection</h2>
+    <p class="muted">
+      Pick or edit a profile, then test it. A <code>local</code> profile is a plain
+      <code>edenserver</code> process on this Mac; a <code>vps</code> profile drives
+      the server over ssh + systemd. No secrets are stored — ssh keys stay in
+      <code>~/.ssh</code>, the world password stays on the server.
+    </p>
+
+    <div class="row">
+      <label>Active profile
+        <select id="profile-select"></select>
+      </label>
+      <button id="activate-btn">Make active</button>
+      <button id="test-btn" class="primary">Test connection</button>
+    </div>
+
+    <div id="test-results"></div>
+
+    <details id="editor">
+      <summary>Add / edit a profile</summary>
+      <form id="profile-form">
+        <div class="grid">
+          <label>Name <input name="name" required pattern="[^ \t/\[\]&quot;]+"></label>
+          <label>Kind
+            <select name="kind">
+              <option value="local">local</option>
+              <option value="vps">vps</option>
+            </select>
+          </label>
+          <label>World dir <input name="world_dir" placeholder="/absolute/path"></label>
+          <label>World root <input name="world_root" placeholder="/absolute/path (parent of the worlds)"></label>
+          <label class="local-only">Server binary <input name="server_bin" placeholder="/…/edenserver"></label>
+          <label class="local-only">eden_import <input name="eden_import" placeholder="/…/eden_import"></label>
+          <label class="local-only">Socket <input name="socket" placeholder="default: &lt;world_dir&gt;/edenserver.sock"></label>
+          <label class="local-only">Backup dir <input name="backup_dir"></label>
+          <label class="local-only">Log file <input name="log_file"></label>
+          <label class="local-only">edenserver args <input name="args" placeholder="--port 27015 --name &quot;My World&quot;"></label>
+          <label class="vps-only">SSH host alias <input name="ssh_host" placeholder="a Host in ~/.ssh/config"></label>
+          <label class="vps-only">systemd service <input name="service" placeholder="edenserver"></label>
+          <label class="vps-only">Run as (service user) <input name="run_as" placeholder="edenserver"></label>
+          <label class="vps-only">Env file <input name="env_file" placeholder="/etc/edenserver.conf"></label>
+        </div>
+        <button type="submit" class="primary">Save profile</button>
+        <button type="button" id="delete-btn" class="danger">Delete</button>
+      </form>
+    </details>
+  </section>
+
+  <section id="panel-status" class="panel hidden">
+    <h2>Status</h2>
+    <p class="muted">Polled every 3&nbsp;s. A <code>local</code> profile is driven by
+      edenadmin's own process supervisor.</p>
+    <div class="row" id="power-row">
+      <button data-power="start">Start</button>
+      <button data-power="stop" class="primary">Stop (graceful)</button>
+      <button data-power="restart">Restart</button>
+      <button data-power="kill" class="danger">Kill</button>
+    </div>
+    <p id="power-msg" class="muted"></p>
+    <div id="status-body"><p class="muted">Loading…</p></div>
+  </section>
+
+  <section id="panel-players" class="panel hidden">
+    <h2>Players</h2>
+    <p class="muted">Connected players from <code>edenctl who</code>. Actions re-poll
+      and show the server's own reply — no optimistic state.</p>
+    <div class="row">
+      <label>Broadcast <input id="say-input" type="text" placeholder="message to all players"></label>
+      <button id="say-btn" class="primary">Say</button>
+    </div>
+    <p id="players-msg" class="muted"></p>
+    <div id="players-body"><p class="muted">Loading…</p></div>
+  </section>
+
+  <section id="panel-bans" class="panel hidden">
+    <h2>Bans</h2>
+    <p class="muted">The ban list from <code>edenctl banlist</code>. A name or an IP is
+      accepted; an IP-shaped name is ambiguous, so ban by the exact token shown in
+      Players.</p>
+    <div class="row">
+      <label>Ban token <input id="ban-input" type="text" placeholder="name or IP"></label>
+      <button id="ban-btn" class="danger">Add ban</button>
+    </div>
+    <p id="bans-msg" class="muted"></p>
+    <div id="bans-body"><p class="muted">Loading…</p></div>
+  </section>
+
+  <section id="panel-worlds" class="panel hidden">
+    <h2>Worlds</h2>
+    <p class="muted">Hostable worlds under the profile's <code>world_root</code>. Download
+      packs <code>eden_world.model</code>, the sign / spawn / player sidecars and the
+      <code>.gitignore</code> as one tar. Upload and import both require the server to be
+      stopped.</p>
+
+    <div class="row">
+      <button id="worlds-refresh">Refresh</button>
+    </div>
+    <p id="worlds-msg" class="muted"></p>
+    <div id="worlds-body"><p class="muted">Loading…</p></div>
+
+    <details class="world-tool">
+      <summary>Upload a world bundle</summary>
+      <p class="muted">Replaces the files in <code>worlds/&lt;name&gt;/</code> with the contents
+        of a previously downloaded tar. The server must be stopped.</p>
+      <div class="grid">
+        <label>World name <input id="up-name" type="text" placeholder="castle"></label>
+        <label>Bundle (.tar) <input id="up-file" type="file" accept=".tar"></label>
+      </div>
+      <button id="up-btn" class="danger">Upload bundle</button>
+    </details>
+
+    <details class="world-tool">
+      <summary>Import a <code>.eden</code> world</summary>
+      <p class="muted">Converts a saved <code>.eden</code> world into a hostable one. Project
+        first to see the cell / REGION budget, then import. See
+        <code>docs/import.md</code>.</p>
+      <div class="grid">
+        <label>.eden file <input id="imp-file" type="file" accept=".eden"></label>
+        <label>World name <input id="imp-name" type="text" placeholder="a slug of the world"></label>
+        <label>Strategy
+          <select id="imp-airfill">
+            <option value="">diff (default)</option>
+            <option value="solid">solid</option>
+            <option value="full">full</option>
+          </select>
+        </label>
+        <label>Spawn <input id="imp-spawn" type="text" placeholder="header / home / none / x,y,z"></label>
+      </div>
+      <div class="row">
+        <label class="chk"><input type="checkbox" id="imp-force"> overwrite if it exists</label>
+        <label class="chk"><input type="checkbox" id="imp-strict"> strict (unknown blocks → error)</label>
+        <label class="chk"><input type="checkbox" id="imp-nosigns"> ignore signs</label>
+        <label class="chk"><input type="checkbox" id="imp-active"> make active after import</label>
+        <label class="chk"><input type="checkbox" id="imp-restart"> restart server after activate</label>
+      </div>
+      <div class="grid" id="imp-overrides">
+        <label>--max-world-cells <input id="imp-maxcells" type="number" min="0" placeholder="raise the cell cap"></label>
+        <label>--max-region-records <input id="imp-maxregion" type="number" min="0" placeholder="raise / disable (0) the REGION cap"></label>
+      </div>
+      <div class="row">
+        <button id="imp-project" class="primary">Project (dry run)</button>
+        <button id="imp-write" disabled>Import</button>
+      </div>
+      <div id="imp-summary"></div>
+    </details>
+  </section>
+
+  <section id="panel-backups" class="panel hidden">
+    <h2>Backups</h2>
+    <p class="muted">World-file backups under the profile's <code>backup_dir</code>. A
+      <code>local</code> profile flushes with <code>edenctl save</code> then copies the
+      files here; a <code>vps</code> profile runs <code>edenserverctl backup</code>.
+      <strong>Restore stops the server, swaps the files, and starts it again</strong>, keeping
+      a <code>-prerestore</code> safety copy of the world it replaced.</p>
+
+    <div class="row">
+      <button id="backup-refresh">Refresh</button>
+      <button id="backup-now" class="primary">Backup now</button>
+    </div>
+    <p id="backups-msg" class="muted"></p>
+    <div id="backups-body"><p class="muted">Loading…</p></div>
+    <div id="restore-trace"></div>
+  </section>
+
+  <section id="panel-config" class="panel hidden">
+    <h2>Config</h2>
+    <p class="muted">On a <code>vps</code> profile this reads and rewrites the systemd
+      EnvironmentFile (<code>/etc/edenserver.conf</code>) through the validating
+      <code>edenserver-writeconf</code> wrapper — never <code>sudo tee</code>. On a
+      <code>local</code> profile it edits the managed flags in the profile's <code>args</code>.
+      Review the diff, then Save. A restart drops every connected player.</p>
+
+    <div class="row">
+      <button id="config-refresh">Refresh</button>
+      <span id="config-source" class="muted"></span>
+    </div>
+    <p id="config-note" class="muted"></p>
+
+    <form id="config-form">
+      <div class="grid">
+        <label>Port <input name="port" type="number" min="1" max="65535"></label>
+        <label>Server name <input name="name" type="text"></label>
+        <label>World dir <input name="world_dir" type="text" placeholder="/var/lib/edenserver/worlds/&lt;name&gt;"></label>
+        <label>Max world cells <input name="max_world_cells" type="number" min="1"></label>
+        <label>Password <input name="password" type="text" placeholder="empty = open server"></label>
+        <label>Extra args <input name="extra_args" type="text" placeholder="--matchmaker host:port --default-level 1"></label>
+      </div>
+      <div class="row">
+        <label class="chk"><input type="checkbox" id="config-restart"> restart the server after saving</label>
+        <button type="submit" class="primary">Save config</button>
+      </div>
+    </form>
+    <p id="config-msg" class="muted"></p>
+    <div id="config-diff"></div>
+    <details class="world-tool">
+      <summary>Raw source</summary>
+      <pre id="config-raw" class="logbox"></pre>
+    </details>
+  </section>
+
+  <section id="panel-logs" class="panel hidden">
+    <h2>Logs</h2>
+    <div class="row">
+      <label>Filter <input id="log-filter" type="text" placeholder="substring, client-side"></label>
+      <button id="log-clear">Clear view</button>
+    </div>
+    <pre id="logs-body" class="logbox"><span class="muted">Loading…</span></pre>
+  </section>
+
+  <section id="panel-audit" class="panel hidden">
+    <h2>Audit</h2>
+    <p class="muted">The server's audit channel — every state-changing control command and
+      every completed edit, with a UTC timestamp and the actor. Polled every 3&nbsp;s.
+      A dedicated <code>--audit-file</code> is the durable feed; without one this filters
+      the <code>[Audit]</code> lines out of the live log (<code>local</code>) or journal
+      (<code>vps</code>), which is reset by a restart.</p>
+    <div class="row">
+      <label>Filter <input id="audit-filter" type="text" placeholder="substring, client-side"></label>
+      <span id="audit-source" class="muted"></span>
+    </div>
+    <p id="audit-note" class="muted"></p>
+    <div id="audit-body"><p class="muted">Loading…</p></div>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

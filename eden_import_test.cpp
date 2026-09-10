@@ -448,6 +448,13 @@ static void test_cli() {
     CHECK(run(base) != 0, "cli: refuses to overwrite without --force");
     CHECK(run(base + " --force") == 0, "cli: --force overwrites");
 
+    // --yes is the non-interactive scripting path: it implies --force but does
+    // not weaken the budget verdicts.
+    CHECK(run(base + " --yes") == 0, "cli: --yes overwrites without --force");
+    CHECK(run("./eden_import '" + in + "' --out '" + d + "/y1' --yes"
+              " --air-fill full --max-world-cells 100") != 0,
+          "cli: --yes does not bypass the cell cap");
+
     // The cell cap is refusable, and refusing means writing nothing.
     const std::string out2 = d + "/out2";
     const std::string full = "./eden_import '" + in + "' --out '" + out2 + "' --air-fill full";

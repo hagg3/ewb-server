@@ -1,0 +1,18 @@
+world "BlockmapWIP"  (version 4, 64z, 38 saved chunks, 0 signs from none)
+  bounding box  x 64714..64815   y 32..53   z 65655..65757   (server coords)
+  strategy      diff (base profile: default)
+  cells         3,433  of 4,000,000 cap  (0.1%)
+  worst REGION  5,439 records  at x 64704..65167, z 65648..66111
+                (largest reply ever captured from the real server: 507,000 records)
+  signs         0 convertible
+  spawn         64746.69, 34.92, 65710.99  (header)
+  sky colours   14 14 14 14 14 14 14 14 14 14 14 14 14 14 14 14
+                (informational — the wire protocol carries no sky message)
+
+wrote /tmp/edencap/gg/eden_world.model   3,433 cells
+wrote /tmp/edencap/gg/eden_signs.txt     0 signs
+wrote /tmp/edencap/gg/eden_spawn.txt     64746.69:34.92:65710.99
+wrote /tmp/edencap/gg/.gitignore         (worlds/ is tracked — this keeps the world out of commits)
+
+run it:  ./host_world.sh '/tmp/edencap/gg/eden_world.model' 'BlockmapWIP' 27015
+         (a joining player with no saved position spawns there)

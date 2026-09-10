@@ -43,7 +43,7 @@ height format is detected from the file's own layout.
 worlds/<name>/
   eden_world.model   x:y:z:type:color, one cell per line   (docs/configuration.md)
   eden_signs.txt     x:y:z:a:b:c:text, one sign per line
-  eden_spawn.txt     x:y:z — read by the server as of ROADMAP stage 5.3
+  eden_spawn.txt     x:y:z — the server sends a spawnless joiner here
   .gitignore         keeps the above out of commits
 ```
 
@@ -87,12 +87,14 @@ stores that same profile verbatim for every untouched column:
 This is identical in the 64-high and 256-high formats. It is why the default strategy is cheap:
 a world only has to record the voxels that *differ* from this, and untouched rock costs nothing.
 
-> **Status of this table.** It is measured from the *files* — every column of two authored
-> specimens matched it exactly, in both height formats — and it is corroborated by the header's
-> recorded standing height and by the real server streaming no ground plane at all. That the
-> retail *client* synthesizes the identical profile for a world it has never seen is a strong
-> inference, not yet a direct observation (ROADMAP stage 5.4). If it turns out to be wrong the
-> symptom is visible banded terrain, and the fix is a `--base-profile` file, not a code change.
+> **Status of this table.** Directly observed. Joining the retail client on a server with an
+> empty world and digging a column from the surface to bedrock gave grass at the surface, 16
+> dirt below it, 15 stone below that, and one layer of bedrock at the bottom — grass `y = 32`,
+> dirt `y = 16..31`, stone `y = 1..15`, bedrock `y = 0`, all unpainted (ROADMAP stage 5.4,
+> 2026-09-09). This also matched every column of two authored `.eden` specimens in both height
+> formats, the header's recorded standing height, and the real server streaming no ground plane
+> at all. If it ever turns out wrong the symptom is visible banded terrain, and the fix is a
+> `--base-profile` file, not a code change.
 
 You can supply your own with `--base-profile FILE`:
 
@@ -131,9 +133,9 @@ For scale, on a lightly-built 39-chunk world: `diff` ≈ 3,500 cells, `solid` �
 world that fails either.
 
 **Cells, against the cap.** Every line of `eden_world.model` becomes one entry in the server's
-in-memory world map, and the server refuses new cells past `SV_MAX_WORLD_CELLS` (4,000,000 —
-see [configuration.md](configuration.md)). Raising it takes *both* `eden_import
---max-world-cells N` and a server that accepts the same ceiling.
+in-memory world map, and the server refuses new cells past its `--max-world-cells` (default
+4,000,000 — see [configuration.md](configuration.md)). Raising it takes *both* `eden_import
+--max-world-cells N` and a server started with `--max-world-cells N`.
 
 **Worst-case records in a single `REGION` reply.** This is the number that decides whether an
 imported world actually *plays*, and it is not the same number. A `REGION` request is answered
@@ -180,8 +182,46 @@ The header's position is already in server axis order and needs no rename. `home
 default: it is an operator choice inside the game and its recorded height is not reliably a
 place a player can stand.
 
-`eden_spawn.txt` is read by the server as of ROADMAP stage 5.3. Until that lands the file is
-written but inert, and a joining player lands wherever the server would otherwise put them.
+The server reads `eden_spawn.txt` at startup (from the world's own directory, or `--spawn-file`;
+`--spawn x:y:z` overrides it). A joining player who has no `eden_players.txt` row is sent there;
+a returning player keeps their saved position.
+
+---
+
+## Interactive session
+
+Run on a real terminal with nothing pinned on the command line, `eden_import` asks before it
+writes. Every question has a flag that pre-answers and suppresses it, and a default equal to the
+non-interactive behaviour — so a pipe, a redirect, or `--yes` runs straight through with no
+prompts and nothing a script sees changes.
+
+```
+$ ./eden_import ~/Downloads/castle.eden
+
+Strategy — what becomes a stored cell:
+  name   cells         worst REGION   verdict
+  diff   184,220       12,880         ok
+  solid  1,910,540     221,700        ok
+  full   9,930,112     1,344,600      over the cell cap
+diff is faithful (caves and all) at ~1% of full; see docs/import.md.
+strategy [diff]:
+
+Spawn point written to eden_spawn.txt:
+  header  65536.00, 33.92, 65540.00
+  home    65500.00, 246.00, 65500.00  (out of range)
+  none    do not write a spawn
+spawn (header/home/none) [header]:
+
+world directory name [castle]:
+worlds/castle exists — overwrite? (y/N) [n]: y
+```
+
+| Prompt | Flag that skips it | Default |
+|---|---|---|
+| strategy | `--air-fill` | `diff` |
+| spawn source | `--spawn` | `header` |
+| output directory name | `--name` / `--out` | slug of the world's name |
+| overwrite confirmation | `--force` or `--yes` | abort (`n`) |
 
 ---
 
@@ -194,6 +234,7 @@ eden_import <world.eden> [options]
   --out DIR                write here instead of worlds/<name>/
   --force                  overwrite an existing output directory
   --dry-run                project and print the summary, write nothing
+  -y, --yes                accept every prompt's default; no interactive questions
 
   --air-fill diff|solid|full          what becomes a cell (default: diff)
   --base-profile default|none|FILE    the terrain `diff` compares against
@@ -202,7 +243,7 @@ eden_import <world.eden> [options]
   --no-signs               ignore signs entirely
   --spawn header|home|X,Y,Z|none      default: header
 
-  --max-world-cells N      cell ceiling (default: 4000000, the server's own cap)
+  --max-world-cells N      cell ceiling (default: 4000000, the server's own default)
   --max-region-records N   worst-case single-REGION reply ceiling (default: 2000000; 0 = off)
   --region-radius N        match a server started with --region-radius (default: 224)
   --strict                 treat unknown block ids and out-of-range paints as errors

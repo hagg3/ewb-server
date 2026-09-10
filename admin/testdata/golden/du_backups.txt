@@ -1,0 +1,4 @@
+1240	/var/lib/edenserver/backups/20260908T140000Z
+980	/var/lib/edenserver/backups/20260909T090000Z
+1200	/var/lib/edenserver/backups/not-a-stamp
+3420	/var/lib/edenserver/backups

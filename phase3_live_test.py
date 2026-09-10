@@ -392,6 +392,14 @@ def group_flood_and_fuzz(srv):
     tail.at(65536, 40, 65536)
     ctl_cmd(srv.sock, "op:Survivor:1")
     check(said(tail.cmd("//pos1", 0.4), "pos1 ="), "...and still serves a normal command")
+
+    # stage 3.6 — the community name tables back /id and the search commands.
+    check(said(tail.cmd("/id stone", 0.4), "2"), "/id resolves a block name to its number")
+    check(said(tail.cmd("/id 19", 0.4), "colour"), "/id resolves a number to its colour name")
+    check(said(tail.cmd("/searchblocks slope_nw", 0.4), "stone_slope_nw=40"),
+          "/searchblocks returns name=id rows")
+    check(said(tail.cmd("/id mauveish", 0.4), "not a known"),
+          "/id refuses an unknown name rather than guessing")
     tail.close(); c.close()
 
 
@@ -518,12 +526,56 @@ def group_audit(server_dir):
         srv.stop()
 
 
+# --- group 13: stage 5.3 — the world default spawn --------------------------
+
+def group_world_spawn(server_dir):
+    print("\n[13] 5.3 — eden_spawn.txt is the default spawn; a saved row still wins")
+    spawn_file = os.path.join(server_dir, "eden_spawn.txt")
+    players_file = os.path.join(server_dir, "eden_players.txt")
+
+    with open(spawn_file, "w") as f:
+        f.write("65540.00:33.92:65500.00\n")
+    with open(players_file, "w") as f:
+        f.write("Returning:1000.5:40.0:2000.5\n")
+
+    srv = Server(server_dir)
+    try:
+        c = Client(); r = c.join("Fresh")
+        check(any("SPAWN:65540.00:33.92:65500.00" in ln for ln in r),
+              "a fresh name is sent the world spawn from eden_spawn.txt")
+        c.close()
+
+        c = Client(); r = c.join("Returning")
+        check(any("SPAWN:1000.50:40.00:2000.50" in ln for ln in r),
+              "a name with an eden_players.txt row gets the row, not the world spawn")
+        check(not any("SPAWN:65540" in ln for ln in r), "...and not both")
+        c.close()
+    finally:
+        srv.stop()
+
+    # A malformed spawn file warns, is ignored, and is never fatal.
+    os.remove(players_file)
+    with open(spawn_file, "w") as f:
+        f.write("not:coordinates:here:extra\n")
+    srv = Server(server_dir)
+    try:
+        check(said(srv.since(0, 0.3), "ignoring malformed spawn line"),
+              "a malformed eden_spawn.txt warns")
+        c = Client(); r = c.join("Fresh2")
+        check(not any(ln.startswith("SPAWN:") for ln in r),
+              "no SPAWN is sent when the spawn file is unusable")
+        check(srv.alive(), "a malformed eden_spawn.txt is not fatal")
+        c.close()
+    finally:
+        srv.stop()
+
+
 # --- group 11 + 12: notes on what a socket test cannot reach -----------------
 
 def group_notes():
     print("\n[11] defect 3 — the edited-cell ceiling")
-    print("     SV_MAX_WORLD_CELLS is 4,000,000 and reaching it over a socket means")
-    print("     relaying ~250 MB of ACTION. The projection is checked before every")
+    print("     the edited-cell cap defaults to 4,000,000 (--max-world-cells); reaching it")
+    print("     over a socket means relaying ~250 MB of ACTION. The projection is checked before every")
     print("     scan in weCommit/weEditBox and refuses rather than truncates; the")
     print("     arithmetic is covered offline. Not exercised here on purpose.")
     print("\n[12] the control socket's 300 s idle timeout")
@@ -564,7 +616,8 @@ def main():
             srv.stop()
             shutil.rmtree(b, ignore_errors=True)
 
-        for prefix, group in (("edenphase3c_", group_fill_cap), ("edenphase3d_", group_audit)):
+        for prefix, group in (("edenphase3c_", group_fill_cap), ("edenphase3d_", group_audit),
+                              ("edenphase3e_", group_world_spawn)):
             wd = tempfile.mkdtemp(prefix=prefix)
             try:
                 group(wd)

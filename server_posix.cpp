@@ -71,6 +71,7 @@
 #include "region_query.h"   // REGION reply geometry + Cell -> record table (stage 1.1)
 #include "snapz_codec.h"    // raw DEFLATE + base64 + SNAPZ framing      (stage 1.2)
 #include "sign_store.h"     // eden_signs.txt + SIGNQ -> SIGNP           (stage 1.5)
+#include "spawn_store.h"    // eden_spawn.txt: a world's default spawn     (stage 5.3)
 #include "hardening.h"      // names, token buckets, ACTION validation   (stage 1.7)
 #include "control.h"        // Tier 1 operator control socket             (stage 3.2)
 #include "worldedit.h"      // Tier 2 player command surface              (stage 3.3)
@@ -117,6 +118,9 @@ int         g_regionRadius = ewb::REGION_RADIUS; // blocks a REGION reply covers
 bool        g_regionSort  = true;                // sort records before deflate (--no-region-sort)
 bool        g_regionEmptyFrame = true;           // answer an empty region with SNAPZ:0 (--no-region-empty-frame to suppress)
 std::string g_signFile   = "eden_signs.txt";     // sign sidecar (--signs)
+std::string g_spawnFile  = "";                   // world spawn sidecar; empty -> derived from the world dir (--spawn-file)
+bool        g_haveWorldSpawn = false;            // a default spawn point is configured (file or --spawn)
+ewb::Spawn  g_worldSpawn;                        // the default spawn handed to a player with no saved position
 bool        g_legacySnapshot = false;            // push the ACTION dump on JOIN (--legacy-snapshot)
 int         g_connectLimit = 10;                 // connects per IP per window; 0 = off (--connect-limit)
 
@@ -158,7 +162,8 @@ std::atomic<uint64_t> g_rgnMicros{0};
 
 // Safety limits (hardening for public hosting).
 static const int    SV_WORLD_HEIGHT   = 256;       // must match the game's T_HEIGHT
-static const size_t SV_MAX_WORLD_CELLS= 4000000;   // cap edited-cell count (mem/disk guard)
+static const size_t SV_MAX_WORLD_CELLS_DEFAULT = 4000000;   // default edited-cell ceiling
+size_t              g_maxWorldCells   = SV_MAX_WORLD_CELLS_DEFAULT;  // cap edited-cell count (mem/disk guard); --max-world-cells
 static const size_t SV_MAX_LINE       = 8192;      // drop a client flooding without '\n'
 static const int    SV_MAX_CLIENTS    = 64;        // reject connections beyond this
 
@@ -284,9 +289,9 @@ static void worldSet(int x,int y,int z,int type,int color){
     // Cap the number of distinct edited cells so a malicious/buggy client can't
     // grow the map (and the on-disk save) without bound. Updates to existing
     // cells are always allowed; only brand-new cells are refused past the cap.
-    if(g_world.find(k)==g_world.end() && g_world.size()>=SV_MAX_WORLD_CELLS){
+    if(g_world.find(k)==g_world.end() && g_world.size()>=g_maxWorldCells){
         static bool warned=false;
-        if(!warned){ std::cerr << "[Server] world cell cap reached (" << SV_MAX_WORLD_CELLS
+        if(!warned){ std::cerr << "[Server] world cell cap reached (" << g_maxWorldCells
                                << "); refusing new cells." << std::endl; warned=true; }
         return;
     }
@@ -424,6 +429,32 @@ void loadPlayerPos() {
             g_playerPos[name] = { x,y,z };
     }
     std::cout << "[Server] Loaded " << g_playerPos.size() << " player positions." << std::endl;
+}
+
+// --- World default spawn (stage 5.3) ----------------------------------------
+// `eden_spawn.txt` (one line `x:y:z`, written by eden_import) is the position a
+// joining player with no eden_players.txt row of their own is sent to. `--spawn
+// x:y:z` sets it directly and skips the file. A missing file is silent; a
+// malformed one warns and is ignored — never fatal.
+void loadSpawn() {
+    if (g_haveWorldSpawn) return;   // --spawn already provided it
+    std::ifstream f(g_spawnFile);
+    if (!f) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        ewb::Spawn s;
+        bool skip = false;
+        if (ewb::parse_spawn_line(line, s, skip)) {
+            g_worldSpawn = s;
+            g_haveWorldSpawn = true;
+            return;
+        }
+        if (!skip) {
+            std::cerr << "[Server] " << g_spawnFile
+                      << ": ignoring malformed spawn line" << std::endl;
+            return;
+        }
+    }
 }
 
 void savePlayerPos() {
@@ -1506,7 +1537,7 @@ static std::vector<ewb::WeEdit> weCommit(const std::vector<ewb::WeEdit>& edits, 
         std::lock_guard<std::mutex> lock(g_worldMtx);
         // Refuse rather than truncate: a partially applied edit is worse than a
         // refused one, and the player can see why.
-        if (g_world.size() + edits.size() > SV_MAX_WORLD_CELLS) {
+        if (g_world.size() + edits.size() > g_maxWorldCells) {
             weSay(s, "The world is at its edited-cell limit; that edit was refused.");
             return batch;
         }
@@ -1543,7 +1574,7 @@ static std::vector<ewb::WeEdit> weEditBox(const ewb::WeBox& box, F&& want, SOCKE
     {
         std::lock_guard<std::mutex> lock(g_worldMtx);
         const long long vol = ewb::we_box_volume(box);
-        if (g_world.size() + (size_t)vol > SV_MAX_WORLD_CELLS) {
+        if (g_world.size() + (size_t)vol > g_maxWorldCells) {
             weSay(s, "The world is at its edited-cell limit; that edit was refused.");
             return batch;
         }
@@ -2250,7 +2281,9 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                 static const char* kCaps = "CAPS:region\n";
                 send(clientSocket, kCaps, strlen(kCaps), 0);
 
-                // 3. SPAWN — only if this name has a saved position.
+                // 3. SPAWN — this name's saved position if it has one, otherwise
+                //    the world's default spawn (eden_spawn.txt / --spawn, stage
+                //    5.3). A returning player's own row always wins.
                 {
                     std::lock_guard<std::mutex> lk(g_posMtx);
                     auto it = g_playerPos.find(username);
@@ -2261,6 +2294,13 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                         send(clientSocket, sp, n, 0);
                         std::cout << "[Server] Restored " << username << " to ("
                                   << it->second.x << "," << it->second.y << "," << it->second.z << ")\n";
+                    } else if (g_haveWorldSpawn) {
+                        char sp[96];
+                        int n = snprintf(sp, sizeof(sp), "SPAWN:%.2f:%.2f:%.2f\n",
+                                         g_worldSpawn.x, g_worldSpawn.y, g_worldSpawn.z);
+                        send(clientSocket, sp, n, 0);
+                        std::cout << "[Server] Spawned " << username << " at world spawn ("
+                                  << g_worldSpawn.x << "," << g_worldSpawn.y << "," << g_worldSpawn.z << ")\n";
                     }
                 }
 
@@ -2552,6 +2592,7 @@ int main(int argc, char* argv[]) {
 
     // Args: [port] and/or flags:
     //   --port N  --name "My World"  --password PASS  --world FILE  --signs FILE
+    //   --spawn x:y:z  --spawn-file FILE  --max-world-cells N
     //   --matchmaker HOST[:PORT]
     //   --region-radius N  --no-region-sort  --no-region-empty-frame
     //   --action-rate N  --action-burst N   (0 = unlimited)
@@ -2567,6 +2608,18 @@ int main(int argc, char* argv[]) {
         else if (a == "--password")   g_password   = next("");
         else if (a == "--world")      g_worldFile  = next("eden_world.model");
         else if (a == "--signs")      g_signFile   = next("eden_signs.txt");
+        else if (a == "--spawn-file") g_spawnFile  = next("eden_spawn.txt");
+        else if (a == "--spawn") {
+            // Inline default spawn; overrides (and skips) eden_spawn.txt.
+            const std::string v = next("x:y:z");
+            ewb::Spawn s;
+            if (ewb::parse_spawn_line(v, s)) { g_worldSpawn = s; g_haveWorldSpawn = true; }
+            else std::cerr << "[Server] --spawn " << v << " is not x:y:z; ignored." << std::endl;
+        }
+        else if (a == "--max-world-cells") {
+            const long long v = std::atoll(next("4000000").c_str());
+            g_maxWorldCells = v >= 1 ? (size_t)v : 0;   // 0 -> reset with a warning below
+        }
         else if (a == "--verbose")    g_verbose    = true;
         // Push the plaintext ACTION world dump on JOIN (pre-1.3 behaviour). Off by
         // default: the real client asks for terrain with REGION and is answered with
@@ -2638,6 +2691,19 @@ int main(int argc, char* argv[]) {
                   << " (non-default — VuencLink's coverage lattice assumes "
                   << ewb::REGION_RADIUS << ")" << std::endl;
 
+    // Runtime edited-cell ceiling (stage 5.3). A value below 1 is a typo, not a
+    // configuration — reset it. There is no hard upper bound: an operator hosting
+    // a world eden_import only passed with a raised --max-world-cells has to be
+    // able to match that number here, and their RAM is the real limit.
+    if (g_maxWorldCells < 1) {
+        std::cerr << "[Server] --max-world-cells must be >= 1; using "
+                  << SV_MAX_WORLD_CELLS_DEFAULT << "." << std::endl;
+        g_maxWorldCells = SV_MAX_WORLD_CELLS_DEFAULT;
+    }
+    if (g_maxWorldCells != SV_MAX_WORLD_CELLS_DEFAULT)
+        std::cout << "[Server] Edited-cell cap " << g_maxWorldCells
+                  << " (default " << SV_MAX_WORLD_CELLS_DEFAULT << ")" << std::endl;
+
     if (!ewb::ctl_level_valid(g_defaultLevel)) {
         std::cerr << "[Server] --default-level " << g_defaultLevel << " out of range (0..2); using 0." << std::endl;
         g_defaultLevel = 0;
@@ -2645,12 +2711,14 @@ int main(int argc, char* argv[]) {
 
     // Tier 2 bounds. A cap of 0 would make every command a no-op and a negative
     // one would make the volume check pass everything, so clamp rather than
-    // trust the command line. The ceiling is SV_MAX_WORLD_CELLS: no single
+    // trust the command line. The ceiling is g_maxWorldCells: no single
     // command may be allowed to fill the whole world.
-    if (g_weMaxCells < 1 || g_weMaxCells > (long long)SV_MAX_WORLD_CELLS) {
+    if (g_weMaxCells < 1 || g_weMaxCells > (long long)g_maxWorldCells) {
         std::cerr << "[Server] --we-max-cells " << g_weMaxCells << " out of range (1.."
-                  << SV_MAX_WORLD_CELLS << "); using " << ewb::WE_MAX_EDIT_CELLS << "." << std::endl;
-        g_weMaxCells = ewb::WE_MAX_EDIT_CELLS;
+                  << g_maxWorldCells << "); using "
+                  << std::min<long long>(ewb::WE_MAX_EDIT_CELLS, (long long)g_maxWorldCells)
+                  << "." << std::endl;
+        g_weMaxCells = std::min<long long>(ewb::WE_MAX_EDIT_CELLS, (long long)g_maxWorldCells);
     }
     // An undo budget below one full-cap batch would evict a player's newest edit
     // the moment they made it, which reads as "undo is broken" rather than as a
@@ -2668,7 +2736,7 @@ int main(int argc, char* argv[]) {
     // (stage 3.4): they bound the same cost — one pass over the world holding
     // g_worldMtx — and having had two independently-chosen numbers for it was
     // how they drifted apart in the first place.
-    g_ctlFillCap = ewb::ctl_fill_cap(g_weMaxCells, (long long)SV_MAX_WORLD_CELLS);
+    g_ctlFillCap = ewb::ctl_fill_cap(g_weMaxCells, (long long)g_maxWorldCells);
 
     // Control-socket flood guard. A rate of 0 turns the pacing off (an operator
     // running a bulk import through edenctl may want that); the concurrent
@@ -2687,6 +2755,16 @@ int main(int argc, char* argv[]) {
                               : g_worldFile.substr(0, slash + 1) + "edenserver.sock";
     }
 
+    // Default the world spawn sidecar to <worlddir>/eden_spawn.txt, the file
+    // eden_import writes there (stage 5.3). --spawn-file overrides the path;
+    // --spawn already set g_haveWorldSpawn and loadSpawn() will skip the file.
+    if (g_spawnFile.empty()) {
+        const size_t slash = g_worldFile.find_last_of('/');
+        g_spawnFile = (slash == std::string::npos)
+                          ? std::string("eden_spawn.txt")
+                          : g_worldFile.substr(0, slash + 1) + "eden_spawn.txt";
+    }
+
     // If we're registering with a matchmaker but weren't told which IP to
     // advertise, auto-detect this machine's LAN address so remote devices get a
     // reachable address instead of the matchmaker's view of our peer IP.
@@ -2702,11 +2780,19 @@ int main(int argc, char* argv[]) {
 
     // Load the saved world model + player positions, and periodically persist them.
     loadWorld();
+    if (g_world.size() > g_maxWorldCells)
+        std::cerr << "[Server] loaded world has " << g_world.size() << " cells, over the "
+                  << g_maxWorldCells << " cap — existing cells are kept, but new ones are"
+                     " refused. Raise --max-world-cells to match the import." << std::endl;
     loadPlayerPos();
+    loadSpawn();    // eden_spawn.txt: the default spawn for a player with no saved row (stage 5.3)
     loadSigns();   // sidecar; the control socket's `signs add|rm` writes it (stage 3.2)
     loadBans();
     loadOps();
 
+    if (g_haveWorldSpawn)
+        std::cout << "[Server] World spawn " << g_worldSpawn.x << ":" << g_worldSpawn.y << ":"
+                  << g_worldSpawn.z << " (players with a saved position keep it)." << std::endl;
     if (g_legacySnapshot)
         std::cout << "[Server] --legacy-snapshot: pushing the plaintext ACTION world dump on JOIN."
                   << std::endl;

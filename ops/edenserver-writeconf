@@ -1,0 +1,73 @@
+#!/bin/sh
+# edenserver-writeconf — validate stdin and atomically replace the EnvironmentFile.
+#
+# Install:
+#     sudo install -m 0755 ops/edenserver-writeconf /usr/local/bin/edenserver-writeconf
+#
+# This is the ONLY path the edenadmin sudoers rule grants write access to /etc
+# through. It exists so the GUI never needs `sudo tee` (or `sudo sh -c`), either
+# of which is a full root primitive. It reads the proposed file on stdin,
+# rejects it unless every non-blank / non-comment line is EDEN_<KEY>=<value>,
+# checks the five required keys and a couple of value shapes, then installs it
+# with a temp file + rename(2) at mode 0600 root:root.
+#
+# Target path: /etc/edenserver.conf, or $EDENSERVER_CONF if set (edenadmin passes
+# it via `sudo -n env EDENSERVER_CONF=... edenserver-writeconf` for a profile
+# with a non-default env_file — the sudoers rule must permit that `env` form).
+set -eu
+
+DEST="${EDENSERVER_CONF:-/etc/edenserver.conf}"
+REQUIRED="EDEN_PORT EDEN_NAME EDEN_WORLD_DIR EDEN_MAX_WORLD_CELLS EDEN_PASSWORD"
+
+case "$DEST" in
+    /*) ;;
+    *) echo "edenserver-writeconf: EDENSERVER_CONF must be an absolute path: $DEST" >&2; exit 2 ;;
+esac
+
+dir=$(dirname "$DEST")
+tmp=$(mktemp "$dir/.edenserver-conf.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+cat > "$tmp"
+
+lineno=0
+while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    case "$line" in
+        '' | \#*) continue ;;
+    esac
+    case "$line" in
+        EDEN_*=*) ;;
+        *)
+            echo "edenserver-writeconf: line $lineno is not EDEN_<KEY>=<value>: $line" >&2
+            exit 2
+            ;;
+    esac
+    key=${line%%=*}
+    case "$key" in
+        *[!A-Z0-9_]*)
+            echo "edenserver-writeconf: line $lineno has a non-[A-Z0-9_] key: $key" >&2
+            exit 2
+            ;;
+    esac
+done < "$tmp"
+
+for k in $REQUIRED; do
+    if ! grep -q "^$k=" "$tmp"; then
+        echo "edenserver-writeconf: required key $k is missing" >&2
+        exit 2
+    fi
+done
+
+val() { sed -n "s/^$1=//p" "$tmp" | tail -n1; }
+port=$(val EDEN_PORT)
+cells=$(val EDEN_MAX_WORLD_CELLS)
+wdir=$(val EDEN_WORLD_DIR)
+case "$port" in '' | *[!0-9]*) echo "edenserver-writeconf: EDEN_PORT must be a positive integer: '$port'" >&2; exit 2 ;; esac
+case "$cells" in '' | *[!0-9]*) echo "edenserver-writeconf: EDEN_MAX_WORLD_CELLS must be a positive integer: '$cells'" >&2; exit 2 ;; esac
+case "$wdir" in /*) ;; *) echo "edenserver-writeconf: EDEN_WORLD_DIR must be an absolute path: '$wdir'" >&2; exit 2 ;; esac
+
+chmod 0600 "$tmp"
+chown root:root "$tmp" 2>/dev/null || true
+mv "$tmp" "$DEST"
+trap - EXIT
+echo "edenserver-writeconf: wrote $DEST"

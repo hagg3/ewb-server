@@ -1,0 +1,4 @@
+3 ban entr(y/ies):
+  10  (ip)
+  203.0.113.9  (ip)
+  Griefer  (name)

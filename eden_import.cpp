@@ -10,10 +10,11 @@
 // `worlds/<name>/` with `eden_world.model`, `eden_signs.txt`, `eden_spawn.txt`
 // and a `.gitignore`. See `docs/import.md`.
 //
-// This file owns argument parsing, file I/O and the summary. Every conversion
-// decision lives in `eden_import.h`, which is pure and unit-tested
-// (`eden_import_test.cpp`). Stage 5.2 adds the interactive prompt flow on top;
-// everything here already has a flag, so that stage adds no new capability.
+// This file owns argument parsing, file I/O, the summary and (stage 5.2) the
+// interactive prompt flow. Every conversion decision lives in `eden_import.h`,
+// which is pure and unit-tested (`eden_import_test.cpp`). The prompts add no
+// capability the flags lack: each one has a flag that pre-answers it, and `--yes`
+// or a non-terminal stdin takes every default.
 //
 //   clang++ -std=c++17 -O2 -Wall eden_import.cpp -lz -o eden_import
 
@@ -128,6 +129,28 @@ static std::string shq(const std::string& s) {
     return out + "'";
 }
 
+// ── interactive prompting (stage 5.2) ───────────────────────────────────────
+//
+// Every prompt below has a command-line flag that pre-answers it (and suppresses
+// it), and a default that is what the non-interactive path already uses. The
+// flow runs only on a real terminal; a pipe or `--yes` takes the defaults, so
+// nothing a script sees changes.
+
+static bool interactive() { return ::isatty(STDIN_FILENO) && ::isatty(STDERR_FILENO); }
+
+/// One line from stdin, trimmed. Returns `def` on empty input or EOF.
+static std::string ask(const std::string& question, const std::string& def) {
+    std::cerr << question;
+    if (!def.empty()) std::cerr << " [" << def << "]";
+    std::cerr << ": ";
+    std::string line;
+    if (!std::getline(std::cin, line)) { std::cerr << "\n"; return def; }
+    size_t b = line.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return def;
+    size_t e = line.find_last_not_of(" \t\r\n");
+    return line.substr(b, e - b + 1);
+}
+
 // ── usage ───────────────────────────────────────────────────────────────────
 
 static void usage() {
@@ -141,6 +164,7 @@ static void usage() {
 "  --out DIR                write here instead of worlds/<name>/\n"
 "  --force                  overwrite an existing output directory\n"
 "  --dry-run                project and print the summary, write nothing\n"
+"  -y, --yes                accept every prompt's default; no interactive questions\n"
 "\n"
 "Terrain\n"
 "  --air-fill diff|solid|full   what becomes a cell (default: diff)\n"
@@ -176,7 +200,9 @@ struct Args {
     std::string input;
     std::string name, out, signs, base_profile = "default", spawn_arg = "header";
     ImportOptions opt;
-    bool force = false, dry_run = false, no_signs = false, help = false;
+    bool force = false, dry_run = false, no_signs = false, help = false, yes = false;
+    // Which options the command line pinned — a pinned option is never prompted.
+    bool air_fill_set = false, spawn_set = false, name_set = false;
 };
 
 bool parse_size(const std::string& s, size_t& out) {
@@ -202,8 +228,9 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if      (f == "-h" || f == "--help") a.help = true;
-        else if (f == "--name")            a.name = next("a name");
-        else if (f == "--out")             a.out = next("a directory");
+        else if (f == "-y" || f == "--yes") a.yes = true;
+        else if (f == "--name")          { a.name = next("a name"); a.name_set = true; }
+        else if (f == "--out")           { a.out = next("a directory"); a.name_set = true; }
         else if (f == "--force")           a.force = true;
         else if (f == "--dry-run")         a.dry_run = true;
         else if (f == "--air-fill") {
@@ -212,11 +239,12 @@ int main(int argc, char** argv) {
                 std::cerr << "eden_import: unknown --air-fill " << v << " (diff|solid|full)\n";
                 return 2;
             }
+            a.air_fill_set = true;
         }
         else if (f == "--base-profile")    a.base_profile = next("default|none|FILE");
         else if (f == "--signs")           a.signs = next("a file");
         else if (f == "--no-signs")        a.no_signs = true;
-        else if (f == "--spawn")           a.spawn_arg = next("header|home|X,Y,Z|none");
+        else if (f == "--spawn")         { a.spawn_arg = next("header|home|X,Y,Z|none"); a.spawn_set = true; }
         else if (f == "--strict")          a.opt.strict = true;
         else if (f == "--max-world-cells") {
             if (!parse_size(next("a count"), a.opt.max_world_cells)) {
@@ -319,6 +347,63 @@ int main(int argc, char** argv) {
     }
     size_t signs_dropped = 0;
     const std::vector<Sign> signs = eden_convert_signs(src_signs, signs_dropped);
+
+    // ── interactive prompts (stage 5.2) ─────────────────────────────────────
+    // Only on a real terminal, and only for options the command line left open.
+    // Every branch here is a no-op under --yes, --dry-run or a pipe.
+    const bool ask_user = interactive() && !a.yes && !a.dry_run;
+
+    if (ask_user && !a.air_fill_set) {
+        std::cerr << "\nStrategy — what becomes a stored cell:\n";
+        std::cerr << "  name   cells         worst REGION   verdict\n";
+        const AirFill order[3] = {AirFill::Diff, AirFill::Solid, AirFill::Full};
+        for (AirFill af : order) {
+            ImportOptions probe = a.opt;
+            probe.air_fill = af;
+            const ImportProjection pp = eden_project(world, probe);
+            std::string verdict = "ok";
+            if (pp.sentinel_cells) verdict = "block id 255 collision (refused)";
+            else if (pp.cells > a.opt.max_world_cells) verdict = "over the cell cap";
+            else if (a.opt.max_region_records && pp.worst_region.records > a.opt.max_region_records)
+                verdict = "over the REGION budget";
+            char row[160];
+            snprintf(row, sizeof row, "  %-5s  %-12s  %-13s  %s\n",
+                     eden_air_fill_name(af), commas(pp.cells).c_str(),
+                     commas(pp.worst_region.records).c_str(), verdict.c_str());
+            std::cerr << row;
+        }
+        std::cerr << "diff is faithful (caves and all) at ~1% of full; see docs/import.md.\n";
+        for (;;) {
+            const std::string v = ask("strategy", eden_air_fill_name(a.opt.air_fill));
+            if (eden_parse_air_fill(v, a.opt.air_fill)) break;
+            std::cerr << "  not a strategy — pick diff, solid or full.\n";
+        }
+    }
+
+    if (ask_user && !a.spawn_set) {
+        const Spawn hs = eden_spawn_from(world.hdr, false);
+        const Spawn hm = eden_spawn_from(world.hdr, true);
+        char note[320];
+        snprintf(note, sizeof note,
+                 "\nSpawn point written to eden_spawn.txt:\n"
+                 "  header  %.2f, %.2f, %.2f%s\n"
+                 "  home    %.2f, %.2f, %.2f%s\n"
+                 "  none    do not write a spawn\n",
+                 hs.x, hs.y, hs.z, eden_spawn_in_range(hs) ? "" : "  (out of range)",
+                 hm.x, hm.y, hm.z, eden_spawn_in_range(hm) ? "" : "  (out of range)");
+        std::cerr << note;
+        for (;;) {
+            const std::string v = ask("spawn (header/home/none)", a.spawn_arg);
+            if (v == "header" || v == "home" || v == "none") { a.spawn_arg = v; break; }
+            std::cerr << "  answer header, home or none.\n";
+        }
+    }
+
+    if (ask_user && !a.name_set) {
+        const std::string def = eden_slug(world.hdr.name.empty() ? a.input : world.hdr.name);
+        const std::string v = ask("world directory name", def);
+        if (v != def) a.name = v;
+    }
 
     // ── spawn ───────────────────────────────────────────────────────────────
     bool have_spawn = true;
@@ -447,10 +532,18 @@ int main(int argc, char** argv) {
     }
 
     // ── write ───────────────────────────────────────────────────────────────
-    if (path_exists(outdir) && !a.force) {
-        std::cerr << "eden_import: error: " << outdir
-                  << " already exists. Pass --force to overwrite it.\n";
-        return 1;
+    if (path_exists(outdir) && !a.force && !a.yes) {
+        if (ask_user) {
+            const std::string v = ask(outdir + " exists — overwrite? (y/N)", "n");
+            if (v != "y" && v != "Y" && v != "yes") {
+                std::cerr << "eden_import: aborted; nothing written.\n";
+                return 1;
+            }
+        } else {
+            std::cerr << "eden_import: error: " << outdir
+                      << " already exists. Pass --force to overwrite it.\n";
+            return 1;
+        }
     }
     if (!make_dirs(outdir, err)) {
         std::cerr << "eden_import: " << err << "\n";
@@ -479,7 +572,6 @@ int main(int argc, char** argv) {
     std::cout << "\nrun it:  ./host_world.sh " << shq(outdir + "/eden_world.model") << " "
               << shq(world.hdr.name.empty() ? world_name : world.hdr.name) << " 27015\n";
     if (have_spawn)
-        std::cout << "         (eden_spawn.txt needs a server built from ROADMAP-SERVER stage 5.3;"
-                     " until then it is inert)\n";
+        std::cout << "         (a joining player with no saved position spawns there)\n";
     return 0;
 }

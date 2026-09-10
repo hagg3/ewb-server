@@ -6,8 +6,11 @@
 this file in the same commit.**
 
 Everything the server can be told is a **command-line argument**. `edenserver` itself reads
-**no environment variables at all**; the environment variables listed below belong to the build
-script, the ops wrapper, and the game client.
+**no environment variables at all**. The `EDEN_*` variables in
+[`/etc/edenserver.conf`](#the-systemd-environmentfile-etcedenserverconf) are expanded by
+*systemd* into that command line before the binary starts — the server never sees them. The
+other environment variables listed here belong to the build script, the ops wrapper, and the
+game client.
 
 ## Command-line arguments
 
@@ -34,10 +37,16 @@ server. Unknown flags are ignored.
 |---|---|---|
 | `--world FILE` | `eden_world.model` | World edit store. Created on first save if absent. |
 | `--signs FILE` | `eden_signs.txt` | Sign sidecar. Read at startup; the control socket's `signs add`/`rm`/`reload` also edit it. Absent is normal and silent. |
+| `--spawn-file FILE` | `eden_spawn.txt` beside `--world` | World default-spawn sidecar (one line `x:y:z`), as written by [`eden_import`](import.md). Read once at startup. Absent is normal and silent; a malformed line warns and is ignored. |
+| `--spawn x:y:z` | *(none)* | Set the world default spawn inline; overrides `--spawn-file` and skips reading it. |
 
 Player positions are always read from and written to `eden_players.txt` — there is no flag for
-it. All three paths are resolved **relative to the process working directory**, so run the
+it. All paths are resolved **relative to the process working directory**, so run the
 server from the world's directory (or pass absolute paths).
+
+The world default spawn is where a joining player who has **no `eden_players.txt` row of their
+own** is placed (`SPAWN` unicast). A returning player's saved position always wins; with neither,
+the client decides.
 
 ### Lifecycle
 
@@ -72,7 +81,9 @@ and one that sits silent for 300 s is closed so it cannot hold a slot.
 
 Filesystem permissions on the socket **are** the authentication — there is no password and
 nothing to point at a network address. Keep it inside the service user's directory. Under
-systemd that is automatic; the unit's `WorkingDirectory` is the world directory.
+systemd that is automatic: `ops/edenserver.service` passes
+`--control-socket ${EDEN_WORLD_DIR}/edenserver.sock`, so the socket always sits in the active
+world directory alongside the world files.
 
 ### Player commands
 
@@ -84,7 +95,7 @@ are load-bearing rather than convenience.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--no-worldedit` | commands on | Disable every in-chat command. Chat still works; a `/`-prefixed line gets a one-line refusal. |
-| `--we-max-cells N` | `131072` | Largest box a single command may read or write. Clamped to `1..4000000` (the world's edited-cell ceiling). A selection or radius larger than this is refused with its size, never silently truncated. **Also sets the operator `fill` cap**, at twice this value — both tiers bound the same cost (one pass over the world holding the world lock), so there is one number for it. |
+| `--we-max-cells N` | `131072` | Largest box a single command may read or write. Clamped to `1..--max-world-cells` (the world's edited-cell ceiling). A selection or radius larger than this is refused with its size, never silently truncated. **Also sets the operator `fill` cap**, at twice this value — both tiers bound the same cost (one pass over the world holding the world lock), so there is one number for it. |
 | `--we-rate N` | `32768` | Cells per second a player may spend. `0` disables the budget — the per-command cap in `--we-max-cells` still applies. |
 | `--we-burst N` | `262144` | Cells a player may spend at once before the sustained rate applies. Raised automatically to at least `--we-max-cells`, so one full-size command always fits. |
 | `--we-undo-budget N` | `2097152` | Bytes of undo **and** redo history per player, oldest batch evicted first. Raised automatically to hold at least one full `--we-max-cells` batch, so undo never discards the edit you just made. |
@@ -135,6 +146,7 @@ keeping a copy that outlives `journalctl --vacuum`.
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--max-world-cells N` | `4000000` | Ceiling on distinct edited world cells held in memory (and written to `eden_world.model`). New cells past it are refused; updates to existing cells always go through. Also the upper clamp for `--we-max-cells` and the derived `fill` cap. Raise it only to match a world [`eden_import`](import.md) was told to allow with its own `--max-world-cells` — your RAM is the real limit. A value below `1` falls back to the default with a warning; a non-default value is logged at startup. |
 | `--action-rate N` | `512` | Sustained terrain edits per second per connection. `0` disables the limit entirely. |
 | `--action-burst N` | `1024` | Edits a connection may spend at once before the sustained rate applies. |
 | `--connect-limit N` | `10` | New connections allowed per source IP per 10 s window. `0` disables. ⚠️ It is per *source address*, so a whole LAN behind one NAT address shares the allowance — as does a test harness on loopback. |
@@ -179,7 +191,7 @@ in `server_posix.cpp` (and its headers) if you must.
 | Max bytes buffered without a newline | 8192 |
 | Max chat message length | 256 bytes |
 | Max username length | 20 bytes |
-| Max distinct edited world cells | 4,000,000 |
+| Max distinct edited world cells | 4,000,000 by default — the value of `--max-world-cells` (see the server flag table) |
 | Max signs loaded | 20,000 |
 | Minimum gap between served `REGION`s | 750 ms |
 | `REGION`s served per session | 256 |
@@ -200,6 +212,59 @@ in `server_posix.cpp` (and its headers) if you must.
 | Failed-auth counting window | 60 s |
 | Auth lockout: base / max / reset-after | 60 s / 1 h (doubling) / 1 h idle |
 
+## The systemd EnvironmentFile (`/etc/edenserver.conf`)
+
+`ops/edenserver.service` reads its settings from `/etc/edenserver.conf` via
+`EnvironmentFile=-/etc/edenserver.conf`. Copy the template and edit it:
+
+```sh
+sudo install -m 0600 -o root -g root ops/edenserver.conf.example /etc/edenserver.conf
+sudoedit /etc/edenserver.conf
+sudo systemctl restart edenserver          # settings apply on restart
+```
+
+The leading `-` means a missing file is not a startup failure — but then the required keys
+expand to empty and the server exits with a flag error in the journal, so create the file. Only
+`ops/edenserver.service` uses this; `./edenserver` run by hand still takes plain flags, and
+`host_world.sh` is unchanged.
+
+### Keys
+
+| Key | In `ExecStart` as | Default (template) | Maps to |
+|---|---|---|---|
+| `EDEN_PORT` | `--port ${EDEN_PORT}` | `27015` | `--port` |
+| `EDEN_NAME` | `--name ${EDEN_NAME}` | `Eden Server` | `--name` |
+| `EDEN_WORLD_DIR` | `--world ${EDEN_WORLD_DIR}/eden_world.model` and the sign / spawn / ban / ops / control-socket paths | `/var/lib/edenserver/world` | the active world directory |
+| `EDEN_MAX_WORLD_CELLS` | `--max-world-cells ${EDEN_MAX_WORLD_CELLS}` | `4000000` | `--max-world-cells` |
+| `EDEN_PASSWORD` | `--password ${EDEN_PASSWORD}` | *(empty)* | `--password`; empty is identical to omitting it (open server) |
+| `EDEN_EXTRA_ARGS` | a bare `$EDEN_EXTRA_ARGS` tail | *(absent)* | any spaceless optional flags: `--matchmaker HOST:PORT`, `--spawn x:y:z`, `--audit-file PATH`, `--default-level N`, … |
+
+### The `${VAR}` vs `$VAR` rule
+
+systemd expands the two forms differently, and getting it wrong is a real bug:
+
+- **`${VAR}` (braced)** → exactly **one** argument, spaces preserved — *even when the value is
+  empty*, in which case it passes an empty string argument. Used for the five keys above, each
+  of which the template always sets.
+- **`$VAR` (bare)** → split on whitespace into **zero or more** arguments, no quote handling.
+  Used once, for `EDEN_EXTRA_ARGS`, which therefore vanishes cleanly when the key is empty or
+  absent.
+
+So a setting that is *optional* **and** can contain a space cannot be its own `${VAR}` — an
+unset `--matchmaker ${EDEN_MATCHMAKER}` would dial the empty host forever. Those go in
+`EDEN_EXTRA_ARGS`. Hostnames, ports and coordinates have no spaces and are fine there.
+`edenadmin`'s **Config** panel writes an empty `EDEN_EXTRA_ARGS` by *omitting the line*, for
+this reason.
+
+### `ops/edenserver-writeconf`
+
+The only path with write access to `/etc/edenserver.conf` that `edenadmin`'s sudoers rule
+grants (never `sudo tee`). It reads the proposed file on stdin, rejects it unless every
+non-blank / non-comment line is `EDEN_<KEY>=<value>`, checks the five required keys and that
+`EDEN_PORT` / `EDEN_MAX_WORLD_CELLS` are positive integers and `EDEN_WORLD_DIR` is absolute,
+then installs it atomically (temp file + `rename(2)`) at `0600 root:root`. Target path is
+`/etc/edenserver.conf` or `$EDENSERVER_CONF` if set.
+
 ## `host_world.sh`
 
 A convenience launcher. It builds `edenserver` first if it is missing, then execs it.
@@ -218,7 +283,11 @@ A convenience launcher. It builds `edenserver` first if it is missing, then exec
 
 If an `eden_signs.txt` sits in the same directory as `worldFile`, it is passed as `--signs`.
 That is what makes a world written by `eden_import` — which puts every file in its own
-directory — load its signs without a second flag.
+directory — load its signs without a second flag. `eden_spawn.txt` in that directory is picked
+up by the server itself, so it needs no flag here either.
+
+Any arguments after the fifth position are forwarded to `edenserver` verbatim, e.g.
+`./host_world.sh w "N" 27015 "" 127.0.0.1 --max-world-cells 8000000`.
 
 ⚠️ It **always** passes `--matchmaker`, defaulting to `127.0.0.1`. With no matchmaker running
 there, the server retries the registration in the background every few seconds; it serves
@@ -241,16 +310,22 @@ numbers are in [import.md](import.md); the flags:
 | `--out DIR` | `worlds/<name>` | Write here instead. |
 | `--force` | off | Overwrite an existing output directory. |
 | `--dry-run` | off | Project and print the summary; write nothing. |
+| `-y`, `--yes` | off | Take every prompt's default; no interactive questions. Implies `--force`. This plus the flags below is the scripting path. |
 | `--air-fill diff\|solid\|full` | `diff` | Which voxels become cells. `diff` emits only what differs from the client's base terrain; `solid` drops air (sub-surface voids fill in); `full` emits every voxel. |
 | `--base-profile default\|none\|FILE` | `default` | The terrain `diff` compares against. Ignored by the other two strategies. |
 | `--signs FILE` | `signs_<input>.dat` beside the input | The sign sidecar. Takes precedence over the world's inline sign trailer. |
 | `--no-signs` | off | Ignore signs entirely. |
 | `--spawn header\|home\|X,Y,Z\|none` | `header` | What goes into `eden_spawn.txt`. |
-| `--max-world-cells N` | `4000000` | Refuse above this many cells. Matches the server's own cap. |
+| `--max-world-cells N` | `4000000` | Refuse above this many cells. Matches the server's `--max-world-cells` default; raise both together. |
 | `--max-region-records N` | `2000000` | Refuse if any single `REGION` reply would carry more records than this. `0` disables the check. |
 | `--region-radius N` | `224` | Match a server started with `--region-radius`; changes the size of the box the projection slides. |
 | `--strict` | off | Treat unknown block ids and out-of-palette paints as errors instead of warnings. |
 | `-h`, `--help` | — | Usage. |
+
+Run on a terminal with no options pinned, `eden_import` walks through the strategy (with the
+projected cell and `REGION` numbers for each), the spawn source, the output name and the
+overwrite confirmation. Each prompt is skipped when the matching flag is given; a pipe or
+`--yes` skips all of them and takes the defaults. See [import.md](import.md#interactive-session).
 
 A block type of `255` is always a hard error: it collides with the server's painted-base
 sentinel, so those cells would be silently dropped from every `REGION` reply.
@@ -321,13 +396,38 @@ arguments. It does **not** launch `edenserver`, which is the POSIX build. On Win
 
 ### Ops wrapper
 
-`ops/edenserverctl` (a thin `systemctl`/`journalctl` wrapper with a `backup` verb) reads:
+`ops/edenserverctl` — `start` / `stop` / `restart` / `status [--porcelain]` / `logs [N]` /
+`logs-tail [N]` / `backup` — is a thin `systemctl` / `journalctl` wrapper. It reads:
 
 | Variable | Default |
 |---|---|
 | `EDENSERVER_SERVICE` | `edenserver` |
-| `EDENSERVER_WORLD_DIR` | `/var/lib/edenserver/world` |
-| `EDENSERVER_BACKUP_DIR` | `/var/lib/edenserver/backups` |
+| `EDENSERVER_WORLD_DIR` | `$EDEN_WORLD_DIR`, else `/var/lib/edenserver/world` |
+| `EDENSERVER_BACKUP_DIR` | `$EDEN_BACKUP_DIR`, else `/var/lib/edenserver/backups` |
+| `EDENSERVER_BACKUP_COMPRESS` | `$EDEN_BACKUP_COMPRESS`, else `1` (gzip backups; `0` = plain copies) |
+| `EDENSERVER_BACKUP_LEVEL` | `$EDEN_BACKUP_LEVEL`, else `6` (gzip level, 1–9) |
+
+The `EDEN_*` forms are honoured as a fallback so
+`ops/edenserver-backup.{service,timer}` can back up whichever world is active just by sourcing
+`/etc/edenserver.conf`.
+
+- `status --porcelain` prints machine-readable `Key=Value` lines (`ActiveState`, `SubState`,
+  `MainPID`, `ExecMainStartTimestamp`, `Result`) with no pager and no follow.
+- `logs-tail [N]` is `journalctl -u <svc> -n N --no-pager` with **no** `-f` — the scriptable
+  counterpart to `logs`, which follows forever.
+- `backup` runs `edenctl save` first (best effort) then **gzips** the world files —
+  `eden_world.model`, `eden_players.txt`, `eden_signs.txt`, `eden_spawn.txt`, whichever exist —
+  into `$EDENSERVER_BACKUP_DIR/<UTC stamp>/` as `<name>.gz`. A world file is one plaintext
+  `x:y:z:type:color` line per edited cell and deflates to roughly a sixth of its size (a 40 MB
+  world → ~7 MB); nothing reads a backup directly, so they are compressed by default. Level 6 is
+  the default because 9 costs several times the CPU for a few percent. Each archive is written to
+  a sibling `.tmp` and `mv`'d into place, so an interrupted backup leaves no truncated file, and
+  the archive keeps the source's mtime. Restore with
+  `gunzip -c <backup>/eden_world.model.gz > <world dir>/eden_world.model` while the server is
+  stopped. `EDENSERVER_BACKUP_COMPRESS=0` restores the old plain-`cp` behaviour; if `gzip` is
+  missing the command warns and copies plain rather than failing.
+  `ops/edenserver-backup.timer` (`OnCalendar=hourly`, `Persistent=true`) runs it on a schedule;
+  install with `sudo systemctl enable --now edenserver-backup.timer`.
 
 ### Client side
 
@@ -448,9 +548,11 @@ x:y:z
 
 Coordinates are floats in server order — `x` and `z` horizontal, `y` height.
 
-> **Written, not yet read.** `eden_import` produces this file today; the server gains the code
-> to load it in ROADMAP stage 5.3. Until then it is inert, and a joining player with no
-> `eden_players.txt` row lands wherever the client puts them.
+Read once at startup, from `eden_spawn.txt` beside the world file (or `--spawn-file`), and
+overridden by `--spawn x:y:z`. A joining player with **no `eden_players.txt` row** is sent here
+with a `SPAWN` unicast; a returning player keeps their saved position. A missing file is silent;
+a malformed line prints one warning and is ignored (never fatal). Hand-edit friendly: `#`
+comments and blank lines are skipped, the first valid line wins.
 
 ### `worlds/<name>/`
 
@@ -461,7 +563,7 @@ directory:
 worlds/<name>/
   eden_world.model   the world            (--world)
   eden_signs.txt     signs                (--signs; host_world.sh derives it)
-  eden_spawn.txt     default spawn        (stage 5.3)
+  eden_spawn.txt     default spawn        (--spawn-file; served on join)
   .gitignore         `*` plus `!.gitignore`
   edenserver.sock    the control socket, created at run time
 ```

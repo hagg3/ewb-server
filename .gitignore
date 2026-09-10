@@ -18,6 +18,9 @@ WORKING/
 *.o
 *.obj
 
+# --- edenadmin operator GUI (admin/, opt-in via build_server.sh --with-admin) ---
+/admin/edenadmin
+
 # --- Runtime state written when ./edenserver is run from the repo root ---
 /eden_players.txt
 /eden_world.model

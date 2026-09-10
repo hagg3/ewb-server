@@ -75,6 +75,11 @@ Supporting files: `build_server.sh` (build + run all suites), `host_world.sh`
 not by the build — they bind a port and spawn processes), `worlds/<name>/` (sample worlds),
 `testdata/` (committed golden files for the offline suites).
 
+`admin/` is a separate, optional Go module — `edenadmin`, a local operator GUI that drives
+`edenctl` / `eden_import` / `ssh` (`admin/README.md`). It is not built by the default
+`build_server.sh` and is not needed to run a server; `./build_server.sh --with-admin` or
+`admin/build.sh` builds it. The server stays a single POSIX translation unit plus pure headers.
+
 `phase3_live_test.py` is the adversarial counterpart to the offline suites: the suites prove the
 command-surface bounds are correct, and it tries to break them over real sockets — oversized
 selections against every command that reads one, permission escalation by casing and prefix
@@ -228,7 +233,7 @@ snapshot regardless of the order edits arrived in.
 
 ## Persistence
 
-Three plaintext files, all read at startup and all written relative to the process working
+Plaintext files, all read at startup and all written relative to the process working
 directory (see [configuration.md](configuration.md) for the grammars):
 
 | File | Written | Notes |
@@ -236,6 +241,7 @@ directory (see [configuration.md](configuration.md) for the grammars):
 | `eden_world.model` | autosave, and when a client disconnects | only when the dirty flag is set |
 | `eden_players.txt` | same | last known position per username |
 | `eden_signs.txt` | never | read-only; operator-authored |
+| `eden_spawn.txt` | never | read-only; the default spawn for a player with no `eden_players.txt` row. `--spawn`/`--spawn-file` override. Malformed → one warning, ignored |
 
 Writes are **atomic and serialised**: the snapshot is taken under the data lock, written to a
 `.tmp` file, flushed, and `rename()`d over the real file while holding `g_saveMtx`. A crash or

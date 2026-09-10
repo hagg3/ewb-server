@@ -1,0 +1,2 @@
+Filesystem     1024-blocks     Used Available Capacity Mounted on
+/dev/sda1         41251136 12034560  27100480      31% /var/lib/edenserver

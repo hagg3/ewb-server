@@ -45,6 +45,7 @@
 #include "hardening.h"      // sanitize_text, MAX_BLOCK_TYPE, MAX_PAINT_INDEX
 #include "region_query.h"   // region_box, CELL_* sentinels, REGION_RADIUS
 #include "sign_store.h"     // Sign, SIGN_COORD_MAX, SIGN_Y_MAX, SIGN_TEXT_MAX
+#include "spawn_store.h"    // Spawn, format_spawn_line (eden_spawn.txt grammar)
 
 namespace ewb {
 
@@ -436,15 +437,10 @@ inline std::string eden_build_signs(const std::vector<Sign>& signs) {
 
 // ── spawn ───────────────────────────────────────────────────────────────────
 
-struct Spawn { float x = 0, y = 0, z = 0; };
-
-/// `eden_spawn.txt` — one line `x:y:z`, two decimals, matching the precision the
-/// `SPAWN` unicast and `eden_players.txt` already use.
-inline std::string eden_format_spawn(const Spawn& s) {
-    char buf[96];
-    const int n = snprintf(buf, sizeof buf, "%.2f:%.2f:%.2f\n", s.x, s.y, s.z);
-    return std::string(buf, n > 0 ? size_t(n) : 0);
-}
+// `Spawn` and the `eden_spawn.txt` line grammar live in `spawn_store.h`, shared
+// verbatim with the server that reads the file back (stage 5.3). This alias keeps
+// the CLI call sites reading `eden_format_spawn`.
+inline std::string eden_format_spawn(const Spawn& s) { return format_spawn_line(s); }
 
 /// The header's `pos` is already in server order — `(x_plane, height, y_plane)`
 /// — so unlike blocks and signs it needs no rename. `pos` is the default source

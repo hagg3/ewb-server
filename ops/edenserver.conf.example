@@ -1,0 +1,75 @@
+# /etc/edenserver.conf — environment for the edenserver systemd unit.
+#
+# Install once:
+#     sudo install -m 0600 -o root -g root ops/edenserver.conf.example /etc/edenserver.conf
+#     sudoedit /etc/edenserver.conf
+# The unit reads it via `EnvironmentFile=-/etc/edenserver.conf`. Apply a change with:
+#     sudo systemctl restart edenserver
+# edenadmin's Config panel edits this file for you, through ops/edenserver-writeconf.
+#
+# ---------------------------------------------------------------------------
+# systemd variable-expansion rules — read before editing ExecStart or this file
+#
+#   ${VAR}  (braced)  expands to exactly ONE argument, spaces and all, even when
+#                     the value is empty. The unit uses it for the five keys
+#                     below, each of which is ALWAYS set here.
+#   $VAR    (bare)    splits on whitespace into zero-or-more arguments, with no
+#                     quote handling. The unit uses it once, for EDEN_EXTRA_ARGS,
+#                     which simply vanishes when the key is absent or empty.
+#
+# Consequence: a setting that is optional AND may contain a space cannot be a
+# braced ${VAR} — an unset braced var still passes an *empty* argument, so
+# `--matchmaker ${EDEN_MATCHMAKER}` with nothing set would dial the empty host
+# forever. Optional flags therefore go in EDEN_EXTRA_ARGS. Hostnames, ports,
+# coordinates and spaceless paths are all fine there.
+# ---------------------------------------------------------------------------
+
+# --- required: always set, referenced as ${VAR} in ExecStart ---
+
+# TCP port. Binds all interfaces.
+EDEN_PORT=27015
+
+# Server name shown to a matchmaker. Spaces are fine (braced expansion).
+EDEN_NAME=Eden Server
+
+# The active world directory: eden_world.model, the sign / spawn / ban / ops
+# sidecars and the control socket all live here. edenadmin's Worlds panel
+# rewrites this line to switch worlds. Point it at
+# /var/lib/edenserver/worlds/<name> for a multi-world host, or keep the classic
+# single /var/lib/edenserver/world.
+EDEN_WORLD_DIR=/var/lib/edenserver/world
+
+# Edited-cell ceiling (the server's --max-world-cells). 4000000 is the server
+# default; raise it only to match a world eden_import was told to allow with its
+# own --max-world-cells. edenadmin bumps this automatically when you
+# import-and-activate a world above the default cap.
+EDEN_MAX_WORLD_CELLS=4000000
+
+# World password. EMPTY = open server (identical to omitting --password). A value
+# travels the network in plaintext and is visible in `ps` / `systemctl show`;
+# treat it as a griefer speed bump, not a secret. See ops/INSTALL.md.
+EDEN_PASSWORD=
+
+# --- optional: a whitespace-split tail, omitted from this file when empty ---
+#
+# Space-free optional flags only. Examples:
+#   --matchmaker eden.example.net:27020
+#   --spawn 65536:40:65536
+#   --audit-file /var/lib/edenserver/world/audit.log
+#   --default-level 1
+#   --connect-limit 20
+EDEN_EXTRA_ARGS=
+
+# --- optional: read by edenserverctl backup, ignored by the server ---
+#
+# Where `edenserverctl backup` writes timestamped snapshots. Default:
+#   /var/lib/edenserver/backups
+#EDEN_BACKUP_DIR=/var/lib/edenserver/backups
+#
+# Backups are gzipped by default (a world file is plaintext and shrinks to
+# roughly a sixth). Set to 0 to store the raw bytes instead.
+#EDEN_BACKUP_COMPRESS=1
+#
+# gzip level 1-9. 6 is the default; 9 buys only a few percent on world data for
+# several times the CPU, and 1 is worth it only on a very slow disk-bound host.
+#EDEN_BACKUP_LEVEL=6

@@ -32,6 +32,9 @@ build is not usable.
 
 The script uses `$CXX` if set, otherwise prefers `clang++` and falls back to `g++`.
 
+`./build_server.sh --with-admin` additionally builds `admin/edenadmin`, an optional local
+operator GUI (needs a Go toolchain). It is not required to run a server — see `admin/README.md`.
+
 Two live tests are **not** run by the build, because they bind a port and spawn server
 processes. Run them by hand — the second one especially, before you host anything publicly:
 
