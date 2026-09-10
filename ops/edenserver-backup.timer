@@ -1,0 +1,21 @@
+# edenserver-backup.timer — periodic world backups.
+#
+# OnCalendar=hourly is a sensible default: backups are gzipped (about a second of
+# CPU for a large world, a sixth of the disk) and `edenserverctl backup` is
+# otherwise cheap. Change the cadence with `sudoedit` + a
+# `systemctl daemon-reload`, or disable it with
+#     sudo systemctl disable --now edenserver-backup.timer
+#
+# Persistent=true runs a missed backup once after downtime. Prune old backups
+# separately (see ops/INSTALL.md § Backups) — this timer only creates them.
+
+[Unit]
+Description=Periodic Eden world backup
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

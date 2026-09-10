@@ -1,0 +1,90 @@
+:root {
+  --bg: #14171c; --panel: #1c2027; --ink: #e7e9ee; --muted: #9aa3b2;
+  --line: #2c313b; --accent: #5c9ded; --ok: #4caf6d; --bad: #e5695f; --warn: #d9a441;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  background: var(--bg); color: var(--ink);
+}
+header {
+  display: flex; align-items: baseline; gap: .75rem;
+  padding: .75rem 1.25rem; border-bottom: 1px solid var(--line);
+}
+header h1 { font-size: 1.1rem; margin: 0; letter-spacing: .02em; }
+.muted { color: var(--muted); }
+code { background: #0f1114; padding: .1em .35em; border-radius: 3px; font-size: .92em; }
+
+nav#tabs { display: flex; gap: .25rem; padding: .5rem 1.25rem 0; border-bottom: 1px solid var(--line); }
+nav#tabs button {
+  background: none; border: 1px solid transparent; border-bottom: none;
+  color: var(--muted); padding: .5rem .9rem; border-radius: 6px 6px 0 0; cursor: pointer;
+}
+nav#tabs button.active { color: var(--ink); background: var(--panel); border-color: var(--line); }
+nav#tabs button:disabled { opacity: .4; cursor: not-allowed; }
+
+main { padding: 1.25rem; max-width: 900px; }
+.panel h2 { margin-top: 0; }
+.row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: end; margin: 1rem 0; }
+label { display: flex; flex-direction: column; gap: .25rem; font-size: .85rem; color: var(--muted); }
+input, select {
+  background: #0f1114; border: 1px solid var(--line); color: var(--ink);
+  padding: .4rem .5rem; border-radius: 5px; font: inherit; min-width: 12rem;
+}
+button {
+  background: #262b34; border: 1px solid var(--line); color: var(--ink);
+  padding: .45rem .85rem; border-radius: 5px; cursor: pointer; font: inherit;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #0c1017; font-weight: 600; }
+button.danger { border-color: var(--bad); color: var(--bad); }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: .75rem; margin: 1rem 0; }
+details#editor { margin-top: 1.5rem; border-top: 1px solid var(--line); padding-top: .75rem; }
+summary { cursor: pointer; color: var(--accent); }
+
+#test-results { margin: 1rem 0; }
+.probe {
+  border: 1px solid var(--line); border-left-width: 3px; border-radius: 5px;
+  padding: .5rem .75rem; margin: .4rem 0; background: var(--panel);
+}
+.probe.ok { border-left-color: var(--ok); }
+.probe.bad { border-left-color: var(--bad); }
+.probe .name { font-weight: 600; }
+.probe .cmd { display: block; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .82rem; margin: .25rem 0; white-space: pre-wrap; word-break: break-all; }
+.probe .detail { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .82rem; }
+.hidden { display: none; }
+
+/* stage 6.2 — Status / Players / Logs */
+.kv { display: flex; gap: .75rem; padding: .3rem 0; border-bottom: 1px solid var(--line); }
+.kv .k { color: var(--muted); min-width: 9rem; }
+table.grid-table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
+table.grid-table th, table.grid-table td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid var(--line); }
+table.grid-table th { color: var(--muted); font-weight: 600; font-size: .82rem; }
+.warn-tag { color: var(--warn); font-size: .8rem; }
+pre.logbox {
+  background: #0f1114; border: 1px solid var(--line); border-radius: 5px;
+  padding: .6rem .8rem; max-height: 60vh; overflow: auto;
+  font: .82rem/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all;
+}
+.logline.tag-Server  { color: var(--accent); }
+.logline.tag-Control { color: var(--warn); }
+.logline.tag-Audit   { color: var(--ok); }
+
+/* stage 6.3 — write actions */
+#power-row button:disabled { opacity: .4; cursor: not-allowed; }
+.row-actions { display: flex; gap: .35rem; flex-wrap: wrap; }
+.row-actions button { padding: .2rem .55rem; font-size: .8rem; }
+.bad-text { color: var(--bad); }
+
+/* stage 6.4 — worlds */
+details.world-tool { margin-top: 1rem; border-top: 1px solid var(--line); padding-top: .75rem; }
+label.chk { flex-direction: row; align-items: center; gap: .4rem; color: var(--ink); }
+label.chk input { min-width: 0; }
+#imp-write:disabled { opacity: .4; cursor: not-allowed; }
+#imp-summary { margin-top: 1rem; }
+#imp-summary code.cmd, #test-results code.cmd {
+  display: block; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .82rem; margin: .35rem 0; white-space: pre-wrap; word-break: break-all;
+}

@@ -1,0 +1,10 @@
+world "Sentinel"  (version 4, 64z, 4 saved chunks, 0 signs from none)
+  bounding box  x 65536..65599   y 32..40   z 65536..65599   (server coords)
+  strategy      diff (base profile: default)
+  cells         41,022  of 4,000,000 cap  (1.0%)
+  worst REGION  6,120 records  at x 65536..65999, z 65536..65999
+                (largest reply ever captured from the real server: 507,000 records)
+  signs         0 convertible
+  spawn         65568.00, 33.00, 65568.00  (header)
+  sky colours   14 14 14 14 14 14 14 14 14 14 14 14 14 14 14 14
+                (informational — the wire protocol carries no sky message)

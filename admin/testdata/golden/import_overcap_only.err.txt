@@ -1,0 +1,2 @@
+eden_import: error: 4,004,403 cells exceeds the 4,000,000 cap. Either import with --air-fill diff, or raise both ceilings: eden_import --max-world-cells 4004403 and edenserver --max-world-cells 4004403.
+eden_import: warning: the worst single REGION reply (3,589,952 records) is larger than any reply ever captured from the real server (507,000). Watch the first join.

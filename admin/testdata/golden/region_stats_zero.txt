@@ -1,0 +1,7 @@
+REGION service since start:
+  requests served : 0
+  cells scanned   : 0
+  records emitted : 0
+  bytes out       : 0
+  total time      : 0 ms
+  mean per region : 0 ms

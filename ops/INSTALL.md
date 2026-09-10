@@ -7,8 +7,12 @@ Artifacts in this directory:
 
 | File | Purpose |
 |---|---|
-| `edenserver.service` | systemd unit template |
-| `edenserverctl` | `start`/`stop`/`restart`/`status`/`logs`/`backup` wrapper |
+| `edenserver.service` | systemd unit template (reads `/etc/edenserver.conf`) |
+| `edenserver.conf.example` | the `EnvironmentFile` template — `EDEN_*` settings |
+| `edenserver-writeconf` | validating, atomic writer for `/etc/edenserver.conf` (used by `edenadmin`) |
+| `edenserverctl` | `start`/`stop`/`restart`/`status`/`logs`/`logs-tail`/`backup` wrapper |
+| `edenserver-backup.{service,timer}` | scheduled `edenserverctl backup` (hourly) |
+| `sudoers.d/edenadmin` | optional NOPASSWD drop-in so the `edenadmin` GUI drives this box over ssh |
 | `fail2ban/` | optional filter + jail for OS-level banning of password guessers |
 | `INSTALL.md` | this document |
 
@@ -21,8 +25,11 @@ Assumed layout (all paths configurable — see below):
 /usr/local/bin/edenserver          the binary (built on this box)
 /usr/local/bin/edenserverctl       the management wrapper
 /usr/local/bin/edenctl             the control-socket client
+/usr/local/bin/edenserver-writeconf the validating conf writer (for edenadmin)
+/etc/edenserver.conf                EDEN_* settings, read by the unit
 /var/lib/edenserver/                owned by the edenserver user
-  world/                            WorkingDirectory — world/player/sign files live here
+  world/                            the classic single world (EDEN_WORLD_DIR)
+  worlds/<name>/                    a multi-world host points EDEN_WORLD_DIR here
   backups/                          timestamped backup dirs
 ```
 
@@ -42,6 +49,7 @@ git clone https://github.com/hagg3/ewb-server && cd ewb-server
 ./build_server.sh                       # picks clang++ if present, else g++
 sudo install -m 0755 edenserver /usr/local/bin/edenserver
 sudo install -m 0755 ops/edenserverctl /usr/local/bin/edenserverctl
+sudo install -m 0755 ops/edenserver-writeconf /usr/local/bin/edenserver-writeconf
 sudo install -m 0755 edenctl /usr/local/bin/edenctl
 ```
 
@@ -68,22 +76,37 @@ sudo -u edenserver cp /path/to/eden_signs.txt   /var/lib/edenserver/world/   # i
 
 ---
 
-## 3. Install the unit
+## 3. Install the unit and its config file
+
+The unit no longer carries settings on its `ExecStart` line — they live in
+`/etc/edenserver.conf`, which it reads via `EnvironmentFile=`. Install both:
 
 ```sh
 sudo cp ops/edenserver.service /etc/systemd/system/edenserver.service
-sudoedit /etc/systemd/system/edenserver.service    # adjust ExecStart: --port, --name, paths
+sudo install -m 0600 -o root -g root ops/edenserver.conf.example /etc/edenserver.conf
+sudoedit /etc/edenserver.conf          # set EDEN_PORT, EDEN_NAME, EDEN_WORLD_DIR, EDEN_PASSWORD
 sudo systemctl daemon-reload
 ```
 
+`/etc/edenserver.conf` keys and the `${VAR}` vs `$VAR` expansion rule are documented in
+[`docs/configuration.md`](../docs/configuration.md#the-systemd-environmentfile-etcedenserverconf)
+and in the template's own header. In short: the five required keys are always set and expand as
+braced `${VAR}` (one argument each); every optional spaceless flag goes in `EDEN_EXTRA_ARGS`,
+a bare `$VAR` tail that disappears when empty.
+
 Notes on the unit (full rationale is in the file's comments):
 
-- `WorkingDirectory=/var/lib/edenserver/world` — the server reads and writes
-  `eden_world.model`, `eden_players.txt`, `eden_signs.txt` relative to its CWD.
+- `WorkingDirectory=/var/lib/edenserver` — only a fallback now; every world file is addressed
+  absolutely off `${EDEN_WORLD_DIR}`, including `--control-socket`.
+- `EnvironmentFile=-/etc/edenserver.conf` — the leading `-` tolerates a missing file so
+  `daemon-reload` never breaks, but the server then errors on the empty flags. Create the file.
 - `Restart=on-failure` — **not** `Restart=always`. `--idle-timeout` makes the
   server `exit(0)` cleanly when empty; `Restart=always` would treat that clean
   exit as something to restart and spin a start/idle/exit loop. The template
-  does not pass `--idle-timeout`; if you add it, keep `on-failure`.
+  does not pass `--idle-timeout`; if you add it (in `EDEN_EXTRA_ARGS`), keep `on-failure`.
+- `TimeoutStopSec=20` — headroom for a graceful stop. The server has no `SIGTERM` handler yet,
+  so `systemctl stop` still loses up to one autosave interval; `edenadmin` stops it through
+  `edenctl stop` instead.
 - `StandardOutput=journal` + the binary's own `std::unitbuf` give live logs.
   Run the binary directly (as `ExecStart` does) — don't wrap it in a shell
   pipeline or `stdbuf`, which would re-buffer its output.
@@ -130,22 +153,49 @@ edenserverctl logs            # journalctl -u edenserver, follows
 
 ```sh
 edenserverctl backup
-# -> /var/lib/edenserver/backups/20260908T181104Z/{eden_world.model,eden_players.txt,eden_signs.txt}
+# -> /var/lib/edenserver/backups/20260908T181104Z/{eden_world.model,eden_players.txt,eden_signs.txt}.gz
 ```
 
-Run it from cron / a systemd timer as often as you like:
+Backups are **gzipped**. `eden_world.model` is one plaintext `x:y:z:type:color` line per edited
+cell, which deflates hard — a 40 MB world lands at about 7 MB — and nothing reads a backup
+directly, so an hourly timer keeping raw copies just burns disk. `EDEN_BACKUP_LEVEL` (default 6)
+tunes it; 9 buys a few percent for several times the CPU. `EDEN_BACKUP_COMPRESS=0` stores plain
+copies as before. Restore a file by decompressing it back into the world dir:
+
+```sh
+edenserverctl stop
+gunzip -c /var/lib/edenserver/backups/20260908T181104Z/eden_world.model.gz \
+    > /var/lib/edenserver/world/eden_world.model
+edenserverctl start
+```
+
+Run it on a schedule. The shipped systemd timer (hourly, with catch-up after downtime) is the
+recommended path — it sources `/etc/edenserver.conf`, so it always backs up whichever world
+`EDEN_WORLD_DIR` names:
+
+```sh
+sudo cp ops/edenserver-backup.service ops/edenserver-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now edenserver-backup.timer
+systemctl list-timers edenserver-backup.timer
+```
+
+Or a plain cron line if you prefer:
 
 ```sh
 # /etc/cron.d/edenserver-backup — hourly
 0 * * * * edenserver /usr/local/bin/edenserverctl backup >/dev/null
 ```
 
+Neither prunes old backups — add a second line / timer for that (see the VPS guide's Part 6).
+
 `edenserverctl backup` asks the running server to `save` first (via `edenctl` on
-the control socket) so the copy is current, then does an atomic-safe `cp` of each
-world file. If the server is stopped or the control socket is unavailable it
-falls back to a plain `cp`, which is still safe: the server publishes each
-world/player file with a temp-write + `rename(2)`, so a backup never catches a
-torn file.
+the control socket) so the copy is current, then compresses each world file into
+the snapshot dir via a staged `.tmp` + `mv`, so a crash mid-backup can't leave a
+truncated `.gz` that looks complete. If the server is stopped or the control
+socket is unavailable it skips the `save` and snapshots what is on disk, which is
+still safe: the server publishes each world/player file with a temp-write +
+`rename(2)`, so a backup never catches a torn file.
 
 ---
 
@@ -164,11 +214,12 @@ systemctl is-enabled edenserver # enabled
 
 ```sh
 edenserverctl backup
-ls -l /var/lib/edenserver/backups/*/    # world/player(/sign) files, non-zero size, current timestamp
+ls -l /var/lib/edenserver/backups/*/    # world/player(/sign) .gz files, non-zero size, current timestamp
+gunzip -t /var/lib/edenserver/backups/*/*.gz && echo "archives intact"
 ```
 
-Restore test: stop the service, copy a backup's files back into `world/`, start,
-and confirm the world loads (`Loaded N world cells` in the log).
+Restore test: stop the service, `gunzip -c` a backup's files back into `world/`,
+start, and confirm the world loads (`Loaded N world cells` in the log).
 
 **c. journald has live logs.**
 
@@ -190,13 +241,46 @@ journalctl -u edenserver | grep '\[Audit\]'
 edenctl say "audit check"        # should produce one immediately
 ```
 
-If you want a copy that outlives journald's retention, add `--audit-file
-/var/lib/edenserver/world/audit.log` to the unit's `ExecStart` and rotate it like any other log
-(the server reopens the file per line, so `logrotate` needs no `copytruncate` and no signal).
+If you want a copy that outlives journald's retention, add
+`--audit-file /var/lib/edenserver/world/audit.log` to `EDEN_EXTRA_ARGS` in
+`/etc/edenserver.conf` (the path has no spaces, so the bare-`$` tail is fine) and rotate it
+like any other log — the server reopens the file per line, so `logrotate` needs no
+`copytruncate` and no signal.
 
 ---
 
-## 8. Optional: fail2ban for password guessers
+## 8. Optional: the `edenadmin` operator GUI
+
+`edenadmin` is a small Go binary you run **on your own machine** (not the VPS). It serves a
+local web UI that drives this server over `ssh` — the same `ssh` key you already use, no new
+port and no new credential on the box. Build and run it from `admin/` (see `admin/README.md`).
+
+For the GUI to work without hitting an interactive `sudo` password prompt, the VPS needs:
+
+- **A NOPASSWD sudoers drop-in.** Install `ops/sudoers.d/edenadmin` and edit the two aliases at
+  the top (your ssh login user, and the service user):
+
+  ```sh
+  sudo install -m 0440 -o root -g root ops/sudoers.d/edenadmin /etc/sudoers.d/edenadmin
+  sudoedit /etc/sudoers.d/edenadmin        # set EDENADMIN = <your-login-user>
+  sudo visudo -cf /etc/sudoers.d/edenadmin
+  ```
+
+  If your ssh login user *already* has unrestricted `NOPASSWD` sudo, you only need
+  `Defaults:<user> !requiretty` and can skip the command allowlist — but keeping the drop-in is
+  harmless belt-and-braces. Possession of the ssh key is the actual admin boundary; this file
+  just spares the GUI a blocking prompt.
+
+- **Journal read access.** Reading `journalctl -u edenserver` as a non-root user needs
+  membership in `adm` or `systemd-journal`, and it fails *silently empty* without it:
+
+  ```sh
+  sudo usermod -aG adm <your-login-user>      # log out and back in for it to take effect
+  ```
+
+The Connection panel probes every one of these and tells you which is missing.
+
+## 9. Optional: fail2ban for password guessers
 
 Only relevant if you run with `--password`. `edenserver` already throttles a
 single-IP brute force itself (`--auth-fail-limit`: 5 wrong `JOIN` passwords in

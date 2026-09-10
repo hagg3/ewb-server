@@ -11,8 +11,15 @@ WORKING/
 /matchmaker_test
 /control_test
 /worldedit_test
+/eden_names_test
+/eden_file_test
+/eden_import
+/eden_import_test
 *.o
 *.obj
+
+# --- edenadmin operator GUI (admin/, opt-in via build_server.sh --with-admin) ---
+/admin/edenadmin
 
 # --- Runtime state written when ./edenserver is run from the repo root ---
 /eden_players.txt

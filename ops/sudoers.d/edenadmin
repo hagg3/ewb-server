@@ -1,0 +1,78 @@
+# ops/sudoers.d/edenadmin — let a local `edenadmin` GUI drive this server over
+# ssh + systemd without ever hitting a password prompt.
+#
+# Install:
+#     sudo install -m 0440 -o root -g root ops/sudoers.d/edenadmin /etc/sudoers.d/edenadmin
+#     sudo visudo -cf /etc/sudoers.d/edenadmin        # syntax check
+#
+# Then edit the two aliases below:
+#   EDENADMIN  — the *login* user your ssh_host alias connects as (e.g. `sam`).
+#   EDENSVC    — the service user (default `edenserver`).
+#
+# ---------------------------------------------------------------------------
+# What this is, and is not
+#
+#   edenadmin adds no port and no credential to this box. Possession of the SSH
+#   key is the whole admin boundary (see admin/README.md). This file only spares
+#   the GUI a blocking `[sudo] password:` prompt for the handful of commands it
+#   runs as another user — every edenctl / systemctl / journalctl call is
+#   `sudo -n` (non-interactive), so a missing rule here is the difference between
+#   the GUI working and the GUI reporting "sudo -n was denied".
+#
+#   The wildcard grants (tar, dd, find, tail) match ANY arguments and so are
+#   wider than they look. That is why config writes go through the validating
+#   edenserver-writeconf wrapper and not `tee`, and why the .eden staging path is
+#   pinned to /tmp/edenadmin-*. If you want least privilege, run edenadmin's ssh
+#   as a dedicated restricted user and keep this file; if your operator login
+#   already has unrestricted `sudo`, you only need the `Defaults` line:
+#
+#       Defaults:sam !requiretty
+#
+#   and NOPASSWD for that user — this file is then belt-and-braces.
+#
+#   ⚠️ The paths assume the ops/INSTALL.md layout (/usr/local/bin, /var/lib/
+#   edenserver, /usr/bin/{systemctl,journalctl,tar,dd,find,wc,du,tail,env}).
+#   Adjust for your distro. The vps live-pass (roadmap 6.7) is what shakes the
+#   last path/permission bugs out of this file.
+# ---------------------------------------------------------------------------
+
+User_Alias   EDENADMIN = sam
+Runas_Alias  EDENSVC   = edenserver
+
+# --- run as the service user: the control socket + world files + eden_import ---
+Cmnd_Alias EDEN_CTL = \
+    /usr/local/bin/edenctl -S /var/lib/edenserver/*/edenserver.sock *, \
+    /usr/bin/test -S /var/lib/edenserver/*/edenserver.sock
+
+Cmnd_Alias EDEN_IMPORT = \
+    /usr/local/bin/eden_import, \
+    /usr/local/bin/eden_import *
+
+Cmnd_Alias EDEN_WORLDFILES = \
+    /usr/bin/tar -C /var/lib/edenserver/* *, \
+    /usr/bin/dd of=/tmp/edenadmin-* *, \
+    /usr/bin/rm -f /tmp/edenadmin-*, \
+    /usr/bin/mkdir -p /var/lib/edenserver/*, \
+    /usr/bin/find /var/lib/edenserver/* *, \
+    /usr/bin/wc -l /var/lib/edenserver/*, \
+    /usr/bin/du -k --max-depth=1 /var/lib/edenserver/*, \
+    /usr/bin/tail -n [0-9]* /var/lib/edenserver/*, \
+    /usr/bin/env EDENSERVER_WORLD_DIR=* EDENSERVER_BACKUP_DIR=* /usr/local/bin/edenserverctl backup
+
+# --- run as root: the unit lifecycle + the validating conf writer ---
+Cmnd_Alias EDEN_UNIT = \
+    /usr/bin/systemctl start edenserver, \
+    /usr/bin/systemctl stop edenserver, \
+    /usr/bin/systemctl restart edenserver, \
+    /usr/bin/systemctl kill -s SIGKILL edenserver, \
+    /usr/bin/systemctl show edenserver *, \
+    /usr/bin/systemctl enable --now edenserver-backup.timer, \
+    /usr/bin/systemctl disable --now edenserver-backup.timer, \
+    /usr/bin/systemctl daemon-reload, \
+    /usr/local/bin/edenserver-writeconf, \
+    /usr/bin/env EDENSERVER_CONF=* /usr/local/bin/edenserver-writeconf, \
+    /usr/bin/cat /etc/edenserver.conf
+
+Defaults:EDENADMIN !requiretty
+EDENADMIN ALL=(EDENSVC) NOPASSWD: EDEN_CTL, EDEN_IMPORT, EDEN_WORLDFILES
+EDENADMIN ALL=(root)    NOPASSWD: EDEN_UNIT

@@ -1,0 +1,5 @@
+Sep 09 12:00:00 vps edenserver[1234]: [Server] listening on 27015
+Sep 09 12:01:11 vps edenserver[1234]: [Control] who
+Sep 09 12:01:15 vps edenserver[1234]: [Audit] 2026-09-09T12:01:15Z control kick Griefer @ 10.0.0.9 (spawn camping)
+Sep 09 12:02:00 vps edenserver[1234]: [Audit] 2026-09-09T12:02:00Z player:alice (level 2) //paint: 88 cell(s)
+Sep 09 12:02:30 vps edenserver[1234]: [Server] player Bob disconnected

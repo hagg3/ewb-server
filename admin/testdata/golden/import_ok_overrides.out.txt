@@ -1,0 +1,12 @@
+world "Canvas-XEN0"  (version 4, 64z, 1024 saved chunks, 0 signs from none)
+  bounding box  x 65536..66047   y 0..63   z 65536..66047   (server coords)
+  strategy      diff (base profile: default)
+  cells         4,004,403  of 5,000,000 cap  (80.1%)
+  worst REGION  3,589,952 records  at x 65536..65999, z 65536..65999
+                (largest reply ever captured from the real server: 507,000 records)
+  signs         0 convertible
+  spawn         65792.00, 22.00, 65792.00  (header)
+  sky colours   14 14 14 14 14 14 14 14 14 14 14 14 14 14 14 14
+                (informational — the wire protocol carries no sky message)
+
+--dry-run: nothing written. Output would have been /tmp/edencap/c/

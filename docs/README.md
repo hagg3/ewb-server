@@ -11,6 +11,7 @@ retail client can connect to a world you host yourself.
 | You are… | Read, in order |
 |---|---|
 | **Hosting a server** | [quickstart.md](quickstart.md) → [configuration.md](configuration.md) → [commands.md](commands.md) |
+| **Hosting a world you already have** | [import.md](import.md) → [quickstart.md](quickstart.md) |
 | **Debugging a connection** | [protocol.md](protocol.md) → [configuration.md](configuration.md) |
 | **Changing the code (human or agent)** | [architecture.md](architecture.md) → [protocol.md](protocol.md) → [configuration.md](configuration.md) |
 
@@ -24,6 +25,9 @@ retail client can connect to a world you host yourself.
   environment variables, and on-disk file formats.
 - [matchmaker.md](matchmaker.md) — the matchmaker wire protocol and the standalone `edenmatch`
   server: how a server gets listed in the in-game Server Browser.
+- [import.md](import.md) — converting a saved `.eden` world into one this server can host:
+  the `eden_import` tool, the base terrain profile, the three fill strategies, and the two
+  budget numbers that decide whether an imported world can actually be played.
 - [commands.md](commands.md) — both command surfaces: the operator control socket and `edenctl`
   (kick/ban, live world edits, save/stop, sign editing, `region-stats`), and the player commands
   typed into game chat (`//set`, `//sphere`, `/tp`, …) with their permission levels and bounds.
@@ -51,13 +55,19 @@ Practically, when you touch a source file, move the doc in the same row:
 | `server_posix.cpp` — join sequence, threading, world model, persistence/autosave | [architecture.md](architecture.md), and [protocol.md](protocol.md) if the join order moves |
 | `region_query.h`, `snapz_codec.h` — `REGION`/`SNAPZ` geometry, encoding or framing | [protocol.md](protocol.md) |
 | `sign_store.h` — `SIGNQ`/`SIGNP` wire shape | [protocol.md](protocol.md); the `eden_signs.txt` grammar lives in [configuration.md](configuration.md) |
+| `spawn_store.h` — `eden_spawn.txt` grammar (world default spawn) | [configuration.md](configuration.md) § `eden_spawn.txt` and the `--spawn` / `--spawn-file` flags |
 | `hardening.h` — limits, username rules, `ACTION` validation | [protocol.md](protocol.md) (what clients may send) and [configuration.md](configuration.md) (what an operator can tune) |
 | `build_server.sh` — compiler, flags, dependencies, or the test suites it runs | [quickstart.md](quickstart.md), [architecture.md](architecture.md) |
+| `admin/` — the optional `edenadmin` operator GUI (separate Go module) | `admin/README.md` (not part of `docs/`); mention it in [quickstart.md](quickstart.md) / [architecture.md](architecture.md) only where it touches the build |
 | `phase1_live_test.py`, `phase3_live_test.py` — the by-hand live socket tests | [architecture.md](architecture.md) (what each one covers) |
 | `server_posix.cpp` — anything written to the audit channel (`auditLog()`) | [configuration.md](configuration.md) § The audit channel |
 | `host_world.sh`, `run_server.bat` — launcher arguments | [configuration.md](configuration.md), [quickstart.md](quickstart.md) |
+| `ops/edenserver.service`, `ops/edenserver.conf.example`, `ops/edenserver-writeconf` — the systemd `EnvironmentFile` layer (`EDEN_*` keys, `${VAR}` vs `$VAR`) | [configuration.md](configuration.md) § The systemd EnvironmentFile; `ops/INSTALL.md` |
+| `ops/edenserverctl` verbs, `ops/edenserver-backup.{service,timer}` | [configuration.md](configuration.md) § Ops wrapper; `ops/INSTALL.md` |
+| `eden_file.h` — `.eden` world-format parsing (header, chunks, spans, signs, ZIP wrapper) | [import.md](import.md) § What it reads; [architecture.md](architecture.md) (file map) |
+| `eden_import.h` / `eden_import.cpp` — the converter: base profile, fill strategies, axis rename, budget projections, flags | [import.md](import.md); [configuration.md](configuration.md) for the files it writes |
 | A new header + `*_test.cpp` pair | [architecture.md](architecture.md) (the file map) and whichever doc above owns its behaviour |
-| On-disk format: `eden_world.model`, `eden_players.txt`, `eden_signs.txt`, `eden_bans.txt`, `eden_ops.txt` | [configuration.md](configuration.md) |
+| On-disk format: `eden_world.model`, `eden_players.txt`, `eden_signs.txt`, `eden_spawn.txt`, `eden_bans.txt`, `eden_ops.txt` | [configuration.md](configuration.md) |
 
 Two more rules for anything written here:
 

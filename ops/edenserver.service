@@ -18,6 +18,22 @@
 #   StandardOutput=journal already gives journald the raw stream.
 #
 # ---------------------------------------------------------------------------
+# Configuration — EnvironmentFile, and the ${VAR} vs $VAR split
+#   Every setting is an environment variable in /etc/edenserver.conf (copy it
+#   from ops/edenserver.conf.example). `EnvironmentFile=-/etc/edenserver.conf`
+#   (leading `-`) means a missing file is not a startup failure, so this template
+#   still works before anyone adopts the conf file — but ExecStart then expands
+#   the required keys to empty and the server exits with a flag error in the
+#   journal. Create the file.
+#
+#   ExecStart below uses BRACED ${VAR} for the five always-set keys (one argument
+#   each, spaces preserved) and BARE $EDEN_EXTRA_ARGS once, for a whitespace-split
+#   tail of optional spaceless flags. An unset braced ${VAR} still passes an
+#   empty argument, so anything optional-and-possibly-spaced must live in
+#   EDEN_EXTRA_ARGS, never as its own ${VAR}. The conf file header explains this
+#   at length; do not "tidy" ExecStart by turning EDEN_EXTRA_ARGS into ${...}.
+#
+# ---------------------------------------------------------------------------
 # Restart policy — why NOT Restart=always
 #   --idle-timeout makes the server exit(0) *cleanly* once it has had no players
 #   for N seconds (for on-demand / matchmaker-spawned worlds). systemd's
@@ -43,18 +59,28 @@ Type=simple
 User=edenserver
 Group=edenserver
 
-# WorkingDirectory is the world directory: edenserver reads/writes
-# eden_world.model, eden_players.txt and eden_signs.txt relative to CWD, and (in
-# a later phase) puts its control socket here too. One directory to back up.
-WorkingDirectory=/var/lib/edenserver/world
+# The state root. Every world file is addressed absolutely off ${EDEN_WORLD_DIR}
+# in ExecStart, so CWD is only a fallback; it must still be a directory the
+# service user can reach.
+WorkingDirectory=/var/lib/edenserver
 
-# Adjust the port / name to taste. Paths are relative to WorkingDirectory.
-# Add --matchmaker HOST[:PORT] only if you are self-hosting a matchmaker.
-# Do NOT add --idle-timeout here unless you also keep Restart=on-failure (above).
-ExecStart=/usr/local/bin/edenserver --port 27015 --name "Eden Server" --world eden_world.model --signs eden_signs.txt
+# All settings come from /etc/edenserver.conf. `-` => a missing file is tolerated
+# (the server then errors on the empty flags, visibly, in the journal).
+EnvironmentFile=-/etc/edenserver.conf
+
+# Braced ${VAR} for the always-set keys; bare $EDEN_EXTRA_ARGS for the optional
+# spaceless tail. Edit /etc/edenserver.conf, not this line. See the conf header
+# and the note block above for why the split matters.
+ExecStart=/usr/local/bin/edenserver --port ${EDEN_PORT} --name ${EDEN_NAME} --world ${EDEN_WORLD_DIR}/eden_world.model --signs ${EDEN_WORLD_DIR}/eden_signs.txt --spawn-file ${EDEN_WORLD_DIR}/eden_spawn.txt --ban-file ${EDEN_WORLD_DIR}/eden_bans.txt --ops-file ${EDEN_WORLD_DIR}/eden_ops.txt --control-socket ${EDEN_WORLD_DIR}/edenserver.sock --max-world-cells ${EDEN_MAX_WORLD_CELLS} --password ${EDEN_PASSWORD} $EDEN_EXTRA_ARGS
 
 Restart=on-failure
 RestartSec=2s
+
+# Give a graceful stop room to finish. The server has no SIGTERM handler yet
+# (roadmap plan §5.4), so `systemctl stop` still loses up to one autosave
+# interval; edenadmin stops it through `edenctl stop` instead. When the handler
+# lands, this is the window it saves in.
+TimeoutStopSec=20
 
 # Live logs to the journal: journalctl -u edenserver -f
 StandardOutput=journal

@@ -18,6 +18,7 @@
 
 #include "hardening.h"
 #include "sign_store.h"
+#include "spawn_store.h"
 
 static int g_fail = 0;
 
@@ -119,6 +120,37 @@ static void test_sign_burst() {
 }
 
 // --- usernames (stage 1.7) ---------------------------------------------------
+
+// --- world spawn sidecar (stage 5.3) ---------------------------------------
+
+static void test_spawn_parse() {
+    ewb::Spawn s;
+    bool skip = true;
+
+    CHECK(ewb::parse_spawn_line("65536.00:33.92:65540.50", s, skip), "a good line parses");
+    CHECK(!skip, "a good line is not a skip");
+    CHECK(s.x == 65536.0f && s.z == 65540.5f, "coords in server order");
+
+    // Round-trips through the formatter the server and eden_import share.
+    ewb::Spawn r;
+    CHECK(ewb::parse_spawn_line(ewb::format_spawn_line(s), r) &&
+              r.x == s.x && r.y == s.y && r.z == s.z,
+          "format -> parse round-trips");
+
+    CHECK(ewb::parse_spawn_line("  1:2:3 \r\n", s, skip) && s.x == 1 && s.y == 2 && s.z == 3,
+          "surrounding whitespace and CRLF tolerated");
+    CHECK(ewb::parse_spawn_line("-3.5:0:10", s) && s.x == -3.5f, "negative coordinate is fine");
+
+    for (const char* l : {"", "1:2", "1:2:3:4", "a:b:c", "1:2:three", "1 2 3"}) {
+        CHECK(!ewb::parse_spawn_line(l, s, skip), "malformed spawn line rejected");
+        if (l[0] != '\0')
+            CHECK(!skip, "a non-empty malformed line is an error, not a skip");
+    }
+
+    ewb::Spawn unused;
+    CHECK(!ewb::parse_spawn_line("# a comment", unused, skip) && skip, "'#' comment is a skip");
+    CHECK(!ewb::parse_spawn_line("   ", unused, skip) && skip, "blank line is a skip");
+}
 
 static void test_username_validation() {
     using ewb::NameVerdict;
@@ -291,6 +323,7 @@ int main() {
     test_sign_parse();
     test_sign_text_cannot_break_framing();
     test_sign_burst();
+    test_spawn_parse();
     test_username_validation();
     test_action_extra_validation();
     test_token_bucket();

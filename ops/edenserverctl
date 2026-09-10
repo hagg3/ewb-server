@@ -1,7 +1,8 @@
 #!/bin/sh
 # edenserverctl — thin management wrapper for the edenserver systemd unit.
 #
-#   edenserverctl start | stop | restart | status | logs [N] | backup
+#   edenserverctl start | stop | restart | status [--porcelain] | logs [N]
+#                 | logs-tail [N] | backup
 #
 # It is a convenience layer over `systemctl` and `journalctl -u`, plus a
 # world-file backup. Nothing here does anything you could not do by hand with
@@ -12,16 +13,31 @@
 #   EDENSERVER_SERVICE     systemd unit name          (default: edenserver)
 #   EDENSERVER_WORLD_DIR   world directory to back up  (default: /var/lib/edenserver/world)
 #   EDENSERVER_BACKUP_DIR  where backups are written   (default: /var/lib/edenserver/backups)
+#   EDENSERVER_BACKUP_COMPRESS  1 = gzip each file (default), 0 = store plain
+#   EDENSERVER_BACKUP_LEVEL     gzip level 1-9              (default: 6)
 
 set -eu
 
 SERVICE="${EDENSERVER_SERVICE:-edenserver}"
-WORLD_DIR="${EDENSERVER_WORLD_DIR:-/var/lib/edenserver/world}"
-BACKUP_DIR="${EDENSERVER_BACKUP_DIR:-/var/lib/edenserver/backups}"
+# EDENSERVER_* is the documented interface. EDEN_WORLD_DIR / EDEN_BACKUP_DIR are
+# the keys used in /etc/edenserver.conf; honouring them as a fallback lets the
+# systemd backup timer point at the active world by sourcing that one file.
+WORLD_DIR="${EDENSERVER_WORLD_DIR:-${EDEN_WORLD_DIR:-/var/lib/edenserver/world}}"
+BACKUP_DIR="${EDENSERVER_BACKUP_DIR:-${EDEN_BACKUP_DIR:-/var/lib/edenserver/backups}}"
+
+# Backups are gzipped by default. eden_world.model is a plaintext
+# "x:y:z:type:color" line per cell, which deflates to roughly a sixth of its size
+# (a 40 MB world -> ~7 MB), and nothing reads a backup directly, so there is no
+# reason to keep the raw bytes on disk. Level 6 is deliberate: on that same world
+# level 9 buys ~4% more for ~6x the CPU time, which matches the Eden editor's own
+# conclusion for its .bak.zip snapshots. Set COMPRESS=0 for plain copies.
+COMPRESS="${EDENSERVER_BACKUP_COMPRESS:-${EDEN_BACKUP_COMPRESS:-1}}"
+LEVEL="${EDENSERVER_BACKUP_LEVEL:-${EDEN_BACKUP_LEVEL:-6}}"
 
 # Files that make up a world. Missing ones are skipped (a fresh world has no
-# signs sidecar, a world nobody has joined has no players file).
-WORLD_FILES="eden_world.model eden_players.txt eden_signs.txt"
+# signs sidecar, a world nobody has joined has no players file, a world imported
+# without a spawn point has no eden_spawn.txt).
+WORLD_FILES="eden_world.model eden_players.txt eden_signs.txt eden_spawn.txt"
 
 usage() {
     cat <<EOF
@@ -31,11 +47,20 @@ Usage: edenserverctl <command>
   stop             systemctl stop $SERVICE
   restart          systemctl restart $SERVICE
   status           systemctl status $SERVICE (falls back to is-active)
+  status --porcelain
+                   machine-readable Key=Value lines (ActiveState, SubState,
+                   MainPID, ExecMainStartTimestamp, Result) — no pager, no follow
   logs [N]         journalctl -u $SERVICE -n N (default 200), then follow (-f)
-  backup           copy the world files to a timestamped dir under
+  logs-tail [N]    journalctl -u $SERVICE -n N (default 200), --no-pager, NO -f —
+                   the scriptable counterpart to 'logs'
+  backup           gzip the world files into a timestamped dir under
                    $BACKUP_DIR
+                   (EDENSERVER_BACKUP_COMPRESS=0 stores them plain)
 
-Environment: EDENSERVER_SERVICE, EDENSERVER_WORLD_DIR, EDENSERVER_BACKUP_DIR
+Environment: EDENSERVER_SERVICE, EDENSERVER_WORLD_DIR, EDENSERVER_BACKUP_DIR,
+             EDENSERVER_BACKUP_COMPRESS, EDENSERVER_BACKUP_LEVEL
+             (the EDEN_* forms of these from /etc/edenserver.conf are honoured
+             as a fallback, so the backup timer needs no extra config)
 EOF
 }
 
@@ -60,12 +85,32 @@ do_backup() {
     dest="$BACKUP_DIR/$stamp"
     mkdir -p "$dest"
 
+    # gzip is in every base install we target, but don't fail a backup over it.
+    if [ "$COMPRESS" != "0" ] && ! command -v gzip >/dev/null 2>&1; then
+        echo "edenserverctl: gzip not found, storing backups uncompressed" >&2
+        COMPRESS=0
+    fi
+
     copied=0
     for f in $WORLD_FILES; do
-        if [ -f "$WORLD_DIR/$f" ]; then
+        [ -f "$WORLD_DIR/$f" ] || continue
+        if [ "$COMPRESS" = "0" ]; then
             cp -p "$WORLD_DIR/$f" "$dest/$f"
-            copied=$((copied + 1))
+        else
+            # Stage + rename so a crash mid-backup leaves no file that looks
+            # complete but is a truncated gzip stream. `gzip -c <file>` records
+            # the original name and mtime in the member header, so `gunzip -N`
+            # restores both; touch -r keeps the wrapper's mtime meaningful too,
+            # the way cp -p did.
+            if ! gzip -c "-$LEVEL" "$WORLD_DIR/$f" > "$dest/$f.gz.tmp"; then
+                rm -f "$dest/$f.gz.tmp"
+                echo "edenserverctl: failed to compress $f" >&2
+                exit 1
+            fi
+            mv "$dest/$f.gz.tmp" "$dest/$f.gz"
+            touch -r "$WORLD_DIR/$f" "$dest/$f.gz"
         fi
+        copied=$((copied + 1))
     done
 
     if [ "$copied" -eq 0 ]; then
@@ -76,6 +121,9 @@ do_backup() {
 
     echo "Backed up $copied file(s) to $dest"
     ls -l "$dest"
+    if [ "$COMPRESS" != "0" ]; then
+        echo "Restore with: gunzip -c $dest/eden_world.model.gz > $WORLD_DIR/eden_world.model"
+    fi
 }
 
 cmd="${1:-}"
@@ -84,11 +132,20 @@ case "$cmd" in
     stop)    exec systemctl stop    "$SERVICE" ;;
     restart) exec systemctl restart "$SERVICE" ;;
     status)
+        if [ "${2:-}" = "--porcelain" ]; then
+            exec systemctl show "$SERVICE" \
+                -p ActiveState -p SubState -p MainPID \
+                -p ExecMainStartTimestamp -p Result
+        fi
         systemctl status "$SERVICE" --no-pager || systemctl is-active "$SERVICE"
         ;;
     logs)
         n="${2:-200}"
         exec journalctl -u "$SERVICE" -n "$n" -f
+        ;;
+    logs-tail)
+        n="${2:-200}"
+        exec journalctl -u "$SERVICE" -n "$n" --no-pager
         ;;
     backup)  do_backup ;;
     ""|-h|--help|help) usage ;;

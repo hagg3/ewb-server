@@ -1,0 +1,4 @@
+[Audit] 2026-09-09T14:03:11Z control fill 4096 cells = 2 @ 65530,32,65530..65545,47,65545
+[Audit] 2026-09-09T14:03:19Z player:hagge (level 1) //set: 512 cell(s)
+[Audit] 2026-09-09T14:05:02Z control say: server restarting in 5m
+[Audit] 2026-09-09T14:05:44Z control stop requested

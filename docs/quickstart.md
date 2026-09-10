@@ -24,11 +24,16 @@ xcode-select --install
 ./build_server.sh
 ```
 
-That produces `./edenserver` and `./edenmatch` (the matchmaker), then builds and runs the
-offline test suites (`snapz_codec_test`, `region_test`, `protocol_test`, `control_test`,
-`worldedit_test`, `matchmaker_test`). If any of them fails, stop — the build is not usable.
+That produces `./edenserver`, `./edenmatch` (the matchmaker) and `./eden_import` (the `.eden`
+world converter), then builds and runs the offline test suites (`snapz_codec_test`,
+`region_test`, `protocol_test`, `control_test`, `worldedit_test`, `eden_names_test`,
+`eden_file_test`, `eden_import_test`, `matchmaker_test`). If any of them fails, stop — the
+build is not usable.
 
 The script uses `$CXX` if set, otherwise prefers `clang++` and falls back to `g++`.
+
+`./build_server.sh --with-admin` additionally builds `admin/edenadmin`, an optional local
+operator GUI (needs a Go toolchain). It is not required to run a server — see `admin/README.md`.
 
 Two live tests are **not** run by the build, because they bind a port and spawn server
 processes. Run them by hand — the second one especially, before you host anything publicly:
@@ -59,6 +64,19 @@ the files on its first save.
 ```bash
 cp -r worlds/ari ~/edenworlds/myworld
 ```
+
+### Starting from an existing world
+
+If you already have a saved `.eden` world, convert it instead of starting from a sample:
+
+```bash
+./eden_import ~/Downloads/myworld.eden        # writes worlds/myworld/
+./eden_import ~/Downloads/myworld.eden --dry-run   # or just see what it would cost
+```
+
+That directory is ready to host: terrain (caves included), signs and a spawn point. Read
+[import.md](import.md) before importing anything large — it explains the two size numbers the
+tool prints, and why the second one is the one that decides whether the world plays.
 
 ## 4. Run
 
