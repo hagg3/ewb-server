@@ -409,6 +409,14 @@ static int run(const std::string& cmd) {
     return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
 }
 
+// run(), keeping stdout + stderr in `out`.
+static int run_capture(const std::string& cmd, const std::string& path, std::string& out) {
+    const int rc = std::system((cmd + " >'" + path + "' 2>&1").c_str());
+    out.clear();
+    read_text(path, out);
+    return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+}
+
 static void test_cli() {
     if (!exists("./eden_import")) {
         std::fprintf(stderr, "FAIL: ./eden_import not built — run build_server.sh\n");
@@ -461,6 +469,23 @@ static void test_cli() {
     CHECK(run(full + " --max-world-cells 100") != 0, "cli: over the cell cap is refused");
     CHECK(!exists(out2), "cli: a refused import writes nothing");
     CHECK(run(full + " --max-world-cells 100000") == 0, "cli: raising the cap allows it");
+
+    // The server cap it recommends leaves room above the import. A cap equal to the
+    // cell count refuses every new block players place — the 2026-09 launch bug the
+    // old "raise both to <cells>" advice produced.
+    std::string capOut;
+    CHECK(run_capture("./eden_import '" + in + "' --out '" + d + "/capmsg' --air-fill full"
+                      " --max-world-cells 100", d + "/capmsg.txt", capOut) != 0,
+          "cli: cap refusal (captured)");
+    CHECK(capOut.find("room above the import") != std::string::npos,
+          "cli: the cap refusal recommends server headroom");
+    CHECK(capOut.find("server cap    edenserver --max-world-cells ") != std::string::npos &&
+          capOut.find(" or higher  (room for players to build)") != std::string::npos,
+          "cli: the summary prints the recommended server cap");
+    CHECK(run_capture("./eden_import '" + in + "' --out '" + d + "/capwarn' --air-fill full"
+                      " --dry-run --max-world-cells 100000", d + "/capwarn.txt", capOut) == 0 &&
+          capOut.find("left for players to build") != std::string::npos,
+          "cli: an import that fits but leaves little room warns");
 
     // The region ceiling is refusable independently of the cell cap.
     const std::string out3 = d + "/out3";

@@ -114,7 +114,7 @@ height. If you change one side of such a pair, the build fails until you change 
 |---|---|---|
 | main | process start | `accept()` loop: IP ban check, auth lockout check, connect rate limit, client cap, spawn a handler |
 | client handler | one per accepted socket, **detached** | the whole session: recv, line framing, dispatch, and its own cleanup |
-| autosave | at startup, detached | every 15 s: `saveWorld()`, `savePlayerPos()`, and the `--idle-timeout` check |
+| autosave | at startup, detached | every 15 s: `saveWorld()`, `savePlayerPos()`, `saveSigns()`, and the `--idle-timeout` check |
 | matchmaker | at startup **iff** `--matchmaker` was given, detached | keeps one TCP registration open, heartbeats a player count every ~15 s, reconnects on failure |
 | control listener | at startup unless `--no-control-socket`, detached | `accept()` loop on the `0600` unix domain socket |
 | control handler | one per control connection, **detached** | reads `\n`-framed command lines, runs each, replies; `stop` saves and exits the process |
@@ -133,6 +133,7 @@ encoder) catch locally.
 | `g_worldMtx` | the world cell map |
 | `g_posMtx` | saved player positions |
 | `g_signMtx` | the sign list and the pre-formatted `SIGNP` burst |
+| `g_signSaveMtx` | spans `saveSigns()`' snapshot and write, so of two racing sign saves the newer list is the one left on disk. Taken before `g_signMtx`, never after it |
 | `g_saveMtx` | serialises on-disk writes so two saves cannot interleave (world, players, `eden_bans.txt`, `eden_ops.txt`, `eden_signs.txt`) |
 | `g_banMtx` / `g_opsMtx` | the in-memory ban list and op-level table |
 | `g_auditMtx` | serialises audit lines so two threads cannot interleave one |
@@ -215,7 +216,9 @@ standalone paint record for such a cell. See [protocol.md](protocol.md) for the 
 The key packs x and z into 24 bits each and y into 16, which is where the coordinate bounds
 enforced on `ACTION`, `REGION` and sign lines come from. A cap on the number of distinct edited
 cells bounds memory and the on-disk file: past the cap, updates to existing cells still apply
-and brand-new cells are refused.
+and brand-new cells are refused. `worldSet()` reports each refusal and `simAction()` counts
+them, so the `ACTION` handler can keep a refused edit off the peers and tell the player rather
+than drop it silently ([protocol.md](protocol.md#at-the-world-cell-cap)).
 
 Edits are applied by `simAction()`, which mirrors the game's own terrain rules rather than
 just recording a delta:
@@ -240,7 +243,7 @@ directory (see [configuration.md](configuration.md) for the grammars):
 |---|---|---|
 | `eden_world.model` | autosave, and when a client disconnects | only when the dirty flag is set |
 | `eden_players.txt` | same | last known position per username |
-| `eden_signs.txt` | never | read-only; operator-authored |
+| `eden_signs.txt` | autosave, disconnect and control `save`/`stop` after a player's sign write; at once on control `signs add`/`rm` | only when the sign list changed |
 | `eden_spawn.txt` | never | read-only; the default spawn for a player with no `eden_players.txt` row. `--spawn`/`--spawn-file` override. Malformed → one warning, ignored |
 
 Writes are **atomic and serialised**: the snapshot is taken under the data lock, written to a

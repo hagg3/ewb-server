@@ -31,6 +31,23 @@ type ImportOptions struct {
 	RegionRadius     int // --region-radius N     (0 -> omit)
 }
 
+// RecommendedMaxWorldCells mirrors hardening.h's recommended_max_world_cells: the
+// server cap a world of `cells` should run under — a quarter again, never less
+// than a million, rounded up to a whole 100,000. A server whose cap equals its
+// world's cell count refuses every new block players place (edits to existing
+// cells still save), so the cap written for an import must leave room above it.
+func RecommendedMaxWorldCells(cells int64) int {
+	if cells < 0 {
+		cells = 0
+	}
+	headroom := cells / 4
+	if headroom < 1000000 {
+		headroom = 1000000
+	}
+	want := cells + headroom
+	return int((want + 99999) / 100000 * 100000)
+}
+
 // NewImportOptions returns options with MaxRegionRecords set to the "omit"
 // sentinel (-1), since 0 is a meaningful value for that flag.
 func NewImportOptions() ImportOptions {

@@ -1,8 +1,9 @@
 // protocol_test.cpp — offline checks for ROADMAP-SERVER stages 1.5, 1.7 and 1.10:
-// the sign sidecar / `SIGNP` wire format, and the hardening primitives
-// (username validation, `ACTION` payload validation, token bucket, per-IP
-// connect limiter, constant-time password compare, per-IP failed-auth limiter,
-// text sanitisation).
+// the sign sidecar / `SIGNP` wire formats (including a player's sign write and its
+// slot upsert), and the hardening primitives (username validation, `ACTION`
+// payload validation, the world cell cap headroom, token bucket, per-IP connect
+// limiter, constant-time password compare, per-IP failed-auth limiter, text
+// sanitisation).
 //
 //   clang++ -std=c++17 -O2 -Wall protocol_test.cpp -o protocol_test
 //   ./protocol_test
@@ -117,6 +118,95 @@ static void test_sign_burst() {
     // different subprotocol — do not generalize it here.
     CHECK(blob.find("END") == std::string::npos, "the burst has no terminator");
     CHECK(ewb::format_sign_burst({}).empty(), "no signs means an empty burst, not a marker");
+}
+
+// --- player sign writes -----------------------------------------------------
+
+static void test_client_signp_parse() {
+    ewb::Sign s;
+    // The retail client's own line (LIVE-FINDINGS 2026-09-08): no sender field.
+    CHECK(ewb::parse_client_signp("SIGNP:65543:32:65546:3:2:0:Testing phase b", s),
+          "retail-client sign write parses");
+    CHECK(s.x == 65543 && s.y == 32 && s.z == 65546 && s.a == 3 && s.b == 2 && s.c == 0,
+          "client sign coords and a/b/c");
+    CHECK(s.text == "Testing phase b", "client sign text");
+
+    CHECK(ewb::parse_client_signp("SIGNP:1:2:3:0:0:0:time 12:30: meet here", s) &&
+          s.text == "time 12:30: meet here", "client sign text keeps its own ':'");
+    CHECK(ewb::parse_client_signp("SIGNP:1:2:3:0:0:0:evil\x01text\r", s) && s.text == "eviltext",
+          "client sign text is sanitised");
+
+    // Nobody writes a sign as `server`, and a write needs all seven fields.
+    CHECK(!ewb::parse_client_signp("SIGNP:server:1:2:3:0:0:0:forged", s), "server-sender line refused");
+    for (const char* l : {"SIGNP", "SIGNP:", "SIGNP:1:2:3", "SIGNQ:1:2:3:0:0:0:t", "1:2:3:0:0:0:t",
+                          "SIGNP:# comment", "SIGNP:1:256:3:0:0:0:t", "SIGNP:-1:2:3:0:0:0:t"})
+        CHECK(!ewb::parse_client_signp(l, s), "malformed client sign write refused");
+}
+
+static void test_sign_file_line_round_trip() {
+    const ewb::Sign in{65414, 40, 65584, 1, 27, 2, "FLOOR 1: RESTAURANT"};
+    const std::string line = ewb::format_sign_file_line(in);
+    CHECK(line == "65414:40:65584:1:27:2:FLOOR 1: RESTAURANT\n", "sidecar line format");
+    ewb::Sign out;
+    bool skip = false;
+    CHECK(ewb::parse_sign_line(line, out, skip) && out.x == in.x && out.a == in.a &&
+          out.c == in.c && out.text == in.text, "sidecar line round-trips");
+}
+
+static void test_sign_upsert() {
+    std::vector<ewb::Sign> v;
+    ewb::Sign a{10, 34, 20, 0, 5, 0, "hello"};
+    CHECK(ewb::upsert_sign(v, a, 10) == ewb::SignUpsert::Added && v.size() == 1, "new slot appends");
+    CHECK(ewb::upsert_sign(v, a, 10) == ewb::SignUpsert::Unchanged && v.size() == 1,
+          "an identical re-send is unchanged");
+
+    a.text = "edited";
+    CHECK(ewb::upsert_sign(v, a, 10) == ewb::SignUpsert::Replaced && v.size() == 1 &&
+          v[0].text == "edited", "an edit replaces the sign in its slot");
+    a.b = 9;
+    CHECK(ewb::upsert_sign(v, a, 10) == ewb::SignUpsert::Replaced && v[0].b == 9,
+          "a changed b is an edit, not a new sign");
+
+    // Two signs on one block, different faces — the shape real imported worlds hold.
+    ewb::Sign otherFace{10, 34, 20, 5, 38, 0, "other face"};
+    CHECK(ewb::upsert_sign(v, otherFace, 10) == ewb::SignUpsert::Added && v.size() == 2,
+          "another face of the same block is a separate sign");
+    CHECK(v[0].text == "edited", "...and does not clobber the first");
+
+    // A hand-edited sidecar with duplicates in one slot converges on one sign.
+    v.push_back({10, 34, 20, 0, 1, 1, "stale dupe"});
+    CHECK(ewb::upsert_sign(v, a, 10) == ewb::SignUpsert::Replaced && v.size() == 2,
+          "duplicates in the slot are dropped");
+
+    // The cap refuses new slots but never an edit.
+    std::vector<ewb::Sign> full{{1, 1, 1, 0, 0, 0, "x"}};
+    CHECK(ewb::upsert_sign(full, {2, 2, 2, 0, 0, 0, "y"}, 1) == ewb::SignUpsert::Full &&
+          full.size() == 1, "a full list refuses a new slot");
+    CHECK(ewb::upsert_sign(full, {1, 1, 1, 0, 0, 0, "z"}, 1) == ewb::SignUpsert::Replaced,
+          "a full list still takes an edit");
+}
+
+// --- world cell cap ---------------------------------------------------------
+
+static void test_cell_cap_headroom() {
+    // Small worlds get the floor; big ones a quarter again; always a round number.
+    CHECK(ewb::recommended_max_world_cells(0) == 1000000, "empty world: the headroom floor");
+    CHECK(ewb::recommended_max_world_cells(3433) == 1100000, "rounded up to 100,000");
+    CHECK(ewb::recommended_max_world_cells(2200053) == 3300000, "xen7-sized: +1M floor");
+    CHECK(ewb::recommended_max_world_cells(13920369) == 17500000, "13.9M: +25%");
+    for (size_t n : {size_t(0), size_t(1), size_t(3999999), size_t(4000000), size_t(13920369)}) {
+        const size_t r = ewb::recommended_max_world_cells(n);
+        CHECK(r >= n + ewb::WORLD_CELL_HEADROOM_MIN, "always leaves at least the floor");
+        CHECK(r % 100000 == 0, "always a round 100,000");
+        CHECK(ewb::cell_cap_state(n, r) == ewb::CellCapState::Ok, "the recommendation is not Low");
+    }
+
+    // The launch bug: the cap set to exactly the imported cell count.
+    CHECK(ewb::cell_cap_state(13920369, 13920369) == ewb::CellCapState::Full, "cap == cells is Full");
+    CHECK(ewb::cell_cap_state(5, 4) == ewb::CellCapState::Full, "over the cap is Full");
+    CHECK(ewb::cell_cap_state(3700000, 4000000) == ewb::CellCapState::Low, "under a tenth left is Low");
+    CHECK(ewb::cell_cap_state(3500000, 4000000) == ewb::CellCapState::Ok, "an eighth left is Ok");
+    CHECK(ewb::cell_cap_state(0, 1) == ewb::CellCapState::Ok, "tiny cap, empty world");
 }
 
 // --- usernames (stage 1.7) ---------------------------------------------------
@@ -323,6 +413,10 @@ int main() {
     test_sign_parse();
     test_sign_text_cannot_break_framing();
     test_sign_burst();
+    test_client_signp_parse();
+    test_sign_file_line_round_trip();
+    test_sign_upsert();
+    test_cell_cap_headroom();
     test_spawn_parse();
     test_username_validation();
     test_action_extra_validation();

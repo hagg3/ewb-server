@@ -135,14 +135,14 @@ Lists the hostable worlds under the profile's `world_root` (each a
 | Download bundle | `GET /api/worlds/bundle?world=<name>` | a tar of `eden_world.model`, the sign / spawn / player sidecars, and the `.gitignore` — whichever exist. `local`: built in Go. `vps`: `sudo -n -u <run_as> tar -C <dir> --ignore-failed-read -cf -`. |
 | Upload bundle | `POST /api/worlds/bundle?world=<name>` (multipart `bundle`) | **refused unless the server is stopped** — a live server rewrites `eden_world.model` on every autosave. The tar is validated (only known member names, must carry `eden_world.model`) before anything is written. |
 | Import `.eden` | `POST /api/worlds/import?mode=project\|write` (multipart `eden` + form fields) | stages the upload to a temp path (a Go temp file locally, `dd of=…` as `<run_as>` on a vps), runs `eden_import --yes` (dry-run for `project`, real for `write`), parses the summary, then **removes the temp file on every path** — success, parse failure, or refusal. `mode=write` with `set_active=true` chains into set-active. An existing target dir needs `force=true` (→ `--force`). |
-| Set active | `POST /api/worlds/activate` `{world, restart}` | `local`: rewrites `--world` (and `--signs`, dropped if the sidecar is absent) in the stored args, moves `world_dir`, persists, and optionally restarts the supervised process. `vps`: rewrites `EDEN_WORLD_DIR` in `/etc/edenserver.conf` through `edenserver-writeconf` (stage 6.6), raising `EDEN_MAX_WORLD_CELLS` if an import needed a higher cap, moves the profile's `world_dir` pointer so socket / backup / restore follow, and restarts. |
+| Set active | `POST /api/worlds/activate` `{world, restart}` | `local`: rewrites `--world` (and `--signs`, dropped if the sidecar is absent) in the stored args, moves `world_dir`, persists, and optionally restarts the supervised process. `vps`: rewrites `EDEN_WORLD_DIR` in `/etc/edenserver.conf` through `edenserver-writeconf` (stage 6.6), raising `EDEN_MAX_WORLD_CELLS` to the imported world's recommended cap (its cell count plus room for players to build — see `docs/import.md`) when that is higher than the current value, moves the profile's `world_dir` pointer so socket / backup / restore follow, and restarts. |
 
 The import form exposes the strategy (`--air-fill`), spawn source (`--spawn`),
 `--strict`, `--no-signs`, and — for an acknowledged refusal — `--max-world-cells`
 / `--max-region-records`. **Project first**: the *Import* button only enables
 after a clean (non-refused) projection. `docs/import.md` explains the two budget
-numbers and why a raised cell cap also needs `edenserver --max-world-cells` to
-match.
+numbers and why the server's `--max-world-cells` must sit above the imported
+world's cell count, not at it.
 
 ### Backups (stage 6.5)
 

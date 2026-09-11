@@ -60,6 +60,7 @@ type Verdict struct {
 // Verdict kinds.
 const (
 	VerdictCellsOverCap       = "cells-over-cap"
+	VerdictCellsLowHeadroom   = "cells-low-headroom"
 	VerdictRegionOverCeiling  = "region-over-ceiling"
 	VerdictRegionOverObserved = "region-over-observed"
 	VerdictType255            = "type-255"
@@ -251,6 +252,8 @@ func classifyVerdict(msg string) string {
 		return VerdictType255
 	case strings.Contains(msg, "cells exceeds the"):
 		return VerdictCellsOverCap
+	case strings.Contains(msg, "left for players to build"):
+		return VerdictCellsLowHeadroom
 	case strings.Contains(msg, "over the") && strings.Contains(msg, "ceiling"):
 		return VerdictRegionOverCeiling
 	case strings.Contains(msg, "larger than any reply ever captured"):

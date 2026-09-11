@@ -1,10 +1,14 @@
-// sign_store.h — the `eden_signs.txt` sidecar and the `SIGNQ` → `SIGNP` wire
-// format. ROADMAP-SERVER stage 1.5, read-only.
+// sign_store.h — the `eden_signs.txt` sidecar and the `SIGNQ` / `SIGNP` wire
+// formats. ROADMAP-SERVER stage 1.5 (read side) and the client sign write.
 //
 // Wire contract, from CAPTURE-FINDINGS.md ("Signs — CHANGED") and plan §1.5:
 //
 //   client  SIGNQ\n
 //   server  SIGNP:server:<x>:<y>:<z>:<a>:<b>:<c>:<text>\n   (a burst, no terminator)
+//
+//   client  SIGNP:<x>:<y>:<z>:<a>:<b>:<c>:<text>\n          (placing / editing a sign)
+//
+// The client's write has **no sender field**; the server's line has `server` there.
 //
 // Note the literal `server` in field 2 — the same reserved sender token
 // `ACTION:server:0:...` uses, which is why `hardening.h` refuses it as a username.
@@ -29,12 +33,21 @@
 // is safe as long as the parser splits only the first six fields. That is the one
 // property this header exists to guarantee.
 //
-// **Read-only in Phase 1.** No client→server sign-write opcode has ever been
-// captured; whether one exists is an open question in CAPTURE-FINDINGS.md. The
-// operator populates the file; an admin command is Phase 3 (§3.2 `signs add|rm`).
+// **Writers.** The operator (by hand, or `signs add|rm` on the control socket) and,
+// since the 2026-09 public launch, players: the retail client sends the write line
+// above when a sign is placed (LIVE-FINDINGS 2026-09-08, Session 2). Until the server
+// handled it, every player-placed sign was silently discarded.
+//
+// ⚠️ **A sign's slot is `(x, y, z, a)`, not the block alone.** Real imported worlds
+// hold two signs on one block with different `a/b/c`, and across every sidecar on
+// hand `a` only ever takes 0–5 — the shape of a block face. So an edit replaces the
+// sign in the same block *and* face, and a sign on another face of that block is a
+// separate sign. That is inference from data, not a capture; it is the narrowest key
+// that keeps both observed collisions apart.
 
 #pragma once
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -115,14 +128,61 @@ inline std::string format_signp(const Sign& s) {
            std::to_string(s.c) + ":" + sanitize_text(s.text, SIGN_TEXT_MAX) + "\n";
 }
 
-/// The whole burst as one buffer. Built once at load time and re-sent verbatim to
-/// every `SIGNQ` — signs are immutable in Phase 1, so there is nothing to rebuild
-/// per request and nothing to lock while formatting.
+/// The whole burst as one buffer. Rebuilt when the sign list changes (load, an
+/// operator edit, a player's write) and re-sent verbatim to every `SIGNQ`, so there
+/// is nothing to format per request.
 inline std::string format_sign_burst(const std::vector<Sign>& signs) {
     std::string blob;
     blob.reserve(signs.size() * 48);
     for (const Sign& s : signs) blob += format_signp(s);
     return blob;
+}
+
+/// One sidecar line, '\n' included — the inverse of `parse_sign_line`.
+inline std::string format_sign_file_line(const Sign& s) {
+    return std::to_string(s.x) + ":" + std::to_string(s.y) + ":" + std::to_string(s.z) + ":" +
+           std::to_string(s.a) + ":" + std::to_string(s.b) + ":" + std::to_string(s.c) + ":" +
+           sanitize_text(s.text, SIGN_TEXT_MAX) + "\n";
+}
+
+/// Parse a player's sign write: `SIGNP:<x>:<y>:<z>:<a>:<b>:<c>:<text>`, the sidecar
+/// grammar behind a `SIGNP:` prefix. A replayed server line (`SIGNP:server:...`)
+/// fails the integer parse — nobody gets to write a sign as `server`.
+inline bool parse_client_signp(const std::string& line, Sign& out) {
+    static const std::string kPrefix = "SIGNP:";
+    if (line.compare(0, kPrefix.size(), kPrefix) != 0) return false;
+    bool skip = false;
+    return parse_sign_line(line.substr(kPrefix.size()), out, skip);
+}
+
+/// Same block, same face — see the ⚠️ at the top.
+inline bool same_sign_slot(const Sign& p, const Sign& q) {
+    return p.x == q.x && p.y == q.y && p.z == q.z && p.a == q.a;
+}
+
+enum class SignUpsert { Added, Replaced, Unchanged, Full };
+
+/// Put `s` into its slot: replace the sign already there, or append if the slot is
+/// empty and the list is under `max_signs`. A hand-edited sidecar can hold several
+/// signs in one slot; the first is replaced and the rest dropped, so the slot
+/// converges on one. A client re-sending an identical sign is `Unchanged`, so the
+/// caller can skip the rewrite, the relay and the audit line.
+inline SignUpsert upsert_sign(std::vector<Sign>& signs, const Sign& s, size_t max_signs) {
+    const auto slot = [&](const Sign& cur) { return same_sign_slot(cur, s); };
+    auto it = std::find_if(signs.begin(), signs.end(), slot);
+    if (it == signs.end()) {
+        if (signs.size() >= max_signs) return SignUpsert::Full;
+        signs.push_back(s);
+        return SignUpsert::Added;
+    }
+    bool changed = !(it->b == s.b && it->c == s.c && it->text == s.text);
+    *it = s;
+    const auto dupes = std::remove_if(it + 1, signs.end(), slot);
+    if (dupes != signs.end()) {
+        signs.erase(dupes, signs.end());
+        changed = true;
+    }
+    return changed ? SignUpsert::Replaced : SignUpsert::Unchanged;
 }
 
 }  // namespace ewb

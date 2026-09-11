@@ -122,6 +122,36 @@ inline bool action_extra_valid(int mode, int extra) {
     return true;
 }
 
+// --- world cell cap ----------------------------------------------------------
+
+/// The least room for *new* cells a hosted world should have above what it loads.
+///
+/// ⚠️ A world loaded at its `--max-world-cells` refuses every brand-new cell while
+/// still accepting edits to cells it already holds. From a player's seat that is
+/// silent, partial data loss: a block placed in open air, or a natural block mined
+/// or painted, is a new cell and vanishes on the next join; a block placed where
+/// the import already stored a cell saves. Setting the cap to exactly an import's
+/// cell count — which the tooling used to suggest — produces precisely that.
+constexpr size_t WORLD_CELL_HEADROOM_MIN = 1000000;
+
+/// A `--max-world-cells` that leaves a world of `cells` room to grow: a quarter
+/// again, never less than WORLD_CELL_HEADROOM_MIN, rounded up to a whole 100,000
+/// so it reads cleanly in a config file. RAM is still the operator's real limit.
+inline size_t recommended_max_world_cells(size_t cells) {
+    const size_t want = cells + std::max(WORLD_CELL_HEADROOM_MIN, cells / 4);
+    return (want + 99999) / 100000 * 100000;
+}
+
+enum class CellCapState { Ok, Low, Full };
+
+/// Where a loaded world sits against its cap: `Full` refuses every new cell,
+/// `Low` has less than a tenth of the cap left for players to build into.
+inline CellCapState cell_cap_state(size_t cells, size_t cap) {
+    if (cells >= cap) return CellCapState::Full;
+    if (cap - cells < cap / 10) return CellCapState::Low;
+    return CellCapState::Ok;
+}
+
 // --- token bucket ------------------------------------------------------------
 
 /// Classic leaky bucket over a caller-supplied monotonic clock (seconds).

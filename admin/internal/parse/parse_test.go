@@ -238,6 +238,16 @@ func TestImportSummaryOverCap(t *testing.T) {
 	}
 }
 
+func TestImportVerdictLowHeadroom(t *testing.T) {
+	stderr := []byte("eden_import: warning: 3,900,000 cells leaves only 100,000 of the 4,000,000 cap" +
+		" left for players to build. Start edenserver with --max-world-cells 4900000 or higher," +
+		" or new blocks stop saving once that room is used.\n")
+	vs := parseVerdicts(stderr)
+	if len(vs) != 1 || vs[0].Level != "warning" || vs[0].Kind != VerdictCellsLowHeadroom {
+		t.Errorf("low-headroom verdict = %+v", vs)
+	}
+}
+
 func TestImportSummaryOverRegion(t *testing.T) {
 	s, _ := ImportSummaryParse(golden(t, "import_overregion_only.out.txt"), golden(t, "import_overregion_only.err.txt"), 1)
 	if !s.Refused || len(s.Verdicts) == 0 || s.Verdicts[0].Kind != VerdictRegionOverCeiling {
