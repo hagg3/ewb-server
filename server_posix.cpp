@@ -184,6 +184,12 @@ static const long SV_SIGNQ_MIN_GAP_MS = 1000;
 static const int  SV_MAX_SIGNQ_PER_SESSION = 32;
 static const size_t SV_MAX_SIGNS = 20000;      // bound the burst the file can produce
 
+// A player's sign write (`SIGNP:x:y:z:a:b:c:text`) rebuilds the burst every SIGNQ is
+// answered from, so one connection's writes are paced. Signs are placed by hand;
+// a burst of 8 and 1/s sustained is far above any human cadence.
+static const double SV_SIGNP_BURST = 8.0;
+static const double SV_SIGNP_RATE  = 1.0;
+
 // Per-connection ACTION budget (stage 1.7, retuned by 1.8 rung 2/3).
 // ⚠️ The original 8/s + 64 burst was sized for a *human* placing blocks by hand. It
 // silently shreds a legitimate bulk edit: VuencLink's "arm interact + fill a box"
@@ -283,20 +289,33 @@ static inline void wunkey(uint64_t k,int&x,int&y,int&z){
     z = (int)((k >> 16) & 0xFFFFFF);
     y = (int)( k        & 0xFFFF);
 }
-// Caller must hold g_worldMtx.
-static void worldSet(int x,int y,int z,int type,int color){
+// Caller must hold g_worldMtx. Returns false when the cap refused a brand-new cell.
+static bool worldSet(int x,int y,int z,int type,int color){
     uint64_t k = wkey(x,y,z);
     // Cap the number of distinct edited cells so a malicious/buggy client can't
     // grow the map (and the on-disk save) without bound. Updates to existing
     // cells are always allowed; only brand-new cells are refused past the cap.
     if(g_world.find(k)==g_world.end() && g_world.size()>=g_maxWorldCells){
-        static bool warned=false;
-        if(!warned){ std::cerr << "[Server] world cell cap reached (" << g_maxWorldCells
-                               << "); refusing new cells." << std::endl; warned=true; }
-        return;
+        // ⚠️ From the player's seat this is silent data loss: their client has
+        // already drawn the block. This used to log once per process, and on the
+        // first public server that one line scrolled away while every new block
+        // players placed for a day was refused. Now: one line a minute, with a
+        // count and the fix. The statics are guarded by the g_worldMtx we hold.
+        static ewb::TokenBucket logGate(1.0, 1.0 / 60.0);
+        static size_t unreported = 0;
+        ++unreported;
+        if (logGate.allow(monoSeconds())) {
+            std::cerr << "[Server] world cell cap reached (" << g_maxWorldCells << "): refused "
+                      << unreported << " new cell(s) — players' new blocks are NOT being saved."
+                         " Restart with --max-world-cells "
+                      << ewb::recommended_max_world_cells(g_world.size()) << " or higher." << std::endl;
+            unreported = 0;
+        }
+        return false;
     }
     g_world[k] = { (unsigned char)type, (unsigned char)color };
     editsDirty = true;
+    return true;
 }
 static bool worldGet(int x,int y,int z, Cell& out){
     auto it = g_world.find(wkey(x,y,z));
@@ -306,13 +325,14 @@ static bool worldGet(int x,int y,int z, Cell& out){
 
 // Simulate a TNT / paint explosion centred on (x,y,z) — mirrors Terrain::explode:
 // a spherical radius; color!=0 paints the sphere, color==0 destroys it. TNT hit by
-// the blast chains. Caller holds g_worldMtx.
-static void simExplode(int cx,int cy,int cz,int depth){
+// the blast chains. Caller holds g_worldMtx. Cells the cap refuses are added to
+// `refused`.
+static void simExplode(int cx,int cy,int cz,int depth, size_t& refused){
     if(depth>6) return;                        // guard runaway chains
     Cell center; bool haveCenter = worldGet(cx,cy,cz,center);
     int color = haveCenter ? center.color : 0;
     bool painting = (color != 0);
-    worldSet(cx,cy,cz, SV_AIR, 0);   // the TNT itself is consumed by its own blast
+    if(!worldSet(cx,cy,cz, SV_AIR, 0)) ++refused;   // the TNT itself is consumed by its own blast
     struct P3{int x,y,z;};
     std::vector<P3> chain;
     const int R = SV_EXPLOSION_RADIUS;
@@ -330,9 +350,9 @@ static void simExplode(int cx,int cy,int cz,int depth){
                     if(have){
                         if(c.type==SV_AIR) continue;
                         if(c.type==SV_TNT && c.color==0) continue;
-                        worldSet(j,sy,k, c.type, color);
+                        worldSet(j,sy,k, c.type, color);             // existing cell: never refused
                     }else{
-                        worldSet(j,sy,k, SV_PAINTED_BASE, color);   // paint a base block
+                        if(!worldSet(j,sy,k, SV_PAINTED_BASE, color)) ++refused;   // paint a base block
                     }
                 }else{
                     if(have){
@@ -340,28 +360,32 @@ static void simExplode(int cx,int cy,int cz,int depth){
                         if(c.type==SV_TNT || c.type==SV_FIREWORK) chain.push_back({j,sy,k});
                         else if(c.type!=SV_BEDROCK && c.type!=SV_STEEL) worldSet(j,sy,k, SV_AIR, 0);
                     }else{
-                        worldSet(j,sy,k, SV_AIR, 0);                 // destroy a base block
+                        if(!worldSet(j,sy,k, SV_AIR, 0)) ++refused;  // destroy a base block
                     }
                 }
             }
         }
     }
-    for(const P3& t: chain) simExplode(t.x,t.y,t.z, depth+1);
+    for(const P3& t: chain) simExplode(t.x,t.y,t.z, depth+1, refused);
 }
 
 // Apply one terrain action to the model. mode: 0 build 1 mine 2 burn 3 paint.
-static void simAction(int mode,int x,int y,int z,int extra){
+// Returns how many cells the world cell cap refused; 0 means the whole action landed.
+static size_t simAction(int mode,int x,int y,int z,int extra){
     std::lock_guard<std::mutex> lk(g_worldMtx);
+    size_t refused = 0;
     switch(mode){
-        case 0: worldSet(x,y,z, extra, 0); break;                 // BUILD (extra=type)
-        case 1: worldSet(x,y,z, SV_AIR, 0); break;                // MINE
+        case 0: if(!worldSet(x,y,z, extra, 0)) ++refused; break;  // BUILD (extra=type)
+        case 1: if(!worldSet(x,y,z, SV_AIR, 0)) ++refused; break; // MINE
         case 3: { Cell c; bool have=worldGet(x,y,z,c);            // PAINT (extra=color)
-                  worldSet(x,y,z, have? c.type : SV_PAINTED_BASE, extra); break; }
+                  if(!worldSet(x,y,z, have? c.type : SV_PAINTED_BASE, extra)) ++refused;
+                  break; }
         case 2: { Cell c; bool have=worldGet(x,y,z,c);            // BURN
-                  if(have && (c.type==SV_TNT || c.type==SV_FIREWORK)) simExplode(x,y,z,0);
+                  if(have && (c.type==SV_TNT || c.type==SV_FIREWORK)) simExplode(x,y,z,0,refused);
                   else if(have && c.type!=SV_AIR) worldSet(x,y,z, SV_AIR, 0);
                   break; }
     }
+    return refused;
 }
 
 void loadWorld() {
@@ -404,7 +428,8 @@ void saveWorld() {
         std::cerr << "[Server] save: rename " << tmp << " -> " << g_worldFile << " failed" << std::endl;
         editsDirty = true; return;
     }
-    std::cout << "[Server] Saved world (" << snap.size() << " cells)." << std::endl;
+    std::cout << "[Server] Saved world (" << snap.size() << " cells, cap " << g_maxWorldCells
+              << ")." << std::endl;
 }
 
 // --- Player position persistence ----------------------------------------------
@@ -590,11 +615,10 @@ static void rememberPos(const std::string& name, float x, float y, float z){
     g_posDirty = true;
 }
 
-// --- Signs (stage 1.5, read-only) ---------------------------------------------
-// The sidecar is operator-authored and immutable while we run, so the whole
-// `SIGNP` burst is formatted once at startup and re-sent verbatim per SIGNQ:
-// nothing to rebuild per request, and no lock held while formatting. (Phase 3's
-// `signs reload` rebuilds this blob under g_signMtx; the mutex is here for that.)
+// --- Signs (stage 1.5, plus player sign writes) --------------------------------
+// The whole `SIGNP` burst is kept pre-formatted and re-sent verbatim per SIGNQ, so
+// nothing is built per request. It is rebuilt under g_signMtx whenever the list
+// changes: the control socket's `signs reload|add|rm`, or a player's sign write.
 static std::vector<ewb::Sign> g_signs;
 static std::string            g_signBlob;
 static std::mutex             g_signMtx;
@@ -632,6 +656,39 @@ void loadSigns() {
     }
     std::cout << "[Server] Loaded " << n << " signs from " << g_signFile
               << " (" << bytes << " B burst)." << std::endl;
+}
+
+// A player's sign write (handleSignWrite) changes the list in memory; the sidecar
+// follows on the world's cadence — autosave, a disconnect, the control socket's
+// save/stop. Operator `signs add|rm` call saveSigns() at once. Either way every
+// write of the file goes through saveSigns(), so there is one serialised path.
+static std::atomic<bool> g_signsDirty{false};
+static std::mutex        g_signSaveMtx;   // holds saveSigns()' snapshot + write together
+
+// The sign list changed: rebuild the SIGNQ burst and mark the sidecar for the next
+// saveSigns(). Caller holds g_signMtx.
+static void signsChangedLocked() {
+    g_signBlob = ewb::format_sign_burst(g_signs);
+    g_signsDirty = true;
+}
+
+// Write eden_signs.txt if the list changed since the last write. The file is
+// formatted under g_signMtx and written after releasing it, so a slow disk — or a
+// large world save holding g_saveMtx — never stalls a SIGNQ or a player's sign.
+// g_signSaveMtx spans snapshot and write, so of two racing saves the later snapshot
+// is always the one left on disk.
+void saveSigns() {
+    std::lock_guard<std::mutex> serial(g_signSaveMtx);
+    std::string file;
+    size_t n = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_signMtx);
+        if (!g_signsDirty.exchange(false)) return;
+        for (const ewb::Sign& s : g_signs) file += ewb::format_sign_file_line(s);
+        n = g_signs.size();
+    }
+    if (!writeFileAtomic(g_signFile, file)) { g_signsDirty = true; return; }
+    std::cout << "[Server] Saved signs (" << n << ")." << std::endl;
 }
 
 // Keep a persistent registration with the matchmaker for as long as we run.
@@ -1024,20 +1081,6 @@ static long long ctlFillBox(int x0, int y0, int z0, int x1, int y1, int z1, int 
     return (long long)batch.size();
 }
 
-// Rewrite g_signFile from the current g_signs and rebuild the SIGNQ burst blob.
-// Caller holds g_signMtx.
-static bool ctlPersistSignsLocked() {
-    std::string file;
-    for (const ewb::Sign& s : g_signs) {
-        char h[64];
-        file.append(h, snprintf(h, sizeof(h), "%d:%d:%d:%d:%d:%d:", s.x, s.y, s.z, s.a, s.b, s.c));
-        file += ewb::sanitize_text(s.text, ewb::SIGN_TEXT_MAX);
-        file += '\n';
-    }
-    g_signBlob = ewb::format_sign_burst(g_signs);
-    return writeFileAtomic(g_signFile, file);
-}
-
 // Handle one complete control line. `reply` is sent back (a trailing '\n' is
 // added if missing); set `stopServer` to request shutdown.
 static void handleControlLine(const std::string& line, std::string& reply, bool& stopServer) {
@@ -1137,6 +1180,7 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
     if (verb == "save") {
         saveWorld();
         savePlayerPos();
+        saveSigns();
         auditLog("control", "save");
         reply = "ok: saved";
         return;
@@ -1223,6 +1267,13 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
         const auto f = ewb::ctl_fields(rest, 0);
         const std::string sub = f.empty() ? "" : f[0];
         if (sub == "reload") {
+            // A player's sign lives only in memory until the next save; reloading
+            // over it would throw it away without a word.
+            if (g_signsDirty) {
+                reply = "error: players have placed signs that are not saved yet. Run 'save' first"
+                        " (it rewrites the sign file, so hand-edit it only while the server is stopped)";
+                return;
+            }
             loadSigns();
             std::lock_guard<std::mutex> lk(g_signMtx);
             auditLog("control", "signs reload (" + std::to_string(g_signs.size()) + ")");
@@ -1238,13 +1289,18 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
             if (!ewb::parse_sign_line(rest.substr(p + 1), s, skip)) {
                 reply = "error: malformed sign line"; return;
             }
-            std::lock_guard<std::mutex> lk(g_signMtx);
-            g_signs.push_back(s);
-            ctlPersistSignsLocked();
+            size_t total = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_signMtx);
+                g_signs.push_back(s);
+                signsChangedLocked();
+                total = g_signs.size();
+            }
+            saveSigns();
             auditLog("control", "signs add " + std::to_string(s.x) + "," + std::to_string(s.y) +
                                 "," + std::to_string(s.z));
             reply = "ok: added sign at " + std::to_string(s.x) + "," + std::to_string(s.y) + "," + std::to_string(s.z) +
-                    " (" + std::to_string(g_signs.size()) + " total)";
+                    " (" + std::to_string(total) + " total)";
             return;
         }
         if (sub == "rm") {
@@ -1252,13 +1308,17 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
             int x, y, z;
             try { x = std::stoi(f[1]); y = std::stoi(f[2]); z = std::stoi(f[3]); }
             catch (...) { reply = "error: non-numeric coordinate"; return; }
-            std::lock_guard<std::mutex> lk(g_signMtx);
-            const size_t before = g_signs.size();
-            g_signs.erase(std::remove_if(g_signs.begin(), g_signs.end(),
-                          [&](const ewb::Sign& s){ return s.x == x && s.y == y && s.z == z; }),
-                          g_signs.end());
-            const size_t removed = before - g_signs.size();
-            if (removed) ctlPersistSignsLocked();
+            size_t removed = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_signMtx);
+                const size_t before = g_signs.size();
+                g_signs.erase(std::remove_if(g_signs.begin(), g_signs.end(),
+                              [&](const ewb::Sign& s){ return s.x == x && s.y == y && s.z == z; }),
+                              g_signs.end());
+                removed = before - g_signs.size();
+                if (removed) signsChangedLocked();
+            }
+            if (removed) saveSigns();
             auditLog("control", "signs rm " + std::to_string(x) + "," + std::to_string(y) + "," +
                                 std::to_string(z) + " (" + std::to_string(removed) + " removed)");
             reply = removed ? "ok: removed " + std::to_string(removed) + " sign(s)"
@@ -1356,6 +1416,7 @@ static void handleControlClient(int fd) {
     if (stopServer) {
         saveWorld();
         savePlayerPos();
+        saveSigns();
         if (!g_controlSocket.empty()) unlink(g_controlSocket.c_str());
         std::cout << "Server terminated (control: stop)." << std::endl;
         std::exit(0);
@@ -2101,6 +2162,44 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
     weSay(s, "'" + verb + "' is not available on this server.");
 }
 
+// `SIGNP:x:y:z:a:b:c:text` from a joined player: the retail client placing or
+// editing a sign (shape caught live, LIVE-FINDINGS 2026-09-08). Before this handler
+// the line fell through to the unrecognised-line branch and every sign a player
+// placed was lost.
+//
+// The sign goes into its slot — same block, same face (sign_store.h) — replacing
+// what was there. The list and the SIGNQ burst change at once; the sidecar follows
+// on the next save, like the world.
+static void handleSignWrite(SOCKET s, const std::string& who, const std::string& line) {
+    ewb::Sign sign;
+    if (!ewb::parse_client_signp(line, sign)) {
+        if (g_verbose) std::cout << "[Server] malformed SIGNP from " << who << ": "
+                                 << line.substr(0, 64) << std::endl;
+        return;
+    }
+    ewb::SignUpsert r;
+    {
+        std::lock_guard<std::mutex> lk(g_signMtx);
+        r = ewb::upsert_sign(g_signs, sign, SV_MAX_SIGNS);
+        if (r == ewb::SignUpsert::Added || r == ewb::SignUpsert::Replaced) signsChangedLocked();
+    }
+    if (r == ewb::SignUpsert::Full) {
+        std::cerr << "[Server] sign cap reached (" << SV_MAX_SIGNS << "); refused a sign from "
+                  << who << "." << std::endl;
+        weSay(s, "This world has reached its sign limit, so that sign was not saved.");
+        return;
+    }
+    if (r == ewb::SignUpsert::Unchanged) return;
+    auditLog("player:" + who,
+             std::string(r == ewb::SignUpsert::Added ? "sign placed" : "sign edited") + " at " +
+                 std::to_string(sign.x) + "," + std::to_string(sign.y) + "," +
+                 std::to_string(sign.z) + ": " + sign.text);
+    // ⚠️ Relayed in the `server`-sender shape SIGNQ is answered with, which the
+    // retail client renders from a join burst. Whether it applies one mid-session
+    // is unconfirmed; a peer that ignores it still gets the sign on its next join.
+    broadcastMessage(ewb::format_signp(sign), s);
+}
+
 void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
     char recvBuffer[BUFFER_SIZE];
     std::string username = "Player" + std::to_string(clientId);
@@ -2111,6 +2210,9 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
     ewb::TokenBucket actionBucket(SV_ACTION_BURST, SV_ACTION_RATE);   // stage 1.7
     bool actionWarned = false;    // log the first refusal per connection, not each one
     WeSession we;                 // Tier 2 selection / clipboard / undo (stage 3.3)
+    ewb::TokenBucket signWriteBucket(SV_SIGNP_BURST, SV_SIGNP_RATE);   // player SIGNP writes
+    bool signWarned = false;      // log the first sign-write refusal, not each one
+    ewb::TokenBucket capNotice(1.0, 1.0 / 30.0);   // "world is full" to this player, <= 1 per 30 s
 
     // Client->server messages are newline-framed: accumulate bytes and process
     // one complete '\n'-terminated line at a time. This makes parsing robust to
@@ -2432,11 +2534,36 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     // Simulate the action into the authoritative world model so the
                     // server always has an accurate picture (handles TNT/paint
                     // explosions and burning too).
-                    simAction(mode, x, y, z, extra);
+                    const size_t refused = simAction(mode, x, y, z, extra);
+                    if (refused && mode != 2) {
+                        // The world is at its cell cap and this edit did not land.
+                        // Keep it off the peers — they would draw a block no REGION
+                        // will ever send back — and tell the player, whose client
+                        // has already drawn it. Otherwise the first anyone hears of
+                        // it is the build being gone on their next join.
+                        if (mode == 0) {
+                            // Take the block back out of the sender's world. The cell
+                            // was absent from the model, so as far as the server knows
+                            // it is untouched terrain, and a client only builds into
+                            // air. ⚠️ The `ACTION:server:0` shape the command relay uses.
+                            std::string undo;
+                            emitEditWire(undo, x, y, z, SV_AIR, 0);
+                            sendAll(clientSocket, undo.data(), undo.size());
+                        }
+                        if (capNotice.allow(monoSeconds()))
+                            weSay(clientSocket, "This world is full, so that edit was not saved."
+                                                " Please tell the server operator.");
+                        continue;
+                    }
                     // Relay the ORIGINAL action to everyone EXCEPT the sender (who
                     // already applied it locally). Peers re-simulate it themselves;
                     // the model above is what late joiners are snapshotted from.
                     broadcastMessage(broadcastMsg, clientSocket);
+                    // A burn is relayed even when part of its blast was refused:
+                    // every client simulates the explosion itself regardless.
+                    if (refused && capNotice.allow(monoSeconds()))
+                        weSay(clientSocket, "This world is full, so part of that explosion was"
+                                            " not saved. Please tell the server operator.");
                 } catch (...) {
                     std::cout << "[Server] Invalid ACTION message from " << username << std::endl;
                 }
@@ -2541,6 +2668,27 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                 }
                 serveSigns(clientSocket, username, signLimiter);
             }
+            // SIGNP:x:y:z:a:b:c:text — a player placed or edited a sign. Gated on JOIN
+            // (a sign is world content, and a passworded server must not take it
+            // from a peer that never authenticated) and paced per connection, since
+            // each write rebuilds the burst every SIGNQ is answered from.
+            else if (command == "SIGNP") {
+                if (!joined) {
+                    if (g_verbose) std::cout << "[Server] SIGNP before JOIN from client "
+                                             << clientId << "; ignored." << std::endl;
+                    continue;
+                }
+                if (!signWriteBucket.allow(monoSeconds())) {
+                    if (!signWarned) {
+                        std::cerr << "[Server] " << username
+                                  << " exceeded the sign write rate limit; dropping sign writes."
+                                  << std::endl;
+                        signWarned = true;
+                    }
+                    continue;
+                }
+                handleSignWrite(clientSocket, username, message);
+            }
             // PING -> PONG. Bare line, bare reply, no arguments echoed — this is what
             // the capture shows and it is what gives a client a real RTT.
             // ⚠️ Not the same thing as the *outbound* matchmaker `PING:<count>`
@@ -2552,8 +2700,8 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                 send(clientSocket, kPong, strlen(kPong), 0);
             }
             // Anything else — log it once per verb so a real client's un-modelled
-            // messages (e.g. a sign-write we don't yet know the shape of — 1.9)
-            // surface instead of being silently swallowed by this else-if chain.
+            // messages surface instead of being silently swallowed by this else-if
+            // chain. (This is how the client's `SIGNP` sign write was found.)
             else if (g_verbose && !command.empty()) {
                 static std::mutex seenMtx;
                 static std::set<std::string> seen;
@@ -2582,6 +2730,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
 
     savePlayerPos();   // persist positions when someone leaves
     saveWorld();       // and persist the world model
+    saveSigns();       // and any signs placed this session
     removeClient(clientSocket);
     close(clientSocket);
 }
@@ -2780,10 +2929,26 @@ int main(int argc, char* argv[]) {
 
     // Load the saved world model + player positions, and periodically persist them.
     loadWorld();
-    if (g_world.size() > g_maxWorldCells)
-        std::cerr << "[Server] loaded world has " << g_world.size() << " cells, over the "
-                  << g_maxWorldCells << " cap — existing cells are kept, but new ones are"
-                     " refused. Raise --max-world-cells to match the import." << std::endl;
+    // A world loaded at (not just over) its cap refuses every new block players
+    // place while edits to existing cells still save — the partial, silent loss the
+    // first public server shipped with. Say it loudly, with the number to use.
+    switch (ewb::cell_cap_state(g_world.size(), g_maxWorldCells)) {
+        case ewb::CellCapState::Full:
+            std::cerr << "[Server] WARNING: the world has " << g_world.size()
+                      << " cells and --max-world-cells is " << g_maxWorldCells
+                      << ". Every NEW block players place will be refused and not saved (edits"
+                         " to existing cells still save). Restart with --max-world-cells "
+                      << ewb::recommended_max_world_cells(g_world.size()) << " or higher." << std::endl;
+            break;
+        case ewb::CellCapState::Low:
+            std::cerr << "[Server] warning: the world has " << g_world.size() << " of "
+                      << g_maxWorldCells << " cells; only " << (g_maxWorldCells - g_world.size())
+                      << " left for new building. Consider --max-world-cells "
+                      << ewb::recommended_max_world_cells(g_world.size()) << "." << std::endl;
+            break;
+        case ewb::CellCapState::Ok:
+            break;
+    }
     loadPlayerPos();
     loadSpawn();    // eden_spawn.txt: the default spawn for a player with no saved row (stage 5.3)
     loadSigns();   // sidecar; the control socket's `signs add|rm` writes it (stage 3.2)
@@ -2853,6 +3018,7 @@ int main(int argc, char* argv[]) {
             std::this_thread::sleep_for(std::chrono::seconds(15));
             saveWorld();
             savePlayerPos();
+            saveSigns();
             // Self-shutdown for on-demand hosted worlds: exit once we've had no
             // clients for --idle-timeout seconds (covers both "nobody ever joined"
             // and "everyone left"). The matchmaker then drops us from its list.
@@ -2865,6 +3031,7 @@ int main(int argc, char* argv[]) {
                                   << "s with no players; shutting down." << std::endl;
                         saveWorld();
                         savePlayerPos();
+                        saveSigns();
                         std::exit(0);
                     }
                 } else {

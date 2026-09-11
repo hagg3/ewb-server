@@ -146,7 +146,7 @@ keeping a copy that outlives `journalctl --vacuum`.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--max-world-cells N` | `4000000` | Ceiling on distinct edited world cells held in memory (and written to `eden_world.model`). New cells past it are refused; updates to existing cells always go through. Also the upper clamp for `--we-max-cells` and the derived `fill` cap. Raise it only to match a world [`eden_import`](import.md) was told to allow with its own `--max-world-cells` — your RAM is the real limit. A value below `1` falls back to the default with a warning; a non-default value is logged at startup. |
+| `--max-world-cells N` | `4000000` | Ceiling on distinct edited world cells held in memory (and written to `eden_world.model`). At the cap, edits to cells the world already holds still apply but **every new cell is refused** — a block placed in open air, a natural block mined or painted — so from a player's seat some builds save and others vanish. **Size it above the world, never equal to it:** [`eden_import`](import.md)'s summary prints the value to use (the cell count plus a quarter, at least 1,000,000 more, rounded up to 100,000). The server warns at startup when the loaded world is at the cap or within a tenth of it, logs refusals at most once a minute (`world cell cap reached`), and tells the player whose edit was refused; every `Saved world` log line shows the cap. Also the upper clamp for `--we-max-cells` and the derived `fill` cap. Your RAM is the real limit. A value below `1` falls back to the default with a warning; a non-default value is logged at startup. |
 | `--action-rate N` | `512` | Sustained terrain edits per second per connection. `0` disables the limit entirely. |
 | `--action-burst N` | `1024` | Edits a connection may spend at once before the sustained rate applies. |
 | `--connect-limit N` | `10` | New connections allowed per source IP per 10 s window. `0` disables. ⚠️ It is per *source address*, so a whole LAN behind one NAT address shares the allowance — as does a test harness on loopback. |
@@ -192,7 +192,8 @@ in `server_posix.cpp` (and its headers) if you must.
 | Max chat message length | 256 bytes |
 | Max username length | 20 bytes |
 | Max distinct edited world cells | 4,000,000 by default — the value of `--max-world-cells` (see the server flag table) |
-| Max signs loaded | 20,000 |
+| Max signs (loaded, or placed by players) | 20,000 |
+| Sign writes (`SIGNP`) per connection | 1/s sustained, burst of 8 |
 | Minimum gap between served `REGION`s | 750 ms |
 | `REGION`s served per session | 256 |
 | Minimum gap between served `SIGNQ`s | 1000 ms |
@@ -316,7 +317,7 @@ numbers are in [import.md](import.md); the flags:
 | `--signs FILE` | `signs_<input>.dat` beside the input | The sign sidecar. Takes precedence over the world's inline sign trailer. |
 | `--no-signs` | off | Ignore signs entirely. |
 | `--spawn header\|home\|X,Y,Z\|none` | `header` | What goes into `eden_spawn.txt`. |
-| `--max-world-cells N` | `4000000` | Refuse above this many cells. Matches the server's `--max-world-cells` default; raise both together. |
+| `--max-world-cells N` | `4000000` | Refuse above this many cells. Matches the server's `--max-world-cells` default. The summary's `server cap` line is the value to start `edenserver` with — **above** the import's cell count, so players have room to build. An import that fits under this flag but would leave less room than that gets a warning. |
 | `--max-region-records N` | `2000000` | Refuse if any single `REGION` reply would carry more records than this. `0` disables the check. |
 | `--region-radius N` | `224` | Match a server started with `--region-radius`; changes the size of the box the projection slides. |
 | `--strict` | off | Treat unknown block ids and out-of-palette paints as errors instead of warnings. |
@@ -489,10 +490,14 @@ Player6835:65535.2:33.92:65545.2
 
 ### `eden_signs.txt`
 
-Operator-authored. Parsed once at startup; the control socket's `signs add` / `signs rm` /
-`signs reload` ([commands.md](commands.md)) edit it at runtime (rewritten via temp file +
-`rename()`, like the world file). Without the control socket it is effectively read-only —
-restart to apply hand edits.
+Written by operators and players. Parsed once at startup. A sign a player places or edits in
+game is saved to it on the next autosave, when they disconnect, or on the control socket's
+`save`/`stop`; the control socket's `signs add` / `signs rm` rewrite it immediately and
+`signs reload` re-reads it ([commands.md](commands.md)). Every write goes through a temp file +
+`rename()`, like the world file.
+
+**Don't hand-edit it while the server is running** — the next save rewrites the file from
+memory and your edit is lost. Stop the server, edit, start it (or use `signs add`/`rm`).
 
 ```
 x:y:z:a:b:c:text
@@ -505,8 +510,9 @@ x:y:z:a:b:c:text
 - `x`, `z` must be `0..16777215`; `y` must be `0..255`. Every one of the six numeric fields
   must be a plain integer with no trailing junk.
 - Text is capped at 256 bytes and stripped of ASCII control characters.
-- ⚠️ `a`, `b`, `c` are of unknown meaning. They are emitted to clients verbatim. `0:0:0` is a
-  reasonable default.
+- ⚠️ `a`, `b`, `c` are of unknown meaning. They are emitted to clients verbatim. `a` has only
+  been seen as `0..5` (likely a block face), and a player's edit replaces the sign with the same
+  `x:y:z:a`. `0:0:0` is a reasonable default.
 
 ```
 # format: x:y:z:a:b:c:text   (a/b/c semantics unknown, emitted verbatim)

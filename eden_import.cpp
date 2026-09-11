@@ -452,6 +452,9 @@ int main(int argc, char** argv) {
               << "  cells         " << commas(p.cells) << "  of "
               << commas(a.opt.max_world_cells) << " cap  ("
               << pct(p.cells, a.opt.max_world_cells) << ")\n"
+              << "  server cap    edenserver --max-world-cells "
+              << recommended_max_world_cells(p.cells)
+              << " or higher  (room for players to build)\n"
               << "  worst REGION  " << commas(p.worst_region.records) << " records";
     if (p.worst_region.records) {
         std::cout << "  at x " << p.worst_region.x0 << ".." << p.worst_region.x1
@@ -500,13 +503,24 @@ int main(int argc, char** argv) {
                      " an out-of-palette paint on the wire, so they will render unpainted.\n";
         if (a.opt.strict) fatal = true;
     }
+    // The server cap must sit *above* the import: at exactly the cell count the
+    // server refuses every new block players place (edits to existing cells still
+    // save), which is how the first public server lost a day of building.
+    const size_t server_cap = recommended_max_world_cells(p.cells);
     if (p.cells > a.opt.max_world_cells) {
         std::cerr << "eden_import: error: " << commas(p.cells) << " cells exceeds the "
                   << commas(a.opt.max_world_cells) << " cap. Either import with"
                      " --air-fill diff, or raise both ceilings: eden_import"
                      " --max-world-cells " << p.cells << " and edenserver --max-world-cells "
-                  << p.cells << ".\n";
+                  << server_cap << " (the server needs room above the import for the blocks"
+                     " players place).\n";
         fatal = true;
+    } else if (server_cap > a.opt.max_world_cells) {
+        std::cerr << "eden_import: warning: " << commas(p.cells) << " cells leaves only "
+                  << commas(a.opt.max_world_cells - p.cells) << " of the "
+                  << commas(a.opt.max_world_cells) << " cap left for players to build. Start"
+                     " edenserver with --max-world-cells " << server_cap << " or higher, or new"
+                     " blocks stop saving once that room is used.\n";
     }
     if (a.opt.max_region_records && p.worst_region.records > a.opt.max_region_records) {
         std::cerr << "eden_import: error: a single REGION reply would carry "

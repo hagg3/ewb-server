@@ -61,13 +61,13 @@ A raw client works too — `printf 'who\n' | nc -U ./edenserver.sock`.
 | `ban <name\|ip>` | Add to the ban list, persist it, and disconnect anyone matching now. A token of only digits/dots/colons is an IP; anything else is a name. |
 | `unban <name\|ip>` | Remove a ban-list entry. |
 | `banlist` | Show the ban list. |
-| `save` | Flush the world and player files to disk now (independent of the 15 s autosave). |
+| `save` | Flush the world, player and sign files to disk now (independent of the 15 s autosave). |
 | `stop` | Save, then exit the process. Under a restart-on-failure supervisor this is a clean stop, not a crash. |
 | `op <name> <0..2>` | Set a player's op level (`0` visitor / `1` builder / `2` operator). Persisted to `eden_ops.txt`, and enforced on the player's **next command** — no reconnect needed. See [Part 2](#part-2--player-commands). |
 | `deop <name>` | Clear a player's op-level entry. |
 | `setblock <x> <y> <z> <type> [color]` | Place one block. Goes through the same world model + broadcast path as a player edit, so connected clients see it immediately. |
 | `fill <x0> <y0> <z0> <x1> <y1> <z1> <type> [color]` | Fill an inclusive box. Capped at `2 x --we-max-cells` (262,144 by default); an oversized box is refused with its size, not truncated. `type 0` clears to air. |
-| `signs reload` | Re-read the sign sidecar from disk. |
+| `signs reload` | Re-read the sign sidecar from disk. Refused while players have placed signs that are not saved yet — run `save` first. A running server's saves rewrite the file, so hand-edit it only while the server is stopped. |
 | `signs add <x> <y> <z> <a> <b> <c> <text>` | Append a sign and rewrite the sidecar. `a`/`b`/`c` are of unknown meaning — `0 0 0` is a fine default. New `SIGNQ`s get the updated burst. |
 | `signs rm <x> <y> <z>` | Remove every sign at that coordinate and rewrite the sidecar. |
 | `region-stats` | `REGION` service counters since start: requests, cells scanned, records emitted, bytes out, total and mean time. |

@@ -174,10 +174,18 @@ func (s *Server) handleWorldImport(w http.ResponseWriter, r *http.Request) {
 
 	res := s.rt.ImportWrite(ctx, p, edenBytes, o)
 	if res.OK && r.FormValue("set_active") == "true" {
-		// Carry any acknowledged --max-world-cells override into the set-active
-		// step: on vps it raises EDEN_MAX_WORLD_CELLS so the server will accept
-		// the world it just imported above the default cap (plan §3.7).
-		sa, saErr := s.setActiveWorldCells(ctx, p, name, r.FormValue("restart") == "true", o.MaxWorldCells)
+		// Size the server cap for the world just imported: on vps the set-active
+		// step raises EDEN_MAX_WORLD_CELLS to this when it is higher (plan §3.7).
+		// It must leave room *above* the cell count — a cap equal to it refuses
+		// every new block players place — so it is the recommended cap for the
+		// imported cells, or the acknowledged import override if that is larger.
+		maxCells := o.MaxWorldCells
+		if res.Summary.Cells > 0 {
+			if rec := eden.RecommendedMaxWorldCells(res.Summary.Cells); rec > maxCells {
+				maxCells = rec
+			}
+		}
+		sa, saErr := s.setActiveWorldCells(ctx, p, name, r.FormValue("restart") == "true", maxCells)
 		if saErr != nil {
 			res.SetActive = map[string]any{"ok": false, "error": saErr.Error()}
 		} else {

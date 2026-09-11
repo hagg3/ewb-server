@@ -134,8 +134,16 @@ world that fails either.
 
 **Cells, against the cap.** Every line of `eden_world.model` becomes one entry in the server's
 in-memory world map, and the server refuses new cells past its `--max-world-cells` (default
-4,000,000 — see [configuration.md](configuration.md)). Raising it takes *both* `eden_import
---max-world-cells N` and a server started with `--max-world-cells N`.
+4,000,000 — see [configuration.md](configuration.md)). Importing a bigger world takes *both*
+`eden_import --max-world-cells N` and a server started with a raised cap of its own.
+
+⚠️ **The server's cap must be higher than the import, not equal to it.** Every block a player
+places in open air, and every natural block they mine or paint, is a new cell. A server started
+at exactly the imported cell count refuses all of them while still accepting edits to cells the
+import already holds — so some builds save and others are gone on the next join. The summary's
+`server cap` line is the value to use: the cell count plus a quarter, at least a million more,
+rounded up to 100,000. An import that fits under `--max-world-cells` but would leave less room
+than that gets a warning.
 
 **Worst-case records in a single `REGION` reply.** This is the number that decides whether an
 imported world actually *plays*, and it is not the same number. A `REGION` request is answered

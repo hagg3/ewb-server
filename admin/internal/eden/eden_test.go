@@ -31,6 +31,24 @@ var vpsP = profile.Profile{
 
 func joinLocal(argv []string) string { return strings.Join(argv, " ") }
 
+// Same table as protocol_test.cpp's test_cell_cap_headroom — the two must agree.
+func TestRecommendedMaxWorldCells(t *testing.T) {
+	for _, c := range []struct {
+		cells int64
+		want  int
+	}{
+		{0, 1000000},
+		{3433, 1100000},
+		{2200053, 3300000},
+		{13920369, 17500000},
+		{-5, 1000000},
+	} {
+		if got := RecommendedMaxWorldCells(c.cells); got != c.want {
+			t.Errorf("RecommendedMaxWorldCells(%d) = %d, want %d", c.cells, got, c.want)
+		}
+	}
+}
+
 func TestCtlArgvLocal(t *testing.T) {
 	cases := []struct {
 		got  []string

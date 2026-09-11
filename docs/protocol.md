@@ -45,9 +45,10 @@ the same commit.**
 | `POSVEL:px:py:pz:vx:vy:vz` | Both at once. |
 | `REGION:x:z` | "Send me the world around this point." Answered with `SNAPZ`. |
 | `SIGNQ` | Bare line, no arguments. "Send me the signs." Answered with `SIGNP`. |
+| `SIGNP:x:y:z:a:b:c:text` | A player placed or edited a sign. The server's `SIGNP` fields **without** the sender field — see [`SIGNP` from a client](#signp-from-a-client). |
 | `PING` | Bare line. Answered with `PONG`. |
 
-`REGION` and `SIGNQ` are refused before a successful `JOIN`.
+`REGION`, `SIGNQ` and `SIGNP` are refused before a successful `JOIN`.
 
 ## Server → client
 
@@ -59,6 +60,7 @@ Broadcast to every peer **except** the sender:
 | `VEL:username:characterType:x:y:z` |
 | `POSVEL:username:characterType:px:py:pz:vx:vy:vz` |
 | `ACTION:username:characterType:x:y:z:mode[:typeOrColor]` ⚠️ unconfirmed |
+| `SIGNP:server:x:y:z:a:b:c:text` — a player's sign write, relayed ⚠️ unconfirmed mid-session |
 | `[username (T<characterType>)] <chat text>` |
 | `[Server] <username> (Type <n>) has joined.` |
 | `[Server] <username> has left.` |
@@ -73,6 +75,9 @@ Unicast to one client:
 | `SIGNP:server:x:y:z:a:b:c:text` | One sign; sent as a burst answering `SIGNQ`. |
 | `SNAPZ:count:base64` | One frame of terrain; sent as a burst answering `REGION`. |
 | `PONG` | Answer to `PING`. |
+| `ACTION:server:0:x:y:z:1` ⚠️ unconfirmed | Removes a block this player placed that the server refused at the world cell cap. See [At the world cell cap](#at-the-world-cell-cap). |
+| `[Server] This world is full, so that edit was not saved. Please tell the server operator.` | An `ACTION` refused at the world cell cap. At most once per 30 s per player. |
+| `[Server] This world has reached its sign limit, so that sign was not saved.` | A `SIGNP` refused at the sign cap. |
 | `[Server] Invalid name (<reason>).` | `JOIN` refused; connection closed. |
 | `[Server] Wrong password.` | `JOIN` refused; connection closed. |
 | `[Server] Name already in use.` ⚠️ unconfirmed wording | `JOIN` refused; connection closed. |
@@ -129,6 +134,25 @@ The server does not merely record the edit: it simulates it, including TNT and f
 explosions with chaining. One burn can therefore change hundreds of cells, which is why it is
 charged much more heavily against the per-connection edit budget (see
 [configuration.md](configuration.md)).
+
+### At the world cell cap
+
+The server holds at most `--max-world-cells` distinct edited cells. At the cap, an edit to a
+cell it already holds still applies, but one that would create a **new** cell — a block placed
+in open air, a natural block mined or painted — is refused:
+
+- A refused build, mine or paint is **not relayed** to peers, who would otherwise draw
+  something no `REGION` will ever send back.
+- The player who placed a refused block is sent `ACTION:server:0:x:y:z:1` to take it back out
+  of their world (the cell was untouched terrain as far as the server knows, and a client only
+  builds into air). ⚠️ This is the relay shape the player commands use; the retail client
+  applying it is unconfirmed.
+- The player is told `[Server] This world is full, so that edit was not saved. Please tell the
+  server operator.`, at most once every 30 s.
+- A burn is relayed regardless, since every client simulates the blast itself; if part of the
+  blast was refused, the player is told that instead.
+
+Sizing the cap so this never happens is covered in [configuration.md](configuration.md).
 
 ## `REGION` → `SNAPZ`
 
@@ -218,8 +242,30 @@ which is what "nothing" means here.
 ⚠️ `a`, `b`, `c` are **unknown fields**. The server emits whatever the sign file holds,
 verbatim, and invents no semantics for them.
 
-Signs are **read-only**. No client→server sign-write message has ever been captured, and
-whether one exists is an open question; the operator populates `eden_signs.txt` by hand.
+### `SIGNP` from a client
+
+```
+client   SIGNP:<x>:<y>:<z>:<a>:<b>:<c>:<text>\n
+```
+
+The retail client sends this when a player places or edits a sign. It is the server's line
+without the sender field; a line carrying `server` there fails to parse and is ignored.
+
+- The sign goes into its **slot — the block `x, y, z` plus `a`** — replacing any sign already
+  there. Real worlds hold two signs on one block that differ in `a`, and `a` has only ever been
+  seen as `0..5`, which fits a block face. That is inferred from data, not confirmed.
+  Re-sending an identical sign changes nothing.
+- The text gets the same treatment as the sign file: capped at 256 bytes, control characters
+  stripped.
+- The next `SIGNQ` answer includes it immediately. `eden_signs.txt` is written on the next
+  autosave, when the player disconnects, or on the control socket's `save`/`stop`.
+- It is relayed to every other player as `SIGNP:server:…`. ⚠️ Whether a connected retail client
+  applies a `SIGNP` outside its join burst is unconfirmed; one that doesn't sees the sign on
+  its next join.
+- It is refused before `JOIN`, paced per connection, and refused with a chat line to the
+  player once the world holds 20,000 signs. Values are in [configuration.md](configuration.md).
+- ⚠️ No message for *removing* a sign has been observed. A sign whose block is mined stays in
+  the sign file until an operator removes it with `signs rm`.
 
 ## `PING` → `PONG`
 
