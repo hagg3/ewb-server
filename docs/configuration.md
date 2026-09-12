@@ -36,7 +36,7 @@ server. Unknown flags are ignored.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--world FILE` | `eden_world.model` | World edit store. Created on first save if absent. |
-| `--signs FILE` | `eden_signs.txt` | Sign sidecar. Read at startup; the control socket's `signs add`/`rm`/`reload` also edit it. Absent is normal and silent. |
+| `--signs FILE` | `eden_signs.txt` | Sign sidecar. Read at startup, when signs on blocks the world stores as air are dropped (see [`eden_signs.txt`](#eden_signstxt)); the control socket's `signs add`/`rm`/`reload` also edit it. Absent is normal and silent. |
 | `--spawn-file FILE` | `eden_spawn.txt` beside `--world` | World default-spawn sidecar (one line `x:y:z`), as written by [`eden_import`](import.md). Read once at startup. Absent is normal and silent; a malformed line warns and is ignored. |
 | `--spawn x:y:z` | *(none)* | Set the world default spawn inline; overrides `--spawn-file` and skips reading it. |
 
@@ -163,6 +163,34 @@ rely on a password to gate strangers, also watch the journal for `wrong password
 fail2ban (a ready-made filter/jail ships in [`ops/`](../ops/)) and prefer the ban list or an
 allow-list over a shared secret where you can.
 
+### Per-client output
+
+Every connected client has one writer thread and one output queue. These bound how far behind a
+slow client may fall before the server stops holding its updates. Most operators never touch
+them; the ones worth knowing about on a small VPS are `--client-world-max` and
+`--region-pending-records`, because those two decide the server's worst-case memory.
+
+The queue is in two halves, and they behave differently on purpose. Movement, chat and
+`[Server]` notices are order-insensitive, so when that half overflows the **oldest** lines are
+dropped and the newest still arrive — a four-second-old position is worthless, and dropping
+someone for a bad ten seconds is the opposite of what a weak-link player needs. World state —
+block edits, sign writes, `SNAPZ` region frames — is never dropped, because a missing edit
+silently diverges that client's world with nothing left to resync it. It is refused instead:
+a request the client made (`REGION`, `SIGNQ`) is refused and re-asked, and a relay it cannot
+re-ask for disconnects it, which resyncs properly on rejoin.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--client-outbox-max N` | `1048576` | Bytes of movement/chat backlog per client before the oldest queued lines are dropped to make room. `who` reports each client's queued bytes, peak and dropped-line count; the first drop for a client is logged. Raised to 65536 if set lower. |
+| `--client-world-max N` | `16777216` | Bytes of **world-state** backlog per client before that client is disconnected with `[Server] Connection too slow.` This bounds the *backlog*, not any single update: one indivisible relay can legitimately be larger (a full operator `fill` is ~27 MB of `ACTION` lines) and is always delivered, so the queue peaks at this plus one update. |
+| `--client-region-queue N` | `2` | `REGION` replies that may be queued at once for one client. Past this, further requests are refused — the same answer the 750 ms gap gives — and the client re-asks. Minimum 1. |
+| `--region-pending-records N` | `16000000` | Scanned-but-not-yet-encoded `REGION` records held across **all** clients, at 20 bytes each on the wire and `sizeof(SnapRec)` in memory. Past this, a `REGION` is refused. `0` disables the guard. This is the knob that stops several players walking into new terrain at once from exhausting a small VPS: one worst-case reply box is ~3.5 M records. |
+| `--client-write-timeout N` | `60` | Seconds a client's writer may make **no** progress at all before the connection is closed. `0` waits forever (not recommended: a peer that vanishes without a FIN parks a thread on TCP retransmit timeouts). |
+
+The server prints a startup note if the all-clients-stalled worst case for these settings would
+exceed ~4 GB, which only happens if you have raised one of them. `region-stats` reports refusals,
+records currently queued, and clients dropped for falling behind.
+
 ### Region tuning
 
 These exist for protocol experimentation. Leave them alone for normal hosting.
@@ -178,7 +206,7 @@ These exist for protocol experimentation. Leave them alone for normal hosting.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--legacy-snapshot` | off | Push the whole world to a joining client as plaintext `ACTION` lines, instead of waiting for `REGION`. See [protocol.md § Legacy world snapshot](protocol.md#legacy-world-snapshot). Bring-up fallback; not what a retail client expects. |
+| `--legacy-snapshot` | off | Push the whole world to a joining client as plaintext `ACTION` lines, instead of waiting for `REGION`. See [protocol.md § Legacy world snapshot](protocol.md#legacy-world-snapshot). Bring-up fallback; not what a retail client expects. ⚠️ The dump is one indivisible blob, routinely far larger than `--client-world-max`; it is queued anyway (that budget bounds the *backlog*, not one update), so expect a joining client to cost the whole world in memory until it has drained. |
 
 ### Compiled-in limits
 
@@ -496,6 +524,14 @@ game is saved to it on the next autosave, when they disconnect, or on the contro
 `signs reload` re-reads it ([commands.md](commands.md)). Every write goes through a temp file +
 `rename()`, like the world file.
 
+**A sign is removed with its block.** Any edit that stores air where a sign is attached — a
+player mining or blowing up the block, `setblock`/`fill`, a player command, `//undo` — removes
+every sign on that block, and the file follows on the next save. At startup, and after
+`signs reload`, signs on blocks the world file stores as air are dropped: the log says
+`dropped N sign(s) on removed blocks` and lists them, and the file is rewritten at once. A sign
+on a cell the world file doesn't hold is kept — that cell is untouched terrain, which may be
+solid.
+
 **Don't hand-edit it while the server is running** — the next save rewrites the file from
 memory and your edit is lost. Stop the server, edit, start it (or use `signs add`/`rm`).
 
@@ -503,6 +539,7 @@ memory and your edit is lost. Stop the server, edit, start it (or use `signs add
 x:y:z:a:b:c:text
 ```
 
+- `x:y:z` is the **block the sign is attached to**, not the air cell in front of it.
 - Exactly six `:` are consumed; **everything after the sixth is the text**, so a `:` inside
   sign text is safe.
 - Blank lines and lines beginning with `#` are skipped silently.

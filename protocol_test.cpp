@@ -1,6 +1,6 @@
 // protocol_test.cpp — offline checks for ROADMAP-SERVER stages 1.5, 1.7 and 1.10:
 // the sign sidecar / `SIGNP` wire formats (including a player's sign write and its
-// slot upsert), and the hardening primitives (username validation, `ACTION`
+// slot upsert, and removing signs with their block — stage 7.2), and the hardening primitives (username validation, `ACTION`
 // payload validation, the world cell cap headroom, token bucket, per-IP connect
 // limiter, constant-time password compare, per-IP failed-auth limiter, text
 // sanitisation).
@@ -14,7 +14,9 @@
 // covered by the live socket test in the stage 1.8 ladder, not here.
 
 #include <cstdio>
+#include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "hardening.h"
@@ -409,6 +411,88 @@ static void test_sanitize_text() {
     CHECK(ewb::sanitize_text("caf\xC3\xA9", 64) == "caf\xC3\xA9", "UTF-8 survives");
 }
 
+// --- signs removed with their block (stage 7.2) ----------------------------------
+
+static bool same_signs(const std::vector<ewb::Sign>& p, const std::vector<ewb::Sign>& q) {
+    if (p.size() != q.size()) return false;
+    for (size_t i = 0; i < p.size(); ++i)
+        if (p[i].x != q[i].x || p[i].y != q[i].y || p[i].z != q[i].z || p[i].a != q[i].a ||
+            p[i].b != q[i].b || p[i].c != q[i].c || p[i].text != q[i].text)
+            return false;
+    return true;
+}
+
+static void test_remove_signs_on_block() {
+    // Two signs on one block that differ in `a`, with a sign on each of the six
+    // neighbouring blocks around and between them.
+    static const int kNeighbour[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                         {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    std::vector<ewb::Sign> v{{100, 34, 200, 0, 27, 0, "face 0"}};
+    for (int i = 0; i < 6; ++i) {
+        v.push_back({100 + kNeighbour[i][0], 34 + kNeighbour[i][1], 200 + kNeighbour[i][2],
+                     0, 0, 0, "n" + std::to_string(i)});
+        if (i == 2) v.push_back({100, 34, 200, 5, 38, 3, "face 5"});
+    }
+
+    std::vector<ewb::Sign> removed;
+    CHECK(ewb::remove_signs_on_block(v, 100, 34, 200, &removed) == 2,
+          "both signs on a block are removed, whatever their face");
+    CHECK(removed.size() == 2 && removed[0].text == "face 0" && removed[1].text == "face 5",
+          "the removed signs are handed back, in order");
+    bool neighbours = v.size() == 6;
+    for (size_t i = 0; neighbours && i < v.size(); ++i)
+        neighbours = v[i].text == "n" + std::to_string(i);
+    CHECK(neighbours, "a sign on each of the six neighbouring blocks survives, in order");
+
+    const std::vector<ewb::Sign> before = v;
+    CHECK(ewb::remove_signs_on_block(v, 100, 34, 200) == 0 && same_signs(v, before),
+          "a block with no signs left removes nothing and leaves the list alone");
+    CHECK(ewb::remove_signs_on_block(v, 7, 7, 7) == 0 && same_signs(v, before),
+          "a miss leaves the list alone");
+    std::vector<ewb::Sign> none;
+    CHECK(ewb::remove_signs_on_block(none, 100, 34, 200) == 0 && none.empty(),
+          "an empty list returns 0");
+}
+
+static void test_prune_signs() {
+    std::vector<ewb::Sign> v;
+    for (int i = 0; i < 6; ++i) v.push_back({i, 34, 0, 0, 0, 0, "s" + std::to_string(i)});
+    int calls = 0;
+    const auto gone = [&](const ewb::Sign& s) { ++calls; return s.x == 1 || s.x == 2 || s.x == 5; };
+
+    std::vector<ewb::Sign> dropped;
+    CHECK(ewb::prune_signs(v, gone, &dropped) == 3, "prune drops only where the predicate is true");
+    CHECK(calls == 6, "the predicate is asked once per sign");
+    CHECK(v.size() == 3 && v[0].text == "s0" && v[1].text == "s3" && v[2].text == "s4",
+          "survivors keep their order");
+    CHECK(dropped.size() == 3 && dropped[0].text == "s1" && dropped[1].text == "s2" &&
+          dropped[2].text == "s5", "the dropped signs are handed back, in order");
+
+    const std::vector<ewb::Sign> before = v;
+    CHECK(ewb::prune_signs(v, [](const ewb::Sign&) { return false; }) == 0 && same_signs(v, before),
+          "nothing to drop leaves the list alone");
+    std::vector<ewb::Sign> none;
+    calls = 0;
+    CHECK(ewb::prune_signs(none, gone) == 0 && none.empty() && calls == 0,
+          "an empty list is left alone");
+
+    // The server's predicate: drop a sign only when its block is *stored* as air. An
+    // absent cell is untouched base terrain, which may be solid, so it keeps its sign.
+    const std::map<std::tuple<int, int, int>, int> world = {
+        {{10, 32, 10}, 0},    // mined: stored as air
+        {{11, 32, 10}, 13},   // built: stored solid
+    };
+    const auto storedAir = [&](const ewb::Sign& s) {
+        const auto it = world.find(std::make_tuple(s.x, s.y, s.z));
+        return it != world.end() && it->second == 0;
+    };
+    std::vector<ewb::Sign> w{{10, 32, 10, 3, 2, 2, "orphan"},
+                             {11, 32, 10, 3, 2, 2, "on a block"},
+                             {12, 32, 10, 3, 2, 2, "on base terrain"}};
+    CHECK(ewb::prune_signs(w, storedAir) == 1 && w.size() == 2 && w[0].text == "on a block" &&
+          w[1].text == "on base terrain", "only the sign on a stored-air block is pruned");
+}
+
 int main() {
     test_sign_parse();
     test_sign_text_cannot_break_framing();
@@ -416,6 +500,8 @@ int main() {
     test_client_signp_parse();
     test_sign_file_line_round_trip();
     test_sign_upsert();
+    test_remove_signs_on_block();
+    test_prune_signs();
     test_cell_cap_headroom();
     test_spawn_parse();
     test_username_validation();

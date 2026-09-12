@@ -55,10 +55,14 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <memory>
 #include <algorithm>
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 #include <fstream>
 #include <atomic>
@@ -70,6 +74,7 @@
 
 #include "region_query.h"   // REGION reply geometry + Cell -> record table (stage 1.1)
 #include "snapz_codec.h"    // raw DEFLATE + base64 + SNAPZ framing      (stage 1.2)
+#include "out_queue.h"      // per-client output queue policy            (stage 7.3)
 #include "sign_store.h"     // eden_signs.txt + SIGNQ -> SIGNP           (stage 1.5)
 #include "spawn_store.h"    // eden_spawn.txt: a world's default spawn     (stage 5.3)
 #include "hardening.h"      // names, token buckets, ACTION validation   (stage 1.7)
@@ -153,12 +158,23 @@ size_t      g_weUndoBudget = ewb::WE_UNDO_BUDGET_BYTES;  // per-player undo+redo
 double      g_weCellRate   = ewb::WE_CELL_RATE;          // cells/sec a player may spend; 0 = unlimited (--we-rate)
 double      g_weCellBurst  = ewb::WE_CELL_BURST;         // cells they may spend at once (--we-burst)
 
+// Per-client output queue bounds (stage 7.3). The policy these feed lives in
+// out_queue.h; these are the numbers an operator can move. See docs/configuration.md.
+size_t      g_outboxMax     = 1u << 20;      // --client-outbox-max: movement/chat backlog bytes
+size_t      g_worldboxMax   = 16u << 20;     // --client-world-max: world-state backlog bytes
+size_t      g_regionQueue   = 2;             // --client-region-queue: regions in flight per client
+uint64_t    g_regionPending = 16000000;      // --region-pending-records: queued records, all clients
+int         g_writeTimeout  = 60;            // --client-write-timeout: seconds with no drain progress
+
 // REGION service counters (the measurement plan §3.2's `region-stats` asks for).
 std::atomic<uint64_t> g_rgnRequests{0};
 std::atomic<uint64_t> g_rgnCellsScanned{0};
 std::atomic<uint64_t> g_rgnRecords{0};
 std::atomic<uint64_t> g_rgnBytesOut{0};
 std::atomic<uint64_t> g_rgnMicros{0};
+std::atomic<uint64_t> g_rgnRefused{0};      // regions refused for output backpressure (7.3)
+std::atomic<uint64_t> g_rgnPendingRecs{0};  // records queued for encoding, across all clients
+std::atomic<uint64_t> g_slowDrops{0};       // clients disconnected for not draining (7.3)
 
 // Safety limits (hardening for public hosting).
 static const int    SV_WORLD_HEIGHT   = 256;       // must match the game's T_HEIGHT
@@ -215,6 +231,17 @@ static const double SV_CONNECT_WINDOW_SEC  = 10.0;
 // Chat is broadcast verbatim to every peer; cap what one line can cost.
 static const size_t SV_MAX_CHAT = 256;
 
+// How long a client writer blocks in one send() before it looks up and asks
+// whether it has run out of --client-write-timeout (SO_SNDTIMEO, stage 7.3). It
+// is a polling granularity, not a deadline: progress resets the deadline.
+static const int SV_SEND_POLL_SEC = 5;
+
+// ...and the much shorter budget it gets once the reader has asked it to stop.
+// The close path exists to flush a queued denial or kick notice to a peer that is
+// still reading; a peer that is not gets the socket closed under it rather than
+// holding the reader's thread open for a full write timeout.
+static const int SV_CLOSE_DRAIN_SEC = 5;
+
 // Monotonic seconds — the clock the token buckets and the connect limiter run on.
 // They take `now` as a parameter so hardening.h stays pure and testable.
 static double monoSeconds() {
@@ -258,7 +285,7 @@ std::string detectLanIP() {
 // correct snapshot to any joiner, regardless of the order edits arrived in.
 struct Cell { unsigned char type; unsigned char color; };
 static std::unordered_map<uint64_t, Cell> g_world;
-static std::mutex g_worldMtx;
+static std::mutex g_worldMtx;        // lock order: before g_signMtx, never after it (see Signs)
 static std::mutex g_saveMtx;         // serializes on-disk writes (world + players)
 std::atomic<bool> editsDirty{false};
 
@@ -289,7 +316,16 @@ static inline void wunkey(uint64_t k,int&x,int&y,int&z){
     z = (int)((k >> 16) & 0xFFFFFF);
     y = (int)( k        & 0xFFFF);
 }
+// Defined with the sign store below: worldSet() just stored air at key `k`, so any
+// signs on that block go too (stage 7.2). Caller holds g_worldMtx.
+static void removeSignsOnBlock(uint64_t k);
+
 // Caller must hold g_worldMtx. Returns false when the cap refused a brand-new cell.
+//
+// The only live writer of g_world (loadWorld is the other, at startup), which is why
+// the sign hook lives here: every edit that turns a cell to air — mine, burn, a blast,
+// setblock/fill, every WorldEdit command, //paste, //undo, //redo — passes through it.
+// A cell the cap refuses is left alone, and so are its signs.
 static bool worldSet(int x,int y,int z,int type,int color){
     uint64_t k = wkey(x,y,z);
     // Cap the number of distinct edited cells so a malicious/buggy client can't
@@ -315,6 +351,8 @@ static bool worldSet(int x,int y,int z,int type,int color){
     }
     g_world[k] = { (unsigned char)type, (unsigned char)color };
     editsDirty = true;
+    // A sign hangs on a block; a block that is now air has no face left to hang one on.
+    if(type==SV_AIR) removeSignsOnBlock(k);
     return true;
 }
 static bool worldGet(int x,int y,int z, Cell& out){
@@ -618,10 +656,46 @@ static void rememberPos(const std::string& name, float x, float y, float z){
 // --- Signs (stage 1.5, plus player sign writes) --------------------------------
 // The whole `SIGNP` burst is kept pre-formatted and re-sent verbatim per SIGNQ, so
 // nothing is built per request. It is rebuilt under g_signMtx whenever the list
-// changes: the control socket's `signs reload|add|rm`, or a player's sign write.
+// changes: the control socket's `signs reload|add|rm`, a player's sign write, or an
+// edit that turns a signed block to air (stage 7.2).
+//
+// ⚠️ Lock order: g_worldMtx, then g_signMtx — never the reverse. worldSet() takes
+// g_signMtx under the world lock when it stores air on a signed block, so nothing that
+// holds g_signMtx may take g_worldMtx.
 static std::vector<ewb::Sign> g_signs;
 static std::string            g_signBlob;
 static std::mutex             g_signMtx;
+
+// The blocks that carry at least one sign, keyed by wkey(). This is what keeps
+// worldSet()'s hook to one hash lookup per cell: a 1M-cell `fill` or a TNT chain must
+// not scan 20k signs per cell. Rebuilt with the list (loadSigns, signsChangedLocked),
+// which is O(signs) and fine at the cap. g_signBlockCount mirrors its size, so in a world
+// with no signs worldSet() never takes g_signMtx at all. Guarded by g_signMtx.
+static std::unordered_set<uint64_t> g_signBlocks;
+static std::atomic<size_t>          g_signBlockCount{0};
+
+// Signs worldSet() took off a block, waiting for their audit line. They are recorded
+// under g_worldMtx, where a log write is off limits, and written by drainSignRemovals()
+// with no lock held. The actor is captured when the sign is removed rather than when the
+// line is written, so a drain on another player's thread can't put it under their name.
+struct SignRemoval {
+    std::string actor;
+    int x = 0, y = 0, z = 0;
+    std::vector<ewb::Sign> signs;
+};
+static std::vector<SignRemoval> g_signRemovals;             // guarded by g_signMtx
+static bool                     g_signBurstStale = false;   // guarded by g_signMtx; see removeSignsOnBlock
+
+// Who is editing on this thread, for those audit lines: `player:<name>` on a client's
+// thread once it has joined, `control` on a control connection, `server` otherwise.
+static thread_local std::string t_editActor = "server";
+
+// Caller holds g_signMtx.
+static void rebuildSignIndexLocked() {
+    g_signBlocks.clear();
+    for (const ewb::Sign& s : g_signs) g_signBlocks.insert(wkey(s.x, s.y, s.z));
+    g_signBlockCount = g_signBlocks.size();
+}
 
 void loadSigns() {
     std::ifstream f(g_signFile);
@@ -653,6 +727,8 @@ void loadSigns() {
         std::lock_guard<std::mutex> lk(g_signMtx);
         g_signs = std::move(signs);
         g_signBlob = std::move(blob);
+        g_signBurstStale = false;
+        rebuildSignIndexLocked();
     }
     std::cout << "[Server] Loaded " << n << " signs from " << g_signFile
               << " (" << bytes << " B burst)." << std::endl;
@@ -668,8 +744,62 @@ static std::mutex        g_signSaveMtx;   // holds saveSigns()' snapshot + write
 // The sign list changed: rebuild the SIGNQ burst and mark the sidecar for the next
 // saveSigns(). Caller holds g_signMtx.
 static void signsChangedLocked() {
+    rebuildSignIndexLocked();
     g_signBlob = ewb::format_sign_burst(g_signs);
+    g_signBurstStale = false;
     g_signsDirty = true;
+}
+
+// worldSet() stored air at `k`: take every sign off that block, whatever its face.
+// Caller holds g_worldMtx (lock order above).
+//
+// The list and the index change here and the sidecar is marked dirty, but the SIGNQ
+// burst is only marked stale: drainSignRemovals() rebuilds it once when the edit is
+// done, and serveSigns() does if a SIGNQ gets in first. Rebuilding it here would format
+// every sign in the world once per signed block, under the world lock — a `fill` across
+// a sign-dense build would pay that hundreds of times over.
+static void removeSignsOnBlock(uint64_t k) {
+    if (g_signBlockCount.load(std::memory_order_relaxed) == 0) return;
+    std::lock_guard<std::mutex> lk(g_signMtx);
+    if (g_signBlocks.erase(k) == 0) return;
+    g_signBlockCount = g_signBlocks.size();
+    SignRemoval r;
+    r.actor = t_editActor;
+    // Coordinates from the key rather than the caller's ints, so the list and the
+    // index can't disagree about which block this is.
+    wunkey(k, r.x, r.y, r.z);
+    if (ewb::remove_signs_on_block(g_signs, r.x, r.y, r.z, &r.signs) == 0) return;
+    g_signRemovals.push_back(std::move(r));
+    g_signBurstStale = true;
+    g_signsDirty = true;
+}
+
+// Rebuild a burst removeSignsOnBlock() left stale. Caller holds g_signMtx.
+static void refreshSignBurstLocked() {
+    if (!g_signBurstStale) return;
+    g_signBlob = ewb::format_sign_burst(g_signs);
+    g_signBurstStale = false;
+}
+
+// Write the audit lines for signs removed with their blocks, one per block, and bring
+// the SIGNQ burst up to date. Call with no lock held, once the edit has released
+// g_worldMtx and written its own audit line (cause, then effect): the ACTION handler,
+// weFinish, //undo and //redo, and the control socket's setblock/fill. saveSigns() calls
+// it too, so a path that misses it still gets its lines by the next autosave.
+static void drainSignRemovals() {
+    std::vector<SignRemoval> done;
+    {
+        std::lock_guard<std::mutex> lk(g_signMtx);
+        refreshSignBurstLocked();
+        done.swap(g_signRemovals);
+    }
+    for (const SignRemoval& r : done) {
+        std::string what = r.signs.size() == 1 ? "sign" : std::to_string(r.signs.size()) + " signs";
+        what += " removed (block became air) at " + std::to_string(r.x) + "," +
+                std::to_string(r.y) + "," + std::to_string(r.z) + ": ";
+        for (size_t i = 0; i < r.signs.size(); ++i) what += (i ? " | " : "") + r.signs[i].text;
+        auditLog(r.actor, what);
+    }
 }
 
 // Write eden_signs.txt if the list changed since the last write. The file is
@@ -678,6 +808,7 @@ static void signsChangedLocked() {
 // g_signSaveMtx spans snapshot and write, so of two racing saves the later snapshot
 // is always the one left on disk.
 void saveSigns() {
+    drainSignRemovals();   // the backstop for any edit path that didn't drain
     std::lock_guard<std::mutex> serial(g_signSaveMtx);
     std::string file;
     size_t n = 0;
@@ -689,6 +820,37 @@ void saveSigns() {
     }
     if (!writeFileAtomic(g_signFile, file)) { g_signsDirty = true; return; }
     std::cout << "[Server] Saved signs (" << n << ")." << std::endl;
+}
+
+// Drop signs on blocks the world stores as air (stage 7.2). Before 7.2 a sign outlived
+// its block, so a world saved by an older server can hold orphans that reappear as soon
+// as someone builds on that block again. A cell the model doesn't hold is untouched base
+// terrain and may be solid, so an absent cell never drops a sign.
+//
+// Run once both the world and the signs are loaded: at startup and after `signs reload`.
+// When anything is dropped the sidecar is rewritten, so the file matches memory and the
+// reload guard (which refuses while signs are unsaved) doesn't trip.
+static size_t pruneOrphanSigns() {
+    std::vector<ewb::Sign> dropped;
+    {
+        std::lock_guard<std::mutex> wl(g_worldMtx);   // lock order: world, then signs
+        std::lock_guard<std::mutex> sl(g_signMtx);
+        ewb::prune_signs(g_signs, [](const ewb::Sign& s) {
+            const auto it = g_world.find(wkey(s.x, s.y, s.z));
+            return it != g_world.end() && it->second.type == SV_AIR;
+        }, &dropped);
+        if (!dropped.empty()) signsChangedLocked();
+    }
+    if (dropped.empty()) return 0;
+    std::cout << "[Server] dropped " << dropped.size() << " sign(s) on removed blocks" << std::endl;
+    const size_t shown = std::min<size_t>(dropped.size(), 20);
+    for (size_t i = 0; i < shown; ++i)
+        std::cout << "[Server]   " << dropped[i].x << "," << dropped[i].y << "," << dropped[i].z
+                  << ": " << dropped[i].text << std::endl;
+    if (dropped.size() > shown)
+        std::cout << "[Server]   (" << (dropped.size() - shown) << " more)" << std::endl;
+    saveSigns();
+    return dropped.size();
 }
 
 // Keep a persistent registration with the matchmaker for as long as we run.
@@ -748,15 +910,400 @@ void matchmakerThread() {
     }
 }
 
-// Send the current world (derived from the model) to one newly-joined client.
-// Send an entire buffer, looping over partial writes.
-static void sendAll(SOCKET s, const char* data, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = send(s, data + off, len - off, 0);
-        if (n <= 0) break;
-        off += (size_t)n;
+// --- per-client output: one writer thread owns the socket (stages 7.3 / 7.4) --
+//
+// ⚠️ **Nothing below this section may call send() on a player's socket.** The one
+// deliberate exception is the accept loop's "Server full" line, which is written
+// before any ClientOut exists and is documented there.
+//
+// Before 7.3 nothing serialised writes to a client socket: serveRegion() streamed
+// SNAPZ frames with no lock held while broadcastMessage(), /msg, weSay(),
+// weTeleport() and ctlKick() wrote to the same fd from other threads. A blocking
+// send() larger than the available send buffer releases the CPU while it waits, so
+// another thread's POSVEL landed *inside* a base64 payload and the frame arrived
+// short or undecodable. Records are sorted (z, x, y, flag) and framed at a flat
+// 3000, so one destroyed frame is one 1-block-wide row across the whole reply box:
+// the "world resets in strips on a weak link" report. A per-socket write mutex
+// would fix that and make 7.4 worse — a blocked region burst would hold it while a
+// broadcaster waited on it *under clientsMutex*. So the fix is structural instead:
+// every producer enqueues, exactly one thread per client drains, and a queue entry
+// is always a whole line or a whole frame (out_queue.h).
+//
+// That also fixes 7.4: broadcastMessage() used to hold clientsMutex across its
+// blocking send(), and JOIN needs the same mutex, so one backed-up client froze
+// every join, chat line, movement relay and block edit server-wide. No syscall now
+// runs under any shared lock.
+//
+// **Lock order: any server lock -> g_outsMtx -> ClientOut::m.** Nothing inside a
+// g_outsMtx or a ClientOut::m critical section takes another lock — those two are
+// terminal — so no ordering against g_worldMtx, g_signMtx, g_posMtx, g_saveMtx or
+// clientsMutex has to be remembered at the ~30 call sites that produce output.
+struct ClientOut {
+    SOCKET fd = INVALID_SOCKET;
+    int    id = 0;
+
+    std::mutex              m;         // guards everything below. Innermost lock.
+    std::condition_variable cv;        // work arrived, or the reader asked us to stop
+    std::condition_variable drained;   // the queue went idle (flushOut waits here)
+    ewb::OutQueue q;
+    std::string name;                  // log label; "client #N" until JOIN names them
+    bool closing    = false;           // reader wants the writer to drain and exit
+    bool tooSlow    = false;           // over the world-state budget; finish hi, then go
+    bool dead       = false;           // the writer gave up (peer gone / write timeout)
+    bool writing    = false;           // an item is in the writer's hand, not the queue
+    bool dropWarned = false;           // "not keeping up" logged once per client
+    uint64_t sentBytes = 0;
+
+    std::thread th;                    // the writer; joined by the reader in closeOut()
+};
+
+static std::mutex g_outsMtx;                                  // guards g_outs only
+static std::map<SOCKET, std::shared_ptr<ClientOut>> g_outs;   // live client writers
+
+// Look a client's output up by socket. Returns a *shared* pointer, so the client
+// may depart between this call and the enqueue and the object stays alive.
+// ⚠️ Never call this while holding g_outsMtx or a ClientOut::m.
+static std::shared_ptr<ClientOut> outFor(SOCKET s) {
+    std::lock_guard<std::mutex> lk(g_outsMtx);
+    auto it = g_outs.find(s);
+    return it == g_outs.end() ? std::shared_ptr<ClientOut>() : it->second;
+}
+
+// Every live client except one, as owning pointers. This is the "snapshot, release,
+// then enqueue" half of the 7.4 fix: broadcasts hold g_outsMtx for a map walk and
+// nothing else, and never hold it across an enqueue.
+static std::vector<std::shared_ptr<ClientOut>> outSnapshot(SOCKET except) {
+    std::vector<std::shared_ptr<ClientOut>> v;
+    std::lock_guard<std::mutex> lk(g_outsMtx);
+    v.reserve(g_outs.size());
+    for (const auto& kv : g_outs)
+        if (kv.first != except) v.push_back(kv.second);
+    return v;
+}
+
+// A client whose world-state backlog is over budget. The update cannot be dropped —
+// a missing ACTION relay silently diverges that client's world with nothing left to
+// resync it, which is the bug class this whole section exists to kill — so the
+// client goes instead and resyncs properly on rejoin.
+//
+// ⚠️ This **marks** the client and returns; it does not tear the connection down
+// here. Two reasons. Producers must never block, and it is called from inside a
+// broadcast loop. And "too slow" does not mean "not reading" — a client draining at
+// 200 KB/s while an operator's `fill` relay arrives at 2 MB/s is over budget and
+// still perfectly able to read one more line. So the notice goes into the
+// latency-sensitive queue, which drains first, and the writer delivers it, drops
+// the rest, and closes the socket (shutdown(), which wakes the reader for the
+// normal cleanup path — the ctlKick convention).
+static void dropTooSlow(const std::shared_ptr<ClientOut>& o) {
+    if (!o) return;
+    std::string who;
+    size_t queued = 0;
+    {
+        std::lock_guard<std::mutex> lk(o->m);
+        if (o->dead || o->closing || o->tooSlow) return;   // once per client
+        o->tooSlow = true;
+        who        = o->name;
+        queued     = o->q.queued_bytes();
+        o->q.push_hi("[Server] Connection too slow.\n");
     }
+    g_slowDrops.fetch_add(1, std::memory_order_relaxed);
+    std::cerr << "[Server] " << who << " is " << queued
+              << " B behind on world updates (--client-world-max " << g_worldboxMax
+              << "); disconnecting. They will resync on rejoin." << std::endl;
+    o->cv.notify_all();
+}
+
+// --- producers. All four are safe from any thread and are no-ops once the client
+// has gone. None of them blocks on the network; none takes another lock. ---------
+
+// A latency-sensitive, order-insensitive line: movement, chat, [Server] notices,
+// the welcome, CAPS, SPAWN, PONG.
+static void pushHi(const std::shared_ptr<ClientOut>& o, const std::string& line) {
+    if (!o || line.empty()) return;
+    bool warn = false;
+    std::string who;
+    {
+        std::lock_guard<std::mutex> lk(o->m);
+        if (o->closing || o->dead || o->tooSlow) return;
+        if (!o->q.push_hi(line) && !o->dropWarned) { o->dropWarned = true; warn = true; who = o->name; }
+    }
+    o->cv.notify_one();
+    if (warn)
+        std::cerr << "[Server] " << who << " is not keeping up; dropping stale movement and"
+                     " chat lines (their world state is still delivered in full)." << std::endl;
+}
+
+// World state the client cannot ask for again: an ACTION relay, a SIGNP relay, a
+// refused-edit correction. Over budget disconnects them — see dropTooSlow().
+static void pushWorld(const std::shared_ptr<ClientOut>& o, std::string blob) {
+    if (!o || blob.empty()) return;
+    bool over;
+    {
+        std::lock_guard<std::mutex> lk(o->m);
+        if (o->closing || o->dead || o->tooSlow) return;
+        over = !o->q.push_world(std::move(blob));
+    }
+    if (over) { dropTooSlow(o); return; }
+    o->cv.notify_one();
+}
+
+// The answer to a request the client made and can make again: the SIGNQ burst.
+// False means refuse the request — the client re-asks, and nothing about the world
+// is lost. (The legacy snapshot is *not* one of these: it is unsolicited, so it
+// goes through pushWorld.)
+static bool pushReply(const std::shared_ptr<ClientOut>& o, std::string blob) {
+    if (!o) return false;
+    bool ok;
+    {
+        std::lock_guard<std::mutex> lk(o->m);
+        if (o->closing || o->dead || o->tooSlow) return false;
+        ok = o->q.push_reply(std::move(blob));
+    }
+    if (ok) o->cv.notify_one();
+    return ok;
+}
+
+// A scanned REGION reply, encoded frame by frame by the writer. False means this
+// client already has --client-region-queue replies in flight: refuse, the same
+// answer the 750 ms gap limiter gives.
+static bool pushRegion(const std::shared_ptr<ClientOut>& o, ewb::RegionJob job) {
+    if (!o) return false;
+    bool ok;
+    {
+        std::lock_guard<std::mutex> lk(o->m);
+        if (o->closing || o->dead || o->tooSlow) return false;
+        ok = o->q.push_region(std::move(job));
+    }
+    if (ok) o->cv.notify_one();
+    return ok;
+}
+
+// Socket-addressed convenience wrappers, so the ~30 existing output call sites keep
+// reading the way they did. Each is one g_outsMtx map lookup; a broadcast uses
+// outSnapshot() instead of calling these in a loop.
+static void sendLine(SOCKET s, const std::string& line)      { pushHi(outFor(s), line); }
+static void sendLine(SOCKET s, const char* d, size_t n)      { pushHi(outFor(s), std::string(d, n)); }
+static void sendWorldTo(SOCKET s, const std::string& blob)   { pushWorld(outFor(s), blob); }
+
+// Block until this client's queue is empty, or `ms` elapses. Used where a line has
+// to reach the peer before the socket goes away (the kick notice); everything else
+// relies on the close path's drain.
+static void flushOut(const std::shared_ptr<ClientOut>& o, int ms) {
+    if (!o) return;
+    std::unique_lock<std::mutex> lk(o->m);
+    o->drained.wait_for(lk, std::chrono::milliseconds(ms),
+                        [&] { return o->dead || (o->q.idle() && !o->writing); });
+}
+
+// Give this client's log lines their player name once JOIN has one.
+static void nameOut(SOCKET s, const std::string& name) {
+    auto o = outFor(s);
+    if (!o) return;
+    std::lock_guard<std::mutex> lk(o->m);
+    o->name = name;
+}
+
+// --- the writer thread -------------------------------------------------------
+
+// Write one whole buffer. The only place a player's socket is written.
+//
+// Retries EINTR **keeping its offset** — the sendAll() this replaces abandoned the
+// rest of its buffer on any n <= 0, including EINTR, which was a third mid-line
+// truncation source independent of any concurrency (7.3 finding 9). SO_SNDTIMEO
+// turns a peer that has stopped reading into an EAGAIN we can time out on rather
+// than a thread parked forever; only a real error or --client-write-timeout
+// seconds with no progress at all ends the connection.
+static bool writeAll(ClientOut& o, const std::string& buf, double& lastProgress, bool leaving) {
+    size_t off = 0;
+    while (off < buf.size()) {
+        const ssize_t n = send(o.fd, buf.data() + off, buf.size() - off, 0);
+        if (n > 0) { off += (size_t)n; lastProgress = monoSeconds(); continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!serverRunning) return false;
+            // Re-read the flag rather than trusting the one this write started
+            // with: the reader may have asked us to stop while this very send()
+            // was blocked, and it is waiting on our join() to close the fd. A
+            // departing client must not hold its own thread for a full write
+            // timeout because the send it happened to be inside began earlier.
+            if (!leaving) {
+                std::lock_guard<std::mutex> lk(o.m);
+                leaving = o.closing || o.tooSlow;
+            }
+            const double budget = leaving ? (double)SV_CLOSE_DRAIN_SEC
+                                          : (g_writeTimeout > 0 ? (double)g_writeTimeout : 0.0);
+            if (budget > 0.0 && monoSeconds() - lastProgress > budget) return false;
+            continue;   // just behind, not gone
+        }
+        return false;   // EPIPE / ECONNRESET / shutdown() under us
+    }
+    return true;
+}
+
+static void clientWriter(std::shared_ptr<ClientOut> o) {
+    ewb::OutItem item;
+    double lastProgress = monoSeconds();
+    bool   sawClosing   = false;
+
+    // Per-region-job accumulators. `lo` is FIFO and a job's frames are contiguous,
+    // so exactly one job is ever in flight here.
+    size_t jobFrames = 0, jobRecords = 0, jobBytes = 0;
+    long   jobEncodeUs = 0;
+    std::chrono::steady_clock::time_point jobStart = std::chrono::steady_clock::now();
+
+    for (;;) {
+        bool leaving;   // the reader asked us to stop, or this client is too far behind
+        {
+            std::unique_lock<std::mutex> lk(o->m);
+            o->cv.wait(lk, [&] { return o->closing || o->tooSlow || o->dead || !o->q.idle(); });
+            if (o->dead) break;
+            leaving = o->closing || o->tooSlow;
+            // A client on its way out has no use for terrain, and dropping its
+            // pending regions here releases the record vectors (and their
+            // pending-record accounting) immediately instead of at the drain
+            // deadline. Queued hi lines survive, so a denial, a kick notice or the
+            // "Connection too slow" line still goes out first.
+            if (leaving) o->q.drop_lo();
+            if (!o->q.take(item)) {
+                o->writing = false;
+                o->drained.notify_all();
+                if (leaving) break;
+                continue;
+            }
+            o->writing = true;
+        }
+        if (leaving && !sawClosing) { sawClosing = true; lastProgress = monoSeconds(); }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string bytes;
+        if (item.kind == ewb::OutItem::Kind::Frame) {
+            if (item.first) {
+                jobFrames = jobRecords = jobBytes = 0;
+                jobEncodeUs = 0;
+                jobStart = t0;
+            }
+            try {
+                bytes = ewb::encode_item(item);
+            } catch (const std::exception& e) {
+                // A deflate failure must not take the server down: this thread is
+                // joined, not caught, and an escaping exception is std::terminate.
+                // Abandoning the rest of the burst is safe now — the client sees a
+                // short reply and asks again; it can no longer corrupt one.
+                std::string who;
+                { std::lock_guard<std::mutex> lk(o->m); who = o->name; o->writing = false; }
+                std::cerr << "[Server] REGION encode failed for " << who << ": " << e.what()
+                          << std::endl;
+                item.reset();
+                o->drained.notify_all();
+                continue;
+            }
+        } else {
+            bytes = std::move(item.bytes);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+
+        const bool ok = writeAll(*o, bytes, lastProgress, leaving);
+
+        if (item.kind == ewb::OutItem::Kind::Frame) {
+            ++jobFrames;
+            jobRecords  += item.count;
+            jobBytes    += bytes.size();
+            jobEncodeUs += (long)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            g_rgnBytesOut.fetch_add(bytes.size(), std::memory_order_relaxed);
+            if (ok && item.last) {
+                // The measurement 7.3 asked for: `encode N ms` used to span encode
+                // *and* send, because the two were interleaved in one loop, so an
+                // operator could not see backpressure as backpressure. Now they are
+                // separate numbers produced by separate threads.
+                const long drainMs = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - jobStart).count();
+                std::string who;
+                { std::lock_guard<std::mutex> lk(o->m); who = o->name; }
+                std::cout << "[Server] REGION drain " << who << ": " << jobFrames << " frame(s), "
+                          << jobRecords << " records, " << jobBytes << " B wire, encode "
+                          << (jobEncodeUs / 1000) << " ms, drain " << drainMs << " ms" << std::endl;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(o->m);
+            o->writing = false;
+            o->sentBytes += bytes.size();
+            if (!ok) o->dead = true;
+        }
+        o->drained.notify_all();
+        item.reset();
+        if (!ok) break;
+    }
+
+    // Drop anything still queued so the record vectors (and the global pending
+    // count they hold) are released the moment this writer stops, not whenever the
+    // last producer lets go of its shared_ptr.
+    bool gaveUp = false, stalled = false;
+    std::string who;
+    {
+        std::lock_guard<std::mutex> lk(o->m);
+        o->q.drop_lo();
+        gaveUp  = (o->dead || o->tooSlow) && !o->closing;
+        // dropTooSlow() has already said why, with the numbers; only a write that
+        // failed or timed out still owes an explanation.
+        stalled = o->dead && !o->tooSlow;
+        who     = o->name;
+    }
+    o->drained.notify_all();
+    if (gaveUp) {
+        // The peer is gone, has not drained a byte in --client-write-timeout
+        // seconds, or fell too far behind on world state. Its reader may still be
+        // happily receiving (a client that stops reading but keeps sending would
+        // otherwise sit here until the idle ceiling), so wake it the same way
+        // ctlKick does and let it run the normal cleanup path.
+        if (stalled && serverRunning)
+            std::cerr << "[Server] " << who << ": output stalled; closing the connection."
+                      << std::endl;
+        shutdown(o->fd, SHUT_RDWR);
+    }
+    // ⚠️ The fd is NOT closed here. The reader thread owns its lifetime and closes
+    // it after joining this one, so no producer can ever write a recycled fd.
+}
+
+// Start a client's writer and register it. Called from the accept loop, before the
+// reader thread exists, so every line the reader can produce has somewhere to go.
+static std::shared_ptr<ClientOut> openOut(SOCKET fd, int id) {
+    auto o  = std::make_shared<ClientOut>();
+    o->fd   = fd;
+    o->id   = id;
+    o->name = "client #" + std::to_string(id);
+    o->q.set_limits(ewb::OutQueue::Limits{g_outboxMax, g_worldboxMax, g_regionQueue});
+    // Without this a writer blocked on a peer that stopped reading is unkillable
+    // short of shutdown(); with it, --client-write-timeout is enforceable.
+    struct timeval tv{ SV_SEND_POLL_SEC, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    {
+        std::lock_guard<std::mutex> lk(g_outsMtx);
+        g_outs[fd] = o;
+    }
+    o->th = std::thread(clientWriter, o);
+    return o;
+}
+
+// Retire a client's writer: unregister it (no producer can find it again), ask it
+// to drain what is queued, and join. Called by that client's own reader thread and
+// by nobody else, which is what makes the join safe.
+static void closeOut(SOCKET fd) {
+    std::shared_ptr<ClientOut> o;
+    {
+        std::lock_guard<std::mutex> lk(g_outsMtx);
+        auto it = g_outs.find(fd);
+        if (it == g_outs.end()) return;
+        o = it->second;
+        g_outs.erase(it);
+    }
+    {
+        std::lock_guard<std::mutex> lk(o->m);
+        o->closing = true;
+    }
+    o->cv.notify_all();
+    if (o->th.joinable()) o->th.join();
 }
 
 // ⚠️ **Legacy, off by default** (stage 1.3, --legacy-snapshot). The real client has
@@ -798,9 +1345,14 @@ void sendWorldSnapshot(SOCKET clientSocket) {
             }
         }
     }
-    sendAll(clientSocket, blob.data(), blob.size());
-    std::cout << "[Server] Sent legacy world snapshot (" << cells << " cells, " << blob.size()
-              << " bytes) to new player." << std::endl;
+    // pushWorld, not pushReply: this is an unsolicited push of world state that the
+    // client has no way to ask for again, and it is the whole world in one blob —
+    // routinely larger than --client-world-max. The world-state budget bounds the
+    // *backlog*, so a single oversized update at join time is still delivered.
+    const size_t bytes = blob.size();
+    pushWorld(outFor(clientSocket), std::move(blob));
+    std::cout << "[Server] Queued legacy world snapshot (" << cells << " cells, " << bytes
+              << " bytes) for a new player." << std::endl;
 }
 
 // --- REGION -> SNAPZ ----------------------------------------------------------
@@ -853,6 +1405,7 @@ static void serveSigns(SOCKET clientSocket, const std::string& who, BurstLimiter
     size_t count;
     {
         std::lock_guard<std::mutex> lk(g_signMtx);
+        refreshSignBurstLocked();   // an edit may have just taken signs off a block
         blob  = g_signBlob;      // copy out; the send happens with no lock held
         count = g_signs.size();
     }
@@ -860,9 +1413,16 @@ static void serveSigns(SOCKET clientSocket, const std::string& who, BurstLimiter
         if (g_verbose) std::cout << "[Server] SIGNQ from " << who << ": no signs." << std::endl;
         return;
     }
-    sendAll(clientSocket, blob.data(), blob.size());
-    if (g_verbose) std::cout << "[Server] SIGNQ from " << who << ": sent " << count
-                             << " signs (" << blob.size() << " B)." << std::endl;
+    const size_t blobBytes = blob.size();
+    if (!pushReply(outFor(clientSocket), std::move(blob))) {
+        // Backpressure, not an error: this client is still working through an
+        // earlier burst. Refusing is what the REGION path does too — they re-ask.
+        if (g_verbose) std::cout << "[Server] SIGNQ from " << who
+                                 << ": refused (output queue full)." << std::endl;
+        return;
+    }
+    if (g_verbose) std::cout << "[Server] SIGNQ from " << who << ": queued " << count
+                             << " signs (" << blobBytes << " B)." << std::endl;
 }
 
 // Answer one `REGION:<x>:<z>` with a burst of `SNAPZ` frames.
@@ -878,6 +1438,30 @@ static void serveSigns(SOCKET clientSocket, const std::string& who, BurstLimiter
 // index). At the 4M-cell cap that is a few tens of ms — already far better than the
 // ~1 s/region observed on the real server. Only add a chunk index if the log line
 // below says the scan actually exceeds ~100 ms on a realistic world.
+//
+// ⚠️ **This function no longer sends anything** (stage 7.3). It scans, sorts, and
+// hands the record vector to the client's writer thread, which encodes one frame
+// per turn. Three things fall out: frames can no longer be spliced by another
+// thread's write; the per-region memory stays the record vector instead of gaining
+// a queue of encoded base64 on top of it (up to ~17 MB for a worst-case box); and
+// deflate moves off this thread, so a slow reader no longer blocks the client's own
+// recv loop — which is what kept a departing player's name taken for a minute (7.5).
+// A record vector that reports its own size to the global pending-record counter
+// for exactly as long as it is alive — queued, being encoded, or held by a producer
+// mid-hand-off. Making the accounting the vector's own deleter is what keeps it
+// correct across every way a job can end: drained, dropped at close, or abandoned
+// because the client went away with frames still queued.
+static std::shared_ptr<const std::vector<ewb::SnapRec>>
+makePendingRecs(std::vector<ewb::SnapRec>&& v) {
+    auto* p = new std::vector<ewb::SnapRec>(std::move(v));
+    g_rgnPendingRecs.fetch_add(p->size(), std::memory_order_relaxed);
+    return std::shared_ptr<const std::vector<ewb::SnapRec>>(
+        p, [](const std::vector<ewb::SnapRec>* q) {
+            g_rgnPendingRecs.fetch_sub(q->size(), std::memory_order_relaxed);
+            delete q;
+        });
+}
+
 static void serveRegion(SOCKET clientSocket, const std::string& who, int cx, int cz,
                         BurstLimiter& lim) {
     using clock = std::chrono::steady_clock;
@@ -911,69 +1495,84 @@ static void serveRegion(SOCKET clientSocket, const std::string& who, int cx, int
     const auto t1 = clock::now();
 
     if (g_regionSort) ewb::sort_records(recs);
-
-    size_t wireBytes = 0, frames = 0;
-    try {
-        for (size_t i = 0; i < recs.size(); i += ewb::SNAPZ_FRAME_RECORDS) {
-            const size_t n = std::min(ewb::SNAPZ_FRAME_RECORDS, recs.size() - i);
-            const std::string line = ewb::encode_snapz(recs.data() + i, n);
-            sendAll(clientSocket, line.data(), line.size());
-            wireBytes += line.size();
-            ++frames;
-        }
-        // An unbuilt region has no records. We answer with an explicit `SNAPZ:0:`
-        // (a well-formed frame that decodes to zero records) — 1.8 rung 2/3 showed
-        // VuencLink needs a real frame back: it treats one as "answered" (resetting
-        // its ABORT_AFTER_EMPTY counter) where silence leaves it stuck on "waiting
-        // for the world snapshot" and aborts a ring sweep after 3 empty points.
-        // --no-region-empty-frame restores pre-1.8 silence to A/B test the real
-        // client in 1.9 (the real server has never been *observed* answering one).
-        if (recs.empty() && g_regionEmptyFrame) {
-            const std::string line = ewb::encode_snapz({});
-            sendAll(clientSocket, line.data(), line.size());
-            wireBytes += line.size();
-            ++frames;
-        }
-    } catch (const std::exception& e) {
-        // deflate failure must not take the client thread down (it is detached, so an
-        // escaping exception would std::terminate the whole server).
-        std::cerr << "[Server] REGION encode failed for " << who << ": " << e.what() << std::endl;
-        return;
-    }
     const auto t2 = clock::now();
 
-    // The measurement the plan asks for: requests served, cells scanned, ms/region,
-    // bytes out. Not gated on --verbose — one line per region is not chatty, and the
-    // scan-vs-encode split is what decides whether a spatial index is worth building.
+    const size_t records = recs.size();
+    const size_t frames  = records ? ewb::snapz_frame_count(records) : (g_regionEmptyFrame ? 1 : 0);
+
+    ewb::RegionJob job;
+    job.recs = makePendingRecs(std::move(recs));   // counts itself as pending from here
+    // An unbuilt region has no records. We answer with an explicit `SNAPZ:0:`
+    // (a well-formed frame that decodes to zero records) — 1.8 rung 2/3 showed
+    // VuencLink needs a real frame back: it treats one as "answered" (resetting
+    // its ABORT_AFTER_EMPTY counter) where silence leaves it stuck on "waiting
+    // for the world snapshot" and aborts a ring sweep after 3 empty points.
+    // --no-region-empty-frame restores pre-1.8 silence to A/B test the real
+    // client in 1.9 (the real server has never been *observed* answering one).
+    job.empty_frame = g_regionEmptyFrame;
+
+    // Global memory guard, on top of the per-client queue depth: one worst-case box
+    // is ~3.5 M records (~68 MB), so a handful of clients walking new terrain at
+    // once is the shape that runs a small VPS out of RAM. Refusing is honest
+    // backpressure — the client re-asks — where dropping frames would be the strips
+    // bug wearing a different hat.
+    const uint64_t pending = g_rgnPendingRecs.load(std::memory_order_relaxed);
+    const bool overGlobal  = g_regionPending && pending > g_regionPending;
+    if (overGlobal || !pushRegion(outFor(clientSocket), std::move(job))) {
+        g_rgnRefused.fetch_add(1, std::memory_order_relaxed);
+        std::cerr << "[Server] REGION #" << lim.served << " " << who << " refused: "
+                  << (overGlobal ? "server region backlog" : "this client's region queue")
+                  << " is full (" << records << " records, " << pending
+                  << " pending server-wide). They will re-ask." << std::endl;
+        return;
+    }
+
+    // The measurement the plan asks for: requests served, cells scanned, ms/region.
+    // Not gated on --verbose — one line per region is not chatty, and the
+    // scan-vs-encode split is what decides whether a spatial index is worth
+    // building. ⚠️ Bytes out, encode time and drain time are the writer thread's to
+    // report (the `REGION drain` line), because nothing has been encoded yet.
     const long scanMs = (long)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-    const long encMs  = (long)std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-    const size_t rawBytes = recs.size() * 20;
+    const long sortMs = (long)std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
 
     // Feed the `region-stats` control command (stage 3.2).
     g_rgnRequests.fetch_add(1, std::memory_order_relaxed);
     g_rgnCellsScanned.fetch_add(scanned, std::memory_order_relaxed);
-    g_rgnRecords.fetch_add(recs.size(), std::memory_order_relaxed);
-    g_rgnBytesOut.fetch_add(wireBytes, std::memory_order_relaxed);
+    g_rgnRecords.fetch_add(records, std::memory_order_relaxed);
     g_rgnMicros.fetch_add(
         (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t2 - t0).count(),
         std::memory_order_relaxed);
 
-    char ratio[32] = "n/a";
-    if (wireBytes) snprintf(ratio, sizeof(ratio), "%.1fx", (double)rawBytes / (double)wireBytes);
     std::cout << "[Server] REGION #" << lim.served << " " << who << " (" << cx << "," << cz
               << ") box x[" << box.x0 << ".." << box.x1 << "] z[" << box.z0 << ".." << box.z1
-              << "]: " << inBox << "/" << scanned << " cells -> " << recs.size() << " records, "
-              << frames << " frame(s), " << wireBytes << " B wire (" << ratio
-              << "), scan " << scanMs << " ms, encode " << encMs << " ms" << std::endl;
+              << "]: " << inBox << "/" << scanned << " cells -> " << records << " records, "
+              << frames << " frame(s) queued, scan " << scanMs << " ms, sort " << sortMs
+              << " ms" << std::endl;
 }
 
+// Relay a latency-sensitive line — movement, chat, a [Server] notice — to every
+// client but the sender.
+//
+// ⚠️ This used to hold clientsMutex across a blocking send() to each peer, and
+// JOIN needs the same mutex, so one backed-up client froze every join, chat line,
+// movement relay and block edit on the server (stage 7.4). It now snapshots owning
+// pointers, releases the lock, and only then enqueues: no syscall runs under any
+// shared lock, and a client departing mid-broadcast stays alive for the enqueue.
 void broadcastMessage(const std::string& message, SOCKET senderSocket) {
-    std::lock_guard<std::mutex> lock(clientsMutex);
-    for (SOCKET client : clients) {
-        if (client != senderSocket) {
-            send(client, message.c_str(), message.length(), 0);
-        }
-    }
+    if (message.empty()) return;
+    const auto targets = outSnapshot(senderSocket);
+    for (const auto& o : targets) pushHi(o, message);
+}
+
+// Relay **world state** — an ACTION relay, a WorldEdit burst, a SIGNP write — to
+// every client but the sender. Same snapshot-then-enqueue shape; the difference is
+// which queue it lands in. World state shares one ordered stream per client so an
+// edit can never overtake the bulk reply it belongs after, and a client too far
+// behind to hold it is disconnected rather than quietly diverged (out_queue.h).
+void broadcastWorld(const std::string& blob, SOCKET senderSocket) {
+    if (blob.empty()) return;
+    const auto targets = outSnapshot(senderSocket);
+    for (const auto& o : targets) pushWorld(o, blob);
 }
 
 void removeClient(SOCKET clientSocket) {
@@ -1010,10 +1609,14 @@ static std::string ctlKick(const std::string& name, const std::string& reason) {
             if (kv.second.username == name) { target = kv.first; ip = kv.second.ip; break; }
     }
     if (target == INVALID_SOCKET) return "";
-    std::string msg = "[Server] You were " + reason + ".\n";
-    send(target, msg.c_str(), msg.size(), 0);
+    // Queue the notice, then give the writer a moment to actually put it on the
+    // wire before the socket goes away. The blocking send() this replaces got that
+    // ordering for free; with a writer thread it has to be asked for.
+    auto out = outFor(target);
+    pushHi(out, "[Server] You were " + reason + ".\n");
+    flushOut(out, 250);
     // shutdown() (not close()) unblocks the client thread's recv(); it then runs
-    // its own cleanup (savePlayerPos / removeClient / close).
+    // its own cleanup (savePlayerPos / removeClient / closeOut / close).
     shutdown(target, SHUT_RDWR);
     return ip.empty() ? std::string("?") : ip;
 }
@@ -1077,7 +1680,7 @@ static long long ctlFillBox(int x0, int y0, int z0, int x1, int y1, int z1, int 
                 }
     }
     const std::string wire = emitEditBatch(batch);   // formatting, outside the lock
-    if (!wire.empty()) broadcastMessage(wire, INVALID_SOCKET);
+    if (!wire.empty()) broadcastWorld(wire, INVALID_SOCKET);
     return (long long)batch.size();
 }
 
@@ -1111,7 +1714,19 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
             int lvl; { std::lock_guard<std::mutex> ol(g_opsMtx); lvl = g_ops.level_of(p.username, g_defaultLevel); }
             ss << "  " << p.username << " (T" << p.characterType << ") "
                << p.ip << "  @ " << (int)p.posX << "," << (int)p.posY << "," << (int)p.posZ
-               << "  level " << lvl << "\n";
+               << "  level " << lvl;
+            // Output backlog (stage 7.3). This is the number that says "this
+            // player is on a weak link" before they are dropped for it, and the
+            // one to look at when someone reports the world arriving late.
+            // Lock order: clientsMutex -> g_outsMtx -> ClientOut::m, as declared.
+            if (auto o = outFor(kv.first)) {
+                std::lock_guard<std::mutex> ok(o->m);
+                ss << "  queued " << o->q.queued_bytes() << " B (peak " << o->q.peak_bytes()
+                   << ", " << o->q.region_jobs() << " region(s))";
+                if (o->q.dropped_lines())
+                    ss << " dropped " << o->q.dropped_lines() << " stale line(s)";
+            }
+            ss << "\n";
         }
         reply = ss.str();
         return;
@@ -1229,6 +1844,7 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
         auditLog("control", "setblock " + std::to_string(x) + "," + std::to_string(y) + "," +
                             std::to_string(z) + " = " + std::to_string(type) +
                             (color ? " color " + std::to_string(color) : ""));
+        drainSignRemovals();   // after the edit's own audit line
         reply = "ok: set 1 block";
         return;
     }
@@ -1259,6 +1875,7 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
                             (color ? " color " + std::to_string(color) : "") + " @ " +
                             std::to_string(v[0]) + "," + std::to_string(v[1]) + "," + std::to_string(v[2]) +
                             ".." + std::to_string(v[3]) + "," + std::to_string(v[4]) + "," + std::to_string(v[5]));
+        drainSignRemovals();   // after the edit's own audit line
         reply = "ok: filled " + std::to_string(changed) + " cells";
         return;
     }
@@ -1267,17 +1884,21 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
         const auto f = ewb::ctl_fields(rest, 0);
         const std::string sub = f.empty() ? "" : f[0];
         if (sub == "reload") {
-            // A player's sign lives only in memory until the next save; reloading
-            // over it would throw it away without a word.
+            // A player's sign change lives only in memory until the next save;
+            // reloading over it would throw it away without a word.
             if (g_signsDirty) {
-                reply = "error: players have placed signs that are not saved yet. Run 'save' first"
+                reply = "error: players have placed or removed signs that are not saved yet. Run 'save' first"
                         " (it rewrites the sign file, so hand-edit it only while the server is stopped)";
                 return;
             }
             loadSigns();
-            std::lock_guard<std::mutex> lk(g_signMtx);
-            auditLog("control", "signs reload (" + std::to_string(g_signs.size()) + ")");
-            reply = "ok: reloaded " + std::to_string(g_signs.size()) + " signs";
+            const size_t dropped = pruneOrphanSigns();
+            size_t n;
+            { std::lock_guard<std::mutex> lk(g_signMtx); n = g_signs.size(); }
+            const std::string note =
+                dropped ? "dropped " + std::to_string(dropped) + " on removed blocks" : "";
+            auditLog("control", "signs reload (" + std::to_string(n) + (dropped ? ", " + note : "") + ")");
+            reply = "ok: reloaded " + std::to_string(n) + " signs" + (dropped ? " (" + note + ")" : "");
             return;
         }
         if (sub == "add") {
@@ -1311,11 +1932,7 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
             size_t removed = 0;
             {
                 std::lock_guard<std::mutex> lk(g_signMtx);
-                const size_t before = g_signs.size();
-                g_signs.erase(std::remove_if(g_signs.begin(), g_signs.end(),
-                              [&](const ewb::Sign& s){ return s.x == x && s.y == y && s.z == z; }),
-                              g_signs.end());
-                removed = before - g_signs.size();
+                removed = ewb::remove_signs_on_block(g_signs, x, y, z);
                 if (removed) signsChangedLocked();
             }
             if (removed) saveSigns();
@@ -1338,8 +1955,16 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
            << "  cells scanned   : " << g_rgnCellsScanned.load(std::memory_order_relaxed) << "\n"
            << "  records emitted : " << g_rgnRecords.load(std::memory_order_relaxed) << "\n"
            << "  bytes out       : " << g_rgnBytesOut.load(std::memory_order_relaxed) << "\n"
-           << "  total time      : " << (us / 1000) << " ms\n"
-           << "  mean per region : " << (reqs ? (double)us / reqs / 1000.0 : 0.0) << " ms\n";
+           << "  total time      : " << (us / 1000) << " ms  (scan + sort; encode and"
+                                        " drain are the writer's)\n"
+           << "  mean per region : " << (reqs ? (double)us / reqs / 1000.0 : 0.0) << " ms\n"
+           << "backpressure since start (stage 7.3):\n"
+           << "  regions refused : " << g_rgnRefused.load(std::memory_order_relaxed)
+                                     << "  (client queue full or server backlog)\n"
+           << "  records queued  : " << g_rgnPendingRecs.load(std::memory_order_relaxed)
+                                     << " of " << g_regionPending << " right now\n"
+           << "  clients dropped : " << g_slowDrops.load(std::memory_order_relaxed)
+                                     << "  (too far behind on world updates)\n";
         reply = ss.str();
         return;
     }
@@ -1350,6 +1975,7 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
 // One control connection: read '\n'-framed lines, answer each, until the peer
 // closes. `stop` sets serverRunning=false and exits the process after a flush.
 static void handleControlClient(int fd) {
+    t_editActor = "control";   // who the audit names when a setblock/fill removes a sign
     // A read timeout, so an abandoned `nc -U` cannot hold one of the connection
     // slots (and its thread) until the process exits.
     if (ewb::CTL_IDLE_TIMEOUT_SEC > 0) {
@@ -1525,8 +2151,7 @@ struct WeSession {
 
 // Unicast a `[Server] ...` line to one player.
 static void weSay(SOCKET s, const std::string& text) {
-    const std::string line = "[Server] " + text + "\n";
-    sendAll(s, line.data(), line.size());
+    sendLine(s, "[Server] " + text + "\n");
 }
 
 // A player's permission level right now — re-read per command, so a `deop` from
@@ -1614,7 +2239,7 @@ static std::vector<ewb::WeEdit> weCommit(const std::vector<ewb::WeEdit>& edits, 
         }
     }
     const std::string wire = emitEditBatch(batch);   // formatting, outside the lock
-    if (!wire.empty()) broadcastMessage(wire, INVALID_SOCKET);
+    if (!wire.empty()) broadcastWorld(wire, INVALID_SOCKET);
     return batch;
 }
 
@@ -1656,7 +2281,7 @@ static std::vector<ewb::WeEdit> weEditBox(const ewb::WeBox& box, F&& want, SOCKE
                 }
     }
     const std::string wire = emitEditBatch(batch);   // formatting, outside the lock
-    if (!wire.empty()) broadcastMessage(wire, INVALID_SOCKET);
+    if (!wire.empty()) broadcastWorld(wire, INVALID_SOCKET);
     return batch;
 }
 
@@ -1673,6 +2298,7 @@ static void weFinish(WeSession& we, SOCKET s, const std::string& username,
         // audit themselves). Volume is bounded by the same cell budget that
         // bounds the edits, so this cannot be flooded faster than the edits can.
         auditLog("player:" + username, verb + ": " + std::to_string(n) + " cell(s)");
+        drainSignRemovals();   // signs on blocks this edit turned to air
     }
     weSay(s, verb + ": " + std::to_string(n) + " block(s) changed.");
 }
@@ -1699,7 +2325,7 @@ static void weTeleport(SOCKET s, const std::string& username, float x, float y, 
     rememberPos(username, x, y, z);
     char sp[96];
     const int n = snprintf(sp, sizeof(sp), "SPAWN:%.2f:%.2f:%.2f\n", x, y, z);
-    sendAll(s, sp, (size_t)n);
+    sendLine(s, sp, (size_t)n);
 }
 
 // One complete Tier 2 command line (the chat text, '/'-prefixed and already
@@ -1795,8 +2421,8 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
         }
         const std::string toThem = "[" + username + " whispers] " + text + "\n";
         const std::string toUs   = "[you tell " + target + "] " + text + "\n";
-        sendAll(dest, toThem.data(), toThem.size());
-        sendAll(s, toUs.data(), toUs.size());
+        sendLine(dest, toThem);
+        sendLine(s, toUs);
         return;
     }
 
@@ -2127,6 +2753,7 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
         const auto done = weCommit(want, s);
         if (!done.empty())
             auditLog("player:" + username, verb + ": " + std::to_string(done.size()) + " cell(s)");
+        drainSignRemovals();   // an undone build or a redone mine can remove signs
         weSay(s, std::string(undo ? "Undid " : "Redid ") + std::to_string(done.size()) + " block(s).");
         return;
     }
@@ -2197,7 +2824,7 @@ static void handleSignWrite(SOCKET s, const std::string& who, const std::string&
     // ⚠️ Relayed in the `server`-sender shape SIGNQ is answered with, which the
     // retail client renders from a join burst. Whether it applies one mid-session
     // is unconfirmed; a peer that ignores it still gets the sign on its next join.
-    broadcastMessage(ewb::format_signp(sign), s);
+    broadcastWorld(ewb::format_signp(sign), s);
 }
 
 void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
@@ -2287,7 +2914,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                 if (verdict != ewb::NameVerdict::Ok) {
                     std::string deny = std::string("[Server] Invalid name (") +
                                        ewb::name_verdict_text(verdict) + ").\n";
-                    send(clientSocket, deny.c_str(), deny.length(), 0);
+                    sendLine(clientSocket, deny);
                     std::cout << "[Server] Rejected client #" << clientId << " ("
                               << ewb::name_verdict_text(verdict) << ")." << std::endl;
                     disconnect = true;
@@ -2301,7 +2928,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     std::lock_guard<std::mutex> lk(g_banMtx);
                     if (g_bans.banned(wanted, clientIP)) {
                         std::string deny = "[Server] You are banned from this server.\n";
-                        send(clientSocket, deny.c_str(), deny.length(), 0);
+                        sendLine(clientSocket, deny);
                         std::cout << "[Server] Rejected " << wanted << " (banned)." << std::endl;
                         disconnect = true;
                         continue;
@@ -2333,7 +2960,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                         inWindow = g_authFail.record_failure(clientIP, monoSeconds());
                     }
                     std::string deny = "[Server] Wrong password.\n";
-                    send(clientSocket, deny.c_str(), deny.length(), 0);
+                    sendLine(clientSocket, deny);
                     std::cout << "[Server] Rejected " << wanted << " from " << clientIP
                               << " (wrong password";
                     if (inWindow) std::cout << ", " << inWindow << " in window";
@@ -2354,7 +2981,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                         // ⚠️ Our wording, not captured evidence — no real server has
                         // been observed refusing a duplicate name.
                         std::string deny = "[Server] Name already in use.\n";
-                        send(clientSocket, deny.c_str(), deny.length(), 0);
+                        sendLine(clientSocket, deny);
                         std::cout << "[Server] Rejected " << wanted << " (name in use)." << std::endl;
                         disconnect = true;
                         continue;
@@ -2365,6 +2992,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     playerInfoMap[clientSocket] = pi;
                 }
                 joined = true;
+                t_editActor = "player:" + username;   // who the audit names when this player's edit removes a sign
 
                 // Handshake complete — relax the read timeout from the short
                 // pre-JOIN window to the post-JOIN idle ceiling (or clear it if
@@ -2374,14 +3002,15 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
 
                 // --- join sequence, in the native pcap's order (stage 1.3) --------
                 // 1. welcome
+                nameOut(clientSocket, username);   // the writer's log lines get a name
                 std::string welcome = "[Server] Welcome, " + username + "! (Character Type: " + std::to_string(characterType) + ")\n";
-                send(clientSocket, welcome.c_str(), welcome.length(), 0);
+                sendLine(clientSocket, welcome);
 
                 // 2. capability advertisement. This is what tells the client to ask
                 //    for terrain with REGION instead of expecting a push; VuencLink
                 //    will not send a REGION until it sees this line.
                 static const char* kCaps = "CAPS:region\n";
-                send(clientSocket, kCaps, strlen(kCaps), 0);
+                sendLine(clientSocket, kCaps, strlen(kCaps));
 
                 // 3. SPAWN — this name's saved position if it has one, otherwise
                 //    the world's default spawn (eden_spawn.txt / --spawn, stage
@@ -2393,14 +3022,14 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                         char sp[96];
                         int n = snprintf(sp, sizeof(sp), "SPAWN:%.2f:%.2f:%.2f\n",
                                          it->second.x, it->second.y, it->second.z);
-                        send(clientSocket, sp, n, 0);
+                        sendLine(clientSocket, sp, (size_t)n);
                         std::cout << "[Server] Restored " << username << " to ("
                                   << it->second.x << "," << it->second.y << "," << it->second.z << ")\n";
                     } else if (g_haveWorldSpawn) {
                         char sp[96];
                         int n = snprintf(sp, sizeof(sp), "SPAWN:%.2f:%.2f:%.2f\n",
                                          g_worldSpawn.x, g_worldSpawn.y, g_worldSpawn.z);
-                        send(clientSocket, sp, n, 0);
+                        sendLine(clientSocket, sp, (size_t)n);
                         std::cout << "[Server] Spawned " << username << " at world spawn ("
                                   << g_worldSpawn.x << "," << g_worldSpawn.y << "," << g_worldSpawn.z << ")\n";
                     }
@@ -2535,6 +3164,9 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     // server always has an accurate picture (handles TNT/paint
                     // explosions and burning too).
                     const size_t refused = simAction(mode, x, y, z, extra);
+                    // A mine or a blast that took a sign's block took the sign. The client
+                    // sends nothing for the sign itself (LIVE-FINDINGS 2026-09-11).
+                    drainSignRemovals();
                     if (refused && mode != 2) {
                         // The world is at its cell cap and this edit did not land.
                         // Keep it off the peers — they would draw a block no REGION
@@ -2548,7 +3180,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                             // air. ⚠️ The `ACTION:server:0` shape the command relay uses.
                             std::string undo;
                             emitEditWire(undo, x, y, z, SV_AIR, 0);
-                            sendAll(clientSocket, undo.data(), undo.size());
+                            sendWorldTo(clientSocket, undo);
                         }
                         if (capNotice.allow(monoSeconds()))
                             weSay(clientSocket, "This world is full, so that edit was not saved."
@@ -2558,7 +3190,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     // Relay the ORIGINAL action to everyone EXCEPT the sender (who
                     // already applied it locally). Peers re-simulate it themselves;
                     // the model above is what late joiners are snapshotted from.
-                    broadcastMessage(broadcastMsg, clientSocket);
+                    broadcastWorld(broadcastMsg, clientSocket);
                     // A burn is relayed even when part of its blast was refused:
                     // every client simulates the explosion itself regardless.
                     if (refused && capNotice.allow(monoSeconds()))
@@ -2697,7 +3329,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
             // 10 s), and a log line per ping drowns everything else.
             else if (command == "PING") {
                 static const char* kPong = "PONG\n";
-                send(clientSocket, kPong, strlen(kPong), 0);
+                sendLine(clientSocket, kPong, strlen(kPong));
             }
             // Anything else — log it once per verb so a real client's un-modelled
             // messages surface instead of being silently swallowed by this else-if
@@ -2731,7 +3363,11 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
     savePlayerPos();   // persist positions when someone leaves
     saveWorld();       // and persist the world model
     saveSigns();       // and any signs placed this session
-    removeClient(clientSocket);
+    removeClient(clientSocket);   // out of the roster: no new broadcast finds us
+    // Then flush and retire the writer, and only then close the fd. The writer
+    // never closes it, so a recycled descriptor can never be written by a thread
+    // that thinks it still belongs to this player (stage 7.3).
+    closeOut(clientSocket);
     close(clientSocket);
 }
 
@@ -2816,6 +3452,14 @@ int main(int argc, char* argv[]) {
         // restores pre-1.8 silence for A/B testing against the real client (1.9).
         else if (a == "--region-empty-frame") g_regionEmptyFrame = true;   // back-compat no-op (now the default)
         else if (a == "--no-region-empty-frame") g_regionEmptyFrame = false;
+        // Per-client output queue bounds (stage 7.3). Defaults are sized in
+        // out_queue.h's header comment and docs/configuration.md; an operator on a
+        // small VPS mostly wants --client-world-max and --region-pending-records.
+        else if (a == "--client-outbox-max")     g_outboxMax     = (size_t)std::atoll(next("1048576").c_str());
+        else if (a == "--client-world-max")      g_worldboxMax   = (size_t)std::atoll(next("16777216").c_str());
+        else if (a == "--client-region-queue")   g_regionQueue   = (size_t)std::atoll(next("2").c_str());
+        else if (a == "--region-pending-records") g_regionPending = (uint64_t)std::atoll(next("16000000").c_str());
+        else if (a == "--client-write-timeout")  g_writeTimeout  = std::atoi(next("60").c_str());
         else if (a == "--action-rate")  SV_ACTION_RATE  = std::atof(next("512").c_str());
         else if (a == "--action-burst") SV_ACTION_BURST = std::atof(next("1024").c_str());
         else if (a == "--matchmaker") {
@@ -2853,6 +3497,18 @@ int main(int argc, char* argv[]) {
         std::cout << "[Server] Edited-cell cap " << g_maxWorldCells
                   << " (default " << SV_MAX_WORLD_CELLS_DEFAULT << ")" << std::endl;
 
+    // Per-client output bounds (stage 7.3). A zero here is not a configuration:
+    // it would make every line an instant overflow, i.e. disconnect-on-first-word.
+    // --client-write-timeout 0 *is* a configuration ("wait forever"), and
+    // --region-pending-records 0 disables the global backlog guard.
+    if (g_outboxMax < 64u * 1024u) {
+        std::cerr << "[Server] --client-outbox-max " << g_outboxMax
+                  << " is too small to hold a burst of movement updates; using 65536." << std::endl;
+        g_outboxMax = 64u * 1024u;
+    }
+    if (g_regionQueue < 1) g_regionQueue = 1;
+    if (g_writeTimeout < 0) g_writeTimeout = 0;
+
     if (!ewb::ctl_level_valid(g_defaultLevel)) {
         std::cerr << "[Server] --default-level " << g_defaultLevel << " out of range (0..2); using 0." << std::endl;
         g_defaultLevel = 0;
@@ -2886,6 +3542,25 @@ int main(int argc, char* argv[]) {
     // g_worldMtx — and having had two independently-chosen numbers for it was
     // how they drifted apart in the first place.
     g_ctlFillCap = ewb::ctl_fill_cap(g_weMaxCells, (long long)g_maxWorldCells);
+
+    {
+        // The memory an all-clients-stalled worst case implies. Not a limit — the
+        // operator's RAM is — but it is the number that turns "why did the box run
+        // out of memory" into something visible at startup, in the style of the
+        // cell-cap warning above. The threshold is deliberately well above the
+        // default config (~1.1 GB at 64 slots, and only if all 64 stall at once):
+        // this fires for someone who has *raised* a limit, not on every start.
+        const size_t perClient = g_outboxMax + g_worldboxMax + (size_t)g_ctlFillCap * 105u;
+        const double outboxGB  = (double)perClient * SV_MAX_CLIENTS / 1073741824.0;
+        const double regionGB  = (double)g_regionPending * sizeof(ewb::SnapRec) / 1073741824.0;
+        if (outboxGB + regionGB > 4.0)
+            std::cerr << "[Server] note: with every one of " << SV_MAX_CLIENTS
+                      << " clients stalled at once the output queues could hold up to "
+                      << outboxGB << " GB, plus " << regionGB
+                      << " GB of queued REGION records. Lower --client-world-max or"
+                         " --region-pending-records if that is more than this host has."
+                      << std::endl;
+    }
 
     // Control-socket flood guard. A rate of 0 turns the pacing off (an operator
     // running a bulk import through edenctl may want that); the concurrent
@@ -2952,6 +3627,7 @@ int main(int argc, char* argv[]) {
     loadPlayerPos();
     loadSpawn();    // eden_spawn.txt: the default spawn for a player with no saved row (stage 5.3)
     loadSigns();   // sidecar; the control socket's `signs add|rm` writes it (stage 3.2)
+    pruneOrphanSigns();   // after both loads: drop signs on blocks stored as air (stage 7.2)
     loadBans();
     loadOps();
 
@@ -3140,6 +3816,9 @@ int main(int argc, char* argv[]) {
         size_t nclients;
         { std::lock_guard<std::mutex> lock(clientsMutex); nclients = clients.size(); }
         if (nclients >= (size_t)SV_MAX_CLIENTS) {
+            // ⚠️ The one deliberate direct send() to a player socket (stage 7.3).
+            // No ClientOut exists yet and no second writer can, so a queue here
+            // would be pure ceremony — and this socket is closed on the next line.
             const char* full = "[Server] Server full.\n";
             send(clientSocket, full, strlen(full), 0);
             close(clientSocket);
@@ -3157,6 +3836,9 @@ int main(int argc, char* argv[]) {
             std::lock_guard<std::mutex> lock(clientsMutex);
             clients.push_back(clientSocket);
         }
+        // Start this client's writer before its reader exists, so every line the
+        // reader can produce — including a JOIN denial — has somewhere to go.
+        openOut(clientSocket, clientId);
 
         // Detached; handleClient does its own cleanup (removeClient + close) on
         // exit, so no thread handle is retained and nothing accumulates.

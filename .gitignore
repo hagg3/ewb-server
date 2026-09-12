@@ -7,6 +7,7 @@ WORKING/
 /edenmatch
 /snapz_codec_test
 /region_test
+/out_queue_test
 /protocol_test
 /matchmaker_test
 /control_test

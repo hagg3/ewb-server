@@ -55,7 +55,7 @@ A raw client works too — `printf 'who\n' | nc -U ./edenserver.sock`.
 | Command | What it does |
 |---|---|
 | `help` | List every command. |
-| `who` | Connected players: name, character type, IP, position, op level. |
+| `who` | Connected players: name, character type, IP, position, op level, and their output backlog — bytes queued now, the peak for the session, `REGION` replies still in flight, and any stale movement/chat lines dropped. A client with a persistently large backlog is on a weak link. |
 | `say <text>` | Broadcast a `[Server] <text>` chat line to everyone. |
 | `kick <name> [reason]` | Disconnect a player by exact name. They see `[Server] You were <reason>.` |
 | `ban <name\|ip>` | Add to the ban list, persist it, and disconnect anyone matching now. A token of only digits/dots/colons is an IP; anything else is a name. |
@@ -67,10 +67,10 @@ A raw client works too — `printf 'who\n' | nc -U ./edenserver.sock`.
 | `deop <name>` | Clear a player's op-level entry. |
 | `setblock <x> <y> <z> <type> [color]` | Place one block. Goes through the same world model + broadcast path as a player edit, so connected clients see it immediately. |
 | `fill <x0> <y0> <z0> <x1> <y1> <z1> <type> [color]` | Fill an inclusive box. Capped at `2 x --we-max-cells` (262,144 by default); an oversized box is refused with its size, not truncated. `type 0` clears to air. |
-| `signs reload` | Re-read the sign sidecar from disk. Refused while players have placed signs that are not saved yet — run `save` first. A running server's saves rewrite the file, so hand-edit it only while the server is stopped. |
+| `signs reload` | Re-read the sign sidecar from disk, then drop any sign on a block the world stores as air and rewrite the file (the reply says how many). Refused while players have placed or removed signs that are not saved yet — run `save` first. A running server's saves rewrite the file, so hand-edit it only while the server is stopped. |
 | `signs add <x> <y> <z> <a> <b> <c> <text>` | Append a sign and rewrite the sidecar. `a`/`b`/`c` are of unknown meaning — `0 0 0` is a fine default. New `SIGNQ`s get the updated burst. |
-| `signs rm <x> <y> <z>` | Remove every sign at that coordinate and rewrite the sidecar. |
-| `region-stats` | `REGION` service counters since start: requests, cells scanned, records emitted, bytes out, total and mean time. |
+| `signs rm <x> <y> <z>` | Remove every sign on that block, whatever its face, and rewrite the sidecar. You rarely need it for a sign whose block is gone: any edit that turns a block to air removes its signs. |
+| `region-stats` | `REGION` service counters since start: requests, cells scanned, records emitted, bytes out, and total/mean time (scan and sort only — encoding and sending happen on each client's writer thread and are reported per reply in the `REGION drain` log line). Then backpressure: requests refused because a client's queue or the server's record backlog was full, records queued right now against `--region-pending-records`, and clients disconnected for falling too far behind on world updates. |
 
 ### Notes
 

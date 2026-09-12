@@ -22,6 +22,16 @@ the same commit.**
 - Lines arrive coalesced or split arbitrarily by TCP; both sides must reassemble on `\n`. The
   server drops a connection that accumulates more than 8192 bytes without a newline.
 - Because `:` is the delimiter, no username may contain one — see [Usernames](#usernames).
+- **Every line the server sends is written whole, by one thread per client.** Nothing can
+  interleave inside a line or inside a `SNAPZ` payload, however slow the connection is or
+  however many other players are moving. A client that stops reading is refused, disconnected,
+  or has stale movement lines dropped — never served half a message. See
+  [architecture.md § The output path](architecture.md#the-output-path).
+- **Delivery order.** Everything that changes the world — `ACTION` relays, `SIGNP`, `SNAPZ`
+  frames — arrives in one stream, in the order the server decided it, so an edit never overtakes
+  the bulk reply it belongs after. Movement, chat and `PONG` carry no world state and may
+  overtake a large burst; that is what keeps other players visibly moving while one of them is
+  downloading terrain.
 
 ## Coordinate model
 
@@ -225,6 +235,16 @@ minimum gap between served requests and a per-session cap. Requests inside the g
 same treatment for the same reason. Current values are in
 [configuration.md](configuration.md).
 
+A request can also be refused for **backpressure**: a client that already has
+`--client-region-queue` replies in flight, or a server whose total scanned-but-unsent record
+backlog is at `--region-pending-records`, answers nothing rather than starting a burst it cannot
+finish. A refused request is silence, exactly like one inside the gap — a partially delivered
+region is the failure this is here to avoid, so refusing is the honest answer and the client
+re-asks. (Silence is the status quo rather than a decision to keep forever: a new "throttled"
+line the retail client has never been observed receiving is a protocol risk, so it has not been
+invented. A client cannot currently distinguish "throttled" from "empty region", and
+`--no-region-empty-frame` makes that worse rather than better.)
+
 ## `SIGNQ` → `SIGNP`
 
 ```
@@ -251,6 +271,8 @@ client   SIGNP:<x>:<y>:<z>:<a>:<b>:<c>:<text>\n
 The retail client sends this when a player places or edits a sign. It is the server's line
 without the sender field; a line carrying `server` there fails to parse and is ignored.
 
+- `x, y, z` is the **block the sign is attached to**, not the air cell in front of it: a sign
+  placed and later removed in game is placed and mined at the same coordinates.
 - The sign goes into its **slot — the block `x, y, z` plus `a`** — replacing any sign already
   there. Real worlds hold two signs on one block that differ in `a`, and `a` has only ever been
   seen as `0..5`, which fits a block face. That is inferred from data, not confirmed.
@@ -264,8 +286,15 @@ without the sender field; a line carrying `server` there fails to parse and is i
   its next join.
 - It is refused before `JOIN`, paced per connection, and refused with a chat line to the
   player once the world holds 20,000 signs. Values are in [configuration.md](configuration.md).
-- ⚠️ No message for *removing* a sign has been observed. A sign whose block is mined stays in
-  the sign file until an operator removes it with `signs rm`.
+- **The client sends nothing when a sign is removed.** In game a sign goes only when the block
+  it is attached to does, and the server sees just that block's `ACTION`. So the server removes
+  **every** sign on a block, whatever its `a`, whenever any edit stores air there: a mine, a burn
+  or explosion, the control socket's `setblock`/`fill`, a player command, `//undo` or `//redo`.
+  An edit refused at the world cell cap leaves the block, and its signs.
+- No message is sent for that removal. Peers already get the block's own relay, and a client
+  does not show a sign whose block is air (⚠️ inferred from a player's report, not captured).
+  The next `SIGNQ` answer leaves the sign out, and `eden_signs.txt` loses it on the next save.
+- `//undo` of an edit that removed a sign restores the block, not the sign.
 
 ## `PING` → `PONG`
 

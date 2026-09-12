@@ -38,6 +38,14 @@
 // above when a sign is placed (LIVE-FINDINGS 2026-09-08, Session 2). Until the server
 // handled it, every player-placed sign was silently discarded.
 //
+// A sign is also **removed when its block becomes air.** `x:y:z` is the block the sign
+// hangs on, not the air cell in front of it, and the client sends nothing when a sign
+// goes: removing its block is the only way to remove one in game, and the only line the
+// server sees is that block's `ACTION` (LIVE-FINDINGS 2026-09-11). So the server takes
+// every sign off a block, whatever its face, whenever any edit stores air there, and
+// drops signs on blocks already stored as air when the world loads. Before that, a sign
+// whose block was mined stayed in the file and came back when the block was rebuilt.
+//
 // ⚠️ **A sign's slot is `(x, y, z, a)`, not the block alone.** Real imported worlds
 // hold two signs on one block with different `a/b/c`, and across every sidecar on
 // hand `a` only ever takes 0–5 — the shape of a block face. So an edit replaces the
@@ -50,6 +58,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "hardening.h"
@@ -183,6 +192,39 @@ inline SignUpsert upsert_sign(std::vector<Sign>& signs, const Sign& s, size_t ma
         changed = true;
     }
     return changed ? SignUpsert::Replaced : SignUpsert::Unchanged;
+}
+
+/// Drop every sign `is_air(sign)` says has no block under it, keeping the survivors
+/// in order. Returns how many were dropped; when `removed` is given they are appended
+/// to it, also in order.
+///
+/// The server's predicate asks whether the block is **stored** as air. A cell the
+/// world model doesn't hold is untouched base terrain, which may well be solid, so a
+/// sign is never dropped just because its cell is absent.
+template <class IsAir>
+inline size_t prune_signs(std::vector<Sign>& signs, IsAir is_air,
+                          std::vector<Sign>* removed = nullptr) {
+    size_t kept = 0;
+    for (size_t i = 0; i < signs.size(); ++i) {
+        if (is_air(static_cast<const Sign&>(signs[i]))) {
+            if (removed) removed->push_back(std::move(signs[i]));
+            continue;
+        }
+        if (kept != i) signs[kept] = std::move(signs[i]);
+        ++kept;
+    }
+    const size_t dropped = signs.size() - kept;
+    signs.resize(kept);
+    return dropped;
+}
+
+/// Every sign on block `(x, y, z)`, whatever its face `a`: what a player loses by
+/// removing that block, and what the operator's `signs rm` removes. One definition of
+/// "the signs on a block" for both. Returns how many were removed.
+inline size_t remove_signs_on_block(std::vector<Sign>& signs, int x, int y, int z,
+                                    std::vector<Sign>* removed = nullptr) {
+    return prune_signs(signs, [&](const Sign& s) { return s.x == x && s.y == y && s.z == z; },
+                       removed);
 }
 
 }  // namespace ewb

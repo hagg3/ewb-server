@@ -1,5 +1,6 @@
-# phase1test fixture signs — 3 near world origin (65536), y=34
-# format: x:y:z:a:b:c:text   (a/b/c semantics unknown, emitted verbatim)
 65516:34:65536:0:0:0:PHASE1 SIGN WEST
 65536:34:65516:0:0:0:PHASE1 SIGN NORTH
 65556:34:65556:0:0:0:PHASE1 SIGN EAST
+65539:32:65548:3:2:2:test
+65538:32:65548:3:2:2:test 2
+65538:33:65547:1:2:2:test3

@@ -54,12 +54,13 @@ Practically, when you touch a source file, move the doc in the same row:
 | `server_posix.cpp` — any message handled in `handleClient()`, or anything the server sends | [protocol.md](protocol.md) |
 | `server_posix.cpp` — join sequence, threading, world model, persistence/autosave | [architecture.md](architecture.md), and [protocol.md](protocol.md) if the join order moves |
 | `region_query.h`, `snapz_codec.h` — `REGION`/`SNAPZ` geometry, encoding or framing | [protocol.md](protocol.md) |
+| `out_queue.h`, or anything that writes to a player's socket | [architecture.md](architecture.md) § The output path; [configuration.md](configuration.md) for the per-client bounds |
 | `sign_store.h` — `SIGNQ`/`SIGNP` wire shape | [protocol.md](protocol.md); the `eden_signs.txt` grammar lives in [configuration.md](configuration.md) |
 | `spawn_store.h` — `eden_spawn.txt` grammar (world default spawn) | [configuration.md](configuration.md) § `eden_spawn.txt` and the `--spawn` / `--spawn-file` flags |
 | `hardening.h` — limits, username rules, `ACTION` validation | [protocol.md](protocol.md) (what clients may send) and [configuration.md](configuration.md) (what an operator can tune) |
 | `build_server.sh` — compiler, flags, dependencies, or the test suites it runs | [quickstart.md](quickstart.md), [architecture.md](architecture.md) |
 | `admin/` — the optional `edenadmin` operator GUI (separate Go module) | `admin/README.md` (not part of `docs/`); mention it in [quickstart.md](quickstart.md) / [architecture.md](architecture.md) only where it touches the build |
-| `phase1_live_test.py`, `phase3_live_test.py` — the by-hand live socket tests | [architecture.md](architecture.md) (what each one covers) |
+| `phase3_live_test.py`, `phase7_live_test.py` — the by-hand live socket tests | [architecture.md](architecture.md) (what each one covers) |
 | `server_posix.cpp` — anything written to the audit channel (`auditLog()`) | [configuration.md](configuration.md) § The audit channel |
 | `host_world.sh`, `run_server.bat` — launcher arguments | [configuration.md](configuration.md), [quickstart.md](quickstart.md) |
 | `ops/edenserver.service`, `ops/edenserver.conf.example`, `ops/edenserver-writeconf` — the systemd `EnvironmentFile` layer (`EDEN_*` keys, `${VAR}` vs `$VAR`) | [configuration.md](configuration.md) § The systemd EnvironmentFile; `ops/INSTALL.md` |

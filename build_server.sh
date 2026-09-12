@@ -60,6 +60,15 @@ echo "Built ./snapz_codec_test  —  SNAPZ raw-DEFLATE/base64 round-trip"
 ./region_test
 echo "Built ./region_test  —  REGION box / encoding / framing"
 
+# Offline per-client output-queue checks: the no-split invariant (a queue entry is
+# always a whole line or a whole frame), drain order, world-state FIFO, byte
+# accounting, the two overflow policies, region-job admission and a whole region
+# draining to exactly its input records (ROADMAP-SERVER stages 7.3 / 7.4).
+# Links -lz: a frame is encoded through the real snapz_codec.h path.
+"$CXX" -std=c++17 -O2 -Wall out_queue_test.cpp -lz -o out_queue_test
+./out_queue_test
+echo "Built ./out_queue_test  —  output queue priority / overflow / frame integrity"
+
 # Offline sign + spawn + hardening checks: eden_signs.txt / eden_spawn.txt
 # parsing, SIGNP formatting, username/ACTION validation, token bucket, connect
 # limiter, constant-time password compare + failed-auth limiter

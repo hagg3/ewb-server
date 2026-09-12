@@ -15,6 +15,10 @@ build system beyond a shell script and no link step beyond `-lz` and `-pthread`.
 server_posix.cpp     The server: sockets, threads, world model, persistence, dispatch.
 snapz_codec.h        Raw DEFLATE + base64 + SNAPZ frame encoding.
 region_query.h       REGION box geometry, Cell -> wire-record table, record ordering, framing.
+out_queue.h          Per-client output queue policy: the two queues (latency-sensitive
+                     lines vs. the ordered world-state stream), region replies as
+                     lazily-encoded jobs, drain order, byte accounting, and the two
+                     overflow policies.
 sign_store.h         eden_signs.txt parsing + SIGNP formatting.
 hardening.h          Username validation, ACTION payload validation, token bucket,
                      per-IP connect limiter, per-IP failed-auth limiter,
@@ -51,6 +55,10 @@ Each header has an offline test binary built and run by `build_server.sh`:
 ```
 snapz_codec_test.cpp   SNAPZ round-trip (deflate/base64/frame).
 region_test.cpp        Region box, cell encoding, frame splitting.
+out_queue_test.cpp     The no-split invariant (a queue entry is always a whole line or a
+                       whole frame), drain order, world-state FIFO, byte accounting, both
+                       overflow policies, region-job admission, a whole region draining to
+                       exactly its input records.
 protocol_test.cpp      Signs, usernames, ACTION validation, rate limiters.
 control_test.cpp       Control line grammar, command table, ban/ops files, fill bounds,
                        the derived fill cap, the flood guard's state machine.
@@ -71,9 +79,9 @@ eden_import_test.cpp   The base terrain profile, the diff/solid/full emitter, th
 
 Supporting files: `build_server.sh` (build + run all suites), `host_world.sh`
 (convenience launcher), `edenctl` (client for the operator control socket), `run_server.bat`
-(Windows/MSVC launcher), the `phase1_*.py` and `phase3_live_test.py` scripts (run by hand,
-not by the build — they bind a port and spawn processes), `worlds/<name>/` (sample worlds),
-`testdata/` (committed golden files for the offline suites).
+(Windows/MSVC launcher), the `phase3_live_test.py` and `phase7_live_test.py` scripts (run by
+hand, not by the build — they bind a port and spawn processes), `worlds/<name>/` (sample
+worlds), `testdata/` (committed golden files for the offline suites).
 
 `admin/` is a separate, optional Go module — `edenadmin`, a local operator GUI that drives
 `edenctl` / `eden_import` / `ssh` (`admin/README.md`). It is not built by the default
@@ -85,6 +93,17 @@ command-surface bounds are correct, and it tries to break them over real sockets
 selections against every command that reads one, permission escalation by casing and prefix
 tricks, undo growth across a long session, command flooding, malformed-argument fuzzing, and the
 control socket's own pacing and connection cap. Run it before hosting anything publicly.
+
+`phase7_live_test.py` is the counterpart for the output path, and it exists because that failure
+mode is **invisible on a fast link** — a test that reads promptly proves nothing. Every group in
+it drives a client reading at roughly 50 KB/s through a tiny receive window: a multi-frame
+`SNAPZ` burst while another player moves at 50 Hz (no short, undecodable or displaced frames,
+every record delivered), a third client's `JOIN` completing in under 2 s while another client is
+backed up, a client that never drains being disconnected rather than parking a thread, a name
+freed the instant its socket goes, a `REGION` past the queue depth being refused rather than
+half-served, and a client too far behind on world state being dropped — with everyone else
+carrying on — rather than quietly missing edits. Run it after touching anything in the output
+path.
 
 `server.cpp` is the original Winsock server this was ported from — reference only, a strict
 subset with no world model, persistence or validation. `server_posix_modded.cpp` is a
@@ -114,16 +133,58 @@ height. If you change one side of such a pair, the build fails until you change 
 |---|---|---|
 | main | process start | `accept()` loop: IP ban check, auth lockout check, connect rate limit, client cap, spawn a handler |
 | client handler | one per accepted socket, **detached** | the whole session: recv, line framing, dispatch, and its own cleanup |
+| client writer | one per accepted socket, **joined** by its own handler | the only thread that ever writes that socket: drains the client's output queue, encodes `SNAPZ` frames, enforces the write timeout |
 | autosave | at startup, detached | every 15 s: `saveWorld()`, `savePlayerPos()`, `saveSigns()`, and the `--idle-timeout` check |
 | matchmaker | at startup **iff** `--matchmaker` was given, detached | keeps one TCP registration open, heartbeats a player count every ~15 s, reconnects on failure |
 | control listener | at startup unless `--no-control-socket`, detached | `accept()` loop on the `0600` unix domain socket |
 | control handler | one per control connection, **detached** | reads `\n`-framed command lines, runs each, replies; `stop` saves and exits the process |
 
-Every thread is detached; nothing joins. A client handler removes itself from the roster and
-closes its socket on the way out, so no handle accumulates. `SIGPIPE` is ignored at startup so
-a peer that vanishes mid-write cannot take the process down. An exception escaping a detached
-thread would `std::terminate` the whole server, so the paths that can throw (the SNAPZ
-encoder) catch locally.
+Every thread is detached **except a client's writer**, which is joined by that client's own
+handler and by nobody else. A client handler removes itself from the roster, retires its writer,
+and only then closes the socket, so no handle accumulates and no thread can write a descriptor
+the kernel has already recycled. `SIGPIPE` is ignored at startup so a peer that vanishes
+mid-write cannot take the process down. An exception escaping a thread would `std::terminate`
+the whole server, so the paths that can throw (the SNAPZ encoder) catch locally.
+
+### The output path
+
+**One writer thread per client owns every write to that socket. Nothing else calls `send()` on a
+player's socket.** Producers — broadcasts, region replies, chat, the join sequence, kick notices
+— enqueue and return; they never touch the network.
+
+This is structural rather than a lock, and it has to be. Before it, a `SNAPZ` burst was streamed
+with no lock held while other threads wrote the same descriptor, and a blocking `send()` bigger
+than the send buffer yields while it waits — so another player's movement update landed *inside*
+a base64 payload. Records are sorted and framed at a flat 3000, so one destroyed frame is one
+1-block-wide row across the whole reply box: players saw long strips of the world reset, only on
+weak connections. A per-socket write mutex would have fixed that and made the next problem
+worse, because a blocked burst would hold it while a broadcaster waited on it under
+`clientsMutex`. With a queue, an interleaved write is not something callers must remember to
+avoid — it cannot be expressed.
+
+Each client has two queues ([out_queue.h](../out_queue.h) has the full rationale):
+
+- **latency-sensitive**: `POS`/`VEL`/`POSVEL`, `PONG`, chat, `[Server]` notices, the welcome,
+  `CAPS`, `SPAWN`. Drained first. Order-insensitive, so when the backlog passes
+  `--client-outbox-max` the *oldest* lines are dropped — a four-second-old position is worthless,
+  and disconnecting instead would punish exactly the weak-link players this exists for.
+- **world state**: `ACTION` relays (single and batch), `SIGNP` writes and bursts, `SNAPZ` region
+  frames, the legacy snapshot. One FIFO, so a block edit can never overtake the bulk reply it
+  belongs after. Nothing here is ever dropped: a client-initiated request (`REGION`, `SIGNQ`)
+  past its budget is refused and re-asked, and a broadcast relay past `--client-world-max`
+  disconnects that client, which resyncs properly on rejoin.
+
+A `REGION` reply is queued as a **job** — the scanned, sorted record vector plus a cursor — and
+the writer encodes one frame per turn. The client's own thread therefore returns as soon as the
+scan is done, deflate runs off it, and the memory an in-flight region costs stays the record
+vector instead of gaining up to ~17 MB of encoded base64 on top. `--region-pending-records`
+bounds those vectors across all clients; the accounting rides on the vector's own deleter, so it
+stays correct however a job ends.
+
+The split also separates two numbers that used to be one: the `REGION` log line reports scan and
+sort from the client's thread, and the writer reports encode and drain when the burst completes.
+Before, `encode N ms` silently spanned encode *and* send, so an operator could not see
+backpressure as backpressure.
 
 ### Locks
 
@@ -132,11 +193,20 @@ encoder) catch locally.
 | `clientsMutex` | the socket list and `playerInfoMap` |
 | `g_worldMtx` | the world cell map |
 | `g_posMtx` | saved player positions |
-| `g_signMtx` | the sign list and the pre-formatted `SIGNP` burst |
+| `g_signMtx` | the sign list, the pre-formatted `SIGNP` burst, the index of signed blocks and the queue of sign-removal audit lines. Taken after `g_worldMtx` when an edit turns a signed block to air, so nothing holding it may take `g_worldMtx` |
 | `g_signSaveMtx` | spans `saveSigns()`' snapshot and write, so of two racing sign saves the newer list is the one left on disk. Taken before `g_signMtx`, never after it |
 | `g_saveMtx` | serialises on-disk writes so two saves cannot interleave (world, players, `eden_bans.txt`, `eden_ops.txt`, `eden_signs.txt`) |
 | `g_banMtx` / `g_opsMtx` | the in-memory ban list and op-level table |
 | `g_auditMtx` | serialises audit lines so two threads cannot interleave one |
+| `g_outsMtx` | the socket → client-writer map. Held for a map lookup or walk and nothing else |
+| `ClientOut::m` | one client's output queue and writer state |
+
+**Lock order: any lock above → `g_outsMtx` → `ClientOut::m`.** The last two are terminal —
+nothing inside either critical section takes another lock, and no syscall runs under either — so
+the ~30 places that produce output do not have to reason about ordering at all. A broadcast
+copies owning pointers out under `g_outsMtx`, releases it, and only then enqueues, which is both
+why a client departing mid-broadcast stays alive for the enqueue and why one backed-up client can
+no longer freeze every join, chat line and edit on the server.
 
 Both command tiers write the world through one shared scan-and-commit path, and it holds
 `g_worldMtx` for exactly the model work:
@@ -158,9 +228,10 @@ Both tiers emit through the same `emitEditWire()`, so there is one `ACTION:serve
 right rather than two that can drift.
 
 **The world lock is held for the scan only.** Answering a `REGION` copies matching records into
-a local vector under `g_worldMtx`, then releases it — sorting, deflate, base64 and `send()` all
-happen unlocked. Holding the world lock across a multi-hundred-millisecond region reply would
-queue every other player's edits behind one player's walk.
+a local vector under `g_worldMtx`, then releases it — sorting happens unlocked, and encoding and
+sending happen later, on the client's writer thread. Holding the world lock across a
+multi-hundred-millisecond region reply would queue every other player's edits behind one
+player's walk.
 
 Per-connection state that only one thread touches carries no lock at all: the `REGION` and
 `SIGNQ` burst limiters, the `ACTION` token bucket, and the whole player-command session (its
@@ -234,6 +305,14 @@ just recording a delta:
 Modelling the rules rather than the deltas is what lets a late joiner be handed a correct
 snapshot regardless of the order edits arrived in.
 
+**Signs go with their block.** A sign's `x, y, z` is the block it is attached to, and the
+client sends nothing when a sign is removed. `worldSet()` is the only live writer of the map,
+so it is where every edit that stores air passes — a mine, a blast, `setblock`/`fill`, a player
+command, `//undo` — and it removes every sign on that block there. A hash set of signed blocks
+keeps that to one lookup per cell, and a world with no signs skips it entirely. The removal is
+recorded under the world lock; its audit line and the rebuilt `SIGNQ` burst wait until the
+lock is released, so a `fill` over many signed blocks formats the burst once, not per sign.
+
 ## Persistence
 
 Plaintext files, all read at startup and all written relative to the process working
@@ -243,7 +322,7 @@ directory (see [configuration.md](configuration.md) for the grammars):
 |---|---|---|
 | `eden_world.model` | autosave, and when a client disconnects | only when the dirty flag is set |
 | `eden_players.txt` | same | last known position per username |
-| `eden_signs.txt` | autosave, disconnect and control `save`/`stop` after a player's sign write; at once on control `signs add`/`rm` | only when the sign list changed |
+| `eden_signs.txt` | autosave, disconnect and control `save`/`stop` after a player's sign write or an edit that removed signs with their block; at once on control `signs add`/`rm`, and at startup or `signs reload` when signs on blocks stored as air were dropped | only when the sign list changed |
 | `eden_spawn.txt` | never | read-only; the default spawn for a player with no `eden_players.txt` row. `--spawn`/`--spawn-file` override. Malformed → one warning, ignored |
 
 Writes are **atomic and serialised**: the snapshot is taken under the data lock, written to a
@@ -254,14 +333,15 @@ retries.
 
 Autosave runs every 15 s, so the worst case for an unclean stop is losing one interval.
 
-Signs are parsed once at startup and the entire `SIGNP` burst is formatted into a single buffer
-then; every `SIGNQ` re-sends that buffer verbatim. Nothing is rebuilt per request and no lock
-is held while formatting. `g_signMtx` exists for a future reload command.
+Signs are parsed at startup and the entire `SIGNP` burst is formatted into a single buffer;
+every `SIGNQ` re-sends that buffer verbatim. Nothing is rebuilt per request: the burst is
+rebuilt under `g_signMtx` only when the sign list changes (a player's sign, `signs add|rm|reload`,
+or an edit that removed signs with their block).
 
 ## Startup and shutdown
 
 `main()` parses arguments, clamps out-of-range values, ignores `SIGPIPE`, loads the world,
-player positions and signs, starts the autosave thread (and the matchmaker thread if
+player positions and signs (then drops signs on blocks the world stores as air), starts the autosave thread (and the matchmaker thread if
 configured), then binds, listens and accepts. `SO_REUSEADDR` is set on the listener and
 `SO_KEEPALIVE` on each accepted socket so peers that vanish without a FIN eventually free their
 thread. Because that keepalive reap takes ~2 h on a default Linux, the client handler also sets
