@@ -40,9 +40,12 @@ EDEN_NAME=Eden Server
 EDEN_WORLD_DIR=/var/lib/edenserver/world
 
 # Edited-cell ceiling (the server's --max-world-cells). 4000000 is the server
-# default. It must be HIGHER than the world's cell count (`wc -l eden_world.model`):
-# at or near that count the server refuses every new block players place, while
-# edits to existing blocks still save. eden_import's summary prints the value to
+# default. It must be HIGHER than the world's cell count — read that off the
+# server's own "Loaded N world cells" startup line. (`wc -l eden_world.model`
+# only counts cells for a legacy *text* world; since stage 7.6 a saved world is
+# the binary EDMB format and that count is meaningless.) At or near that count:
+# the server refuses every new block players place, while edits to existing
+# blocks still save. eden_import's summary prints the value to
 # use ("server cap"), and edenadmin sets it when you import-and-activate. RAM is
 # the real limit.
 EDEN_MAX_WORLD_CELLS=4000000

@@ -9,17 +9,22 @@
 //   * the Cell -> record table, all four rows, incl. "255 never reaches the wire"
 //   * frame splitting at 3000 records, last frame short, nothing lost or duplicated
 //   * sorting changes only the order, never the multiset of records
+//   * sorted output groups every chunk into exactly one contiguous run (stage 7.8)
+//   * chunk-major order compresses at least as well as the flat order it replaced
 //   * a whole simulated region round-tripping back through the decode path
 //
 // The socket, the lock discipline and the rate limiter live in server_posix.cpp and
 // are exercised by the stage 1.8 verification ladder, not here.
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <random>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "region_query.h"
@@ -207,6 +212,10 @@ static std::map<std::string, int> tally(const std::vector<SnapRec>& v) {
     return m;
 }
 
+static std::tuple<int, int, int> chunkOf(const SnapRec& r) {
+    return {r.x >> 4, r.z >> 4, r.y >> 4};
+}
+
 static void test_sort_preserves_contents() {
     std::vector<SnapRec> a = synth(5000);
     std::vector<SnapRec> b = a;
@@ -218,17 +227,89 @@ static void test_sort_preserves_contents() {
     for (size_t i = 1; i < b.size(); ++i) {
         const SnapRec& p = b[i - 1];
         const SnapRec& q = b[i];
-        const bool le = (p.z < q.z) || (p.z == q.z && p.x < q.x) ||
-                        (p.z == q.z && p.x == q.x && p.y < q.y) ||
-                        (p.z == q.z && p.x == q.x && p.y == q.y && p.flag <= q.flag);
+        const auto pc = chunkOf(p), qc = chunkOf(q);
+        const bool le = (pc < qc) ||
+                        (pc == qc && p.x < q.x) ||
+                        (pc == qc && p.x == q.x && p.z < q.z) ||
+                        (pc == qc && p.x == q.x && p.z == q.z && p.y < q.y) ||
+                        (pc == qc && p.x == q.x && p.z == q.z && p.y == q.y && p.flag <= q.flag);
         if (!le) { ordered = false; break; }
     }
-    CHECK(ordered, "sorted output is ordered by (z, x, y, flag)");
+    CHECK(ordered, "sorted output is ordered by (chunk, x, z, y, flag)");
 
     // Deterministic: sorting an already-sorted burst is a no-op.
     std::vector<SnapRec> c = b;
     ewb::sort_records(c);
     CHECK(tally(b) == tally(c), "sort is idempotent");
+}
+
+// Stage 7.8: the native server hands the client every 16^3 chunk as one
+// contiguous run. Assert our sort does too — no chunk may appear, end, and
+// reappear later in the stream.
+static void test_sort_groups_chunks() {
+    std::vector<SnapRec> v = synth(5000);
+    ewb::sort_records(v);
+
+    std::map<std::tuple<int, int, int>, size_t> runs;
+    std::tuple<int, int, int> last{INT32_MIN, INT32_MIN, INT32_MIN};
+    for (const auto& r : v) {
+        auto c = chunkOf(r);
+        if (c != last) ++runs[c];
+        last = c;
+    }
+    bool oneRunEach = true;
+    for (const auto& kv : runs) {
+        if (kv.second != 1) { oneRunEach = false; break; }
+    }
+    CHECK(oneRunEach, "every chunk appears in exactly one contiguous run");
+}
+
+// A pile of cells clustered a chunk at a time — real edits build up locally
+// (a player's structure, an imported region's terrain) rather than landing one
+// per unique (x, z) across the whole span the way synth() does. This is the
+// shape that makes chunk grouping pay off, per the capture's measured 3.7%.
+static std::vector<SnapRec> synthClustered(size_t chunks, size_t perChunk) {
+    std::vector<SnapRec> out;
+    for (size_t c = 0; c < chunks; ++c) {
+        const int cx = 65312 + int((c % 20) * 16);
+        const int cz = 65312 + int((c / 20) * 16);
+        for (size_t i = 0; i < perChunk; ++i) {
+            const int x = cx + int(i % 16);
+            const int z = cz + int((i / 4) % 16);
+            const int y = int((c * 7 + i * 13) % 200);
+            ewb::emit_cell_records(x, y, z, 8, 0, out);  // solid, unpainted
+        }
+    }
+    return out;
+}
+
+// Stage 7.8: chunk-major order must not regress the deflate ratio vs. the flat
+// (z, x, y, flag) order it replaced — that was the whole point of the change.
+static void test_sort_compression_not_worse() {
+    std::vector<SnapRec> chunkMajor = synthClustered(400, 24);
+    ewb::sort_records(chunkMajor);
+
+    std::vector<SnapRec> flatOrder = chunkMajor;
+    std::sort(flatOrder.begin(), flatOrder.end(), [](const SnapRec& a, const SnapRec& b) {
+        if (a.z != b.z) return a.z < b.z;
+        if (a.x != b.x) return a.x < b.x;
+        if (a.y != b.y) return a.y < b.y;
+        return a.flag < b.flag;
+    });
+
+    auto deflatedSize = [](const std::vector<SnapRec>& v) {
+        size_t total = 0;
+        for (size_t i = 0; i < v.size(); i += ewb::SNAPZ_FRAME_RECORDS) {
+            const size_t n = std::min(ewb::SNAPZ_FRAME_RECORDS, v.size() - i);
+            total += ewb::encode_snapz(v.data() + i, n).size();
+        }
+        return total;
+    };
+
+    const size_t chunkMajorBytes = deflatedSize(chunkMajor);
+    const size_t flatOrderBytes = deflatedSize(flatOrder);
+    CHECK(chunkMajorBytes <= flatOrderBytes,
+          "chunk-major order compresses at least as well as the flat order it replaced");
 }
 
 // Split exactly as serveRegion does, then decode every frame back.
@@ -297,6 +378,8 @@ int main() {
     test_point_validation();
     test_cell_encoding();
     test_sort_preserves_contents();
+    test_sort_groups_chunks();
+    test_sort_compression_not_worse();
     test_frame_split_and_round_trip();
     if (g_fail) {
         std::fprintf(stderr, "%d check(s) failed\n", g_fail);

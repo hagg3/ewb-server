@@ -5,11 +5,23 @@
 // TCP connection to it and register; game clients ask it for the list.
 //
 // The wire protocol here is the one described by Eden's developer (WORKING/
-// matchmakerinfo.txt) cross-checked against the byte-exact browse capture in the
-// private RE tree (CAPTURE-FINDINGS.md "Matchmaker SERVER: grammar — CONFIRMED").
-// Where the two disagree — the developer sketch lists a short 4-field SERVER row,
-// the capture shows 7 fields — the capture wins for what we emit, because that is
-// what a real client was observed parsing; see `format_server_row`.
+// matchmakerinfo.txt — a lossy paste, superseded on several points) cross-checked
+// against the byte-exact browse capture of the *live* matchmaker in the private
+// RE tree (CAPTURE-FINDINGS.md "Matchmaker SERVER: grammar — CONFIRMED").
+//
+// The SERVER: row width has three sources that disagree (stage 2.3):
+//   4 fields — the developer's prose sketch;
+//   6 fields — a community-supplied matchmaker implementation (…:hasPassword:players);
+//   7 fields — the live browse capture (…:locked:players:flag6).
+// We emit 7. The capture is the only one of the three taken off the wire of the
+// server the retail client actually browses, and its 6th and 7th columns vary
+// independently of one another — across rows and between two separate passes the
+// count column tracks live joins while the last column stays set for a fixed
+// subset of servers — so the 7th field is a real column, not a mis-split or a
+// delimiter artifact of a 6-field row. The 6-field implementation is therefore an
+// older or divergent branch, not the running build. Both other forms stay
+// selectable for an A/B (`RowForm`, `edenmatch --prod-list` / `--short-list`);
+// see `format_server_row`.
 //
 // Newline-framed, ':'-delimited, one message per line. Three kinds of peer:
 //
@@ -17,7 +29,9 @@
 //     REGISTER:name:port:hasPassword[:advertiseIP]   -> REGISTERED
 //         registration lives as long as the TCP connection stays open; the
 //         server must send *something* at least every ~45 s (HEARTBEAT_TTL_SEC).
-//     PING                                            (no reply) resets the timer
+//     PING[:<players>]                                (no reply) resets the timer;
+//         a `:<players>` argument is the live join count, clamped to
+//         [0, MAX_REPORTED_PLAYERS]; a bare PING leaves the last known count as-is
 //
 //   game client -> matchmaker (one-shot; connection closed after the reply)
 //     LIST  (also accepted: LISTP, the browser-build verb)
@@ -25,6 +39,11 @@
 //            END
 //     HOST:name[:hasPassword[:password]]
 //         -> HOSTED:ip:port | HOSTFAIL:full | HOSTFAIL:spawn | HOSTFAIL:timeout
+//         semantics (stage 2.4): a name with no live registration spawns a
+//         fresh world (`world_<slug>.model`, one file per name — see
+//         world_slug); a name matching an *offline* saved world reloads it;
+//         a name matching a *live* registration returns that running server
+//         instead of spawning a duplicate that would fight it for the file.
 //
 // This header is pure and unit-tested by matchmaker_test.cpp. The socket loop,
 // the accept thread and the on-demand spawn live in edenmatch.cpp.
@@ -34,38 +53,99 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace edenmatch {
 
-constexpr int    DEFAULT_PORT       = 27020;  // edenmatch default; the retail IP is 45.79.193.87
+constexpr int    DEFAULT_PORT       = 27020;  // edenmatch default; matches the retail matchmaker's port
 constexpr size_t MAX_LINE           = 4096;   // dev: lines are capped at ~4 KB
 constexpr int    HEARTBEAT_TTL_SEC  = 45;     // dev: "traffic at least every ~45 s or [dropped]"
-constexpr size_t MAX_NAME_LEN       = 32;     // display name; longer is truncated
+constexpr size_t MAX_NAME_LEN       = 48;     // display name bytes; longer is truncated.
+                                              // Sized to leave headroom inside the client's
+                                              // 64-byte server-name field (stage 2.3).
 constexpr size_t MAX_REGISTRATIONS  = 512;    // registry sanity cap (refuse beyond this)
+constexpr int    MAX_REPORTED_PLAYERS = 1000; // `PING:<n>` clamp — production's ceiling
+constexpr int    MAX_CONNS_GLOBAL   = 256;    // concurrent connections, all peers (stage 2.2)
+constexpr int    MAX_CONNS_PER_IP   = 24;     // concurrent connections, single peer IP (stage 2.2)
 
-// Names are sanitised to alphanumerics + single spaces (dev note: "Names are
-// sanitized (alnum + s[paces])..."). Everything else is dropped, whitespace runs
-// collapse to one space, and the result is trimmed and length-capped. The point
-// is a hard guarantee that a name can never carry a ':' or '\n', so neither the
-// colon split in a SERVER: row nor the newline framing can be forged from it.
+// Drop a trailing byte sequence that a byte-wise length cap cut in half, so a
+// truncated name is never left ending in a partial UTF-8 code point. Only the
+// final sequence is examined — this is a truncation fixup, not a validator.
+inline void trim_partial_utf8(std::string& s) {
+    if (s.empty()) return;
+    size_t i = s.size(), cont = 0;
+    while (i > 0 && (static_cast<unsigned char>(s[i - 1]) & 0xC0) == 0x80 && cont < 3) {
+        --i;
+        ++cont;
+    }
+    if (i == 0) { s.clear(); return; }              // continuation bytes only
+    unsigned char lead = static_cast<unsigned char>(s[i - 1]);
+    if (lead < 0x80) { if (cont) s.resize(i); return; }  // ASCII + stray continuations
+    size_t need = ((lead & 0xE0) == 0xC0) ? 2
+                : ((lead & 0xF0) == 0xE0) ? 3
+                : ((lead & 0xF8) == 0xF0) ? 4
+                                          : 0;
+    if (need == 0 || cont + 1 != need) s.resize(i - 1);
+}
+
+// Sanitise a display name for the browse list. The guarantee we need is exactly
+// the framing guarantee and nothing more: a name can never carry a ':' (which
+// would forge a field in a SERVER: row) or a '\n' (which would forge a whole
+// line), nor any other control byte. So: ':' and every control byte are dropped,
+// TAB and SPACE become a single space, whitespace runs collapse, the result is
+// trimmed and capped at MAX_NAME_LEN bytes.
+//
+// Everything else printable survives, including punctuation and non-ASCII —
+// this matches how the production matchmaker is known to behave, and it is why
+// a name like "Ari's Server" now lists intact instead of as "Aris Server". The
+// older alnum-only rule bought no safety the above does not already buy.
+//
+// This is *not* the function to use for anything that becomes a path; see
+// world_slug below.
 inline std::string sanitize_name(const std::string& in) {
     std::string out;
     bool pendingSpace = false;
     for (char c : in) {
         unsigned char u = static_cast<unsigned char>(c);
-        if (std::isalnum(u)) {
-            if (pendingSpace && !out.empty() && out.size() < MAX_NAME_LEN) out += ' ';
-            pendingSpace = false;
-            if (out.size() < MAX_NAME_LEN) out += c;
-        } else if (c == ' ' || c == '\t') {
-            pendingSpace = true;
-        }
-        // any other byte: dropped entirely
+        if (c == ':') continue;                       // field delimiter
+        if (u == ' ' || u == '\t') { pendingSpace = true; continue; }
+        if (u < 0x20 || u == 0x7f) continue;          // '\n', '\r', every other control byte
+        if (pendingSpace && !out.empty() && out.size() < MAX_NAME_LEN) out += ' ';
+        pendingSpace = false;
+        if (out.size() < MAX_NAME_LEN) out += c;
     }
+    trim_partial_utf8(out);
     return out;
+}
+
+// Turn a HOST display name into a filesystem-safe slug for its per-name world
+// file (stage 2.4): keep [a-z0-9] (case-folded), collapse every other byte
+// into a single '_' separator, trim leading/trailing '_', cap length, empty
+// result -> "world". This is a different job from sanitize_name (a path
+// component, not a wire-protocol display string) so it is not reused: the
+// output alphabet is narrow enough ([a-z0-9_]) that a path-traversal attempt
+// like "../../etc/passwd" slugs to something inert ("etc_passwd") rather than
+// needing special-case rejection.
+constexpr size_t MAX_SLUG_LEN = 40;
+
+inline std::string world_slug(const std::string& in) {
+    std::string out;
+    bool pendingSep = false;
+    for (char c : in) {
+        unsigned char u = static_cast<unsigned char>(c);
+        if (std::isalnum(u)) {
+            if (pendingSep && !out.empty() && out.size() < MAX_SLUG_LEN) out += '_';
+            pendingSep = false;
+            if (out.size() < MAX_SLUG_LEN) out += static_cast<char>(std::tolower(u));
+        } else {
+            pendingSep = true;
+        }
+    }
+    return out.empty() ? "world" : out;
 }
 
 // One live server, keyed while connected by its owning connection id.
@@ -74,7 +154,7 @@ struct Registration {
     std::string ip;           // advertised address a client should dial
     int         port = 0;
     bool        hasPassword = false;
-    int         players = 0;  // not carried by REGISTER; reserved for a future count channel
+    int         players = 0;  // not carried by REGISTER; set by `PING:<n>` (see parse_ping)
     int         flag6   = 0;  // opaque mode/PvP bool from the browse grammar; 0 for our servers
     int64_t     lastSeen = 0; // monotonic seconds, supplied by the caller
     uint64_t    conn = 0;     // owning connection id
@@ -119,15 +199,141 @@ inline bool parse_register(const std::string& line, const std::string& peerIp,
     return true;
 }
 
-// A browse-list row. The 7-field form is the capture-confirmed grammar the retail
-// client parses:  SERVER:<name>:<ip>:<port>:<locked>:<playerCount>:<flag6>
-// `shortForm` emits the developer-sketch 4-field variant instead
-// (SERVER:<name>:<ip>:<port>:<hasPassword>) — kept only for an A/B against a
-// client that turns out to want it; the default is the observed grammar.
-inline std::string format_server_row(const Registration& r, bool shortForm = false) {
+// Parse the heartbeat's optional player-count channel. A bare "PING" (no reply,
+// no argument) just resets the TTL and leaves the last known count in place —
+// returns false, `players` untouched. "PING:<n>" reports the live count,
+// clamped to [0, MAX_REPORTED_PLAYERS]. Anything else after the colon (junk,
+// negative, non-numeric) is treated the same as a bare PING: the heartbeat
+// itself is never rejected on a malformed count.
+inline bool parse_ping(const std::string& line, int& players) {
+    if (line.rfind("PING:", 0) != 0) return false;
+    std::string arg = line.substr(5);
+    if (arg.empty()) return false;
+    char* end = nullptr;
+    long n = std::strtol(arg.c_str(), &end, 10);
+    if (end == arg.c_str() || *end != '\0' || n < 0) return false;
+    if (n > MAX_REPORTED_PLAYERS) n = MAX_REPORTED_PLAYERS;
+    players = static_cast<int>(n);
+    return true;
+}
+
+// On-disk persistence for the registry (`eden_registry.txt`, stage 2.2), so a
+// matchmaker restart doesn't blank the browser for everyone while every server
+// waits out its own reconnect delay. One line per entry, same fields as the
+// SERVER: row minus the framing; `conn` and `lastSeen` are never serialized —
+// a reloaded entry always comes back as conn=0 (orphaned) and gets its
+// liveness re-established by a probe (see Registry::load_stale).
+inline std::string serialize_entry(const Registration& r) {
+    return r.name + ":" + r.ip + ":" + std::to_string(r.port) + ":" +
+           (r.hasPassword ? "1" : "0") + ":" + std::to_string(r.players) + ":" +
+           std::to_string(r.flag6);
+}
+
+inline std::string serialize_registry(const std::vector<Registration>& regs) {
+    std::string out;
+    for (const auto& r : regs) out += serialize_entry(r) + "\n";
+    return out;
+}
+
+// Inverse of serialize_entry. Rejects anything that doesn't round-trip cleanly
+// (wrong field count, bad port) rather than guessing — a corrupt registry file
+// should lose entries, not fabricate broken ones.
+inline bool parse_persisted_line(const std::string& line, Registration& out) {
+    std::vector<std::string> f;
+    size_t start = 0;
+    for (size_t i = 0; i <= line.size(); ++i) {
+        if (i == line.size() || line[i] == ':') {
+            f.emplace_back(line.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    if (f.size() != 6) return false;
+    if (f[0].empty() || f[1].empty()) return false;
+    char* end = nullptr;
+    long port = std::strtol(f[2].c_str(), &end, 10);
+    if (end == f[2].c_str() || *end != '\0' || port < 1 || port > 65535) return false;
+    Registration r;
+    r.name = f[0];
+    r.ip = f[1];
+    r.port = static_cast<int>(port);
+    r.hasPassword = !f[3].empty() && f[3] != "0";
+    long players = std::strtol(f[4].c_str(), &end, 10);
+    r.players = (end == f[4].c_str()) ? 0 : static_cast<int>(players);
+    long flag6 = std::strtol(f[5].c_str(), &end, 10);
+    r.flag6 = (end == f[5].c_str()) ? 0 : static_cast<int>(flag6);
+    out = std::move(r);
+    return true;
+}
+
+// Global + per-IP concurrent connection caps (stage 2.2). Pure counting; the
+// accept()/thread lifecycle lives in edenmatch.cpp, which acquires a slot right
+// after accept() and releases it via RAII when the connection's thread exits,
+// covering every exit path (LIST reply, HOST reply, REGISTER drop, error) —
+// today's accept loop spawns a detached thread per connection with no cap at
+// all.
+class ConnCaps {
+public:
+    bool tryAcquire(const std::string& ip) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (total_ >= MAX_CONNS_GLOBAL) return false;
+        int& c = perIp_[ip];
+        if (c >= MAX_CONNS_PER_IP) return false;
+        ++c;
+        ++total_;
+        return true;
+    }
+    void release(const std::string& ip) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = perIp_.find(ip);
+        if (it != perIp_.end() && --it->second <= 0) perIp_.erase(it);
+        if (total_ > 0) --total_;
+    }
+    int total() const { std::lock_guard<std::mutex> lk(mu_); return total_; }
+    int forIp(const std::string& ip) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = perIp_.find(ip);
+        return it == perIp_.end() ? 0 : it->second;
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::unordered_map<std::string, int> perIp_;
+    int total_ = 0;
+};
+
+// Case-insensitively find a *live* (non-orphaned) registration by display
+// name (stage 2.4's "join-existing": a HOST for a name that's already up
+// should hand back the running server rather than spawn a duplicate that
+// fights it for the same world file). An orphaned entry (conn == 0) doesn't
+// count as live — its process may already be gone.
+inline const Registration* find_live_by_name(const std::vector<Registration>& regs,
+                                              const std::string& name) {
+    auto lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s;
+    };
+    std::string target = lower(name);
+    for (const auto& r : regs)
+        if (r.conn != 0 && lower(r.name) == target) return &r;
+    return nullptr;
+}
+
+// Which of the three attested SERVER: row widths to emit (see the header block).
+enum class RowForm {
+    Capture7 = 0,  // SERVER:name:ip:port:locked:players:flag6  — the live browse capture (default)
+    Prod6,         // SERVER:name:ip:port:hasPassword:players   — a community implementation
+    Sketch4,       // SERVER:name:ip:port:hasPassword           — the developer's prose sketch
+};
+
+// A browse-list row. `Capture7` is the default because it is the grammar the
+// retail client is observed browsing every day; the two narrower forms are kept
+// only so a live A/B is one flag away if a client ever turns out to want them.
+inline std::string format_server_row(const Registration& r, RowForm form = RowForm::Capture7) {
     std::string s = "SERVER:" + r.name + ":" + r.ip + ":" + std::to_string(r.port) + ":" +
                     (r.hasPassword ? "1" : "0");
-    if (!shortForm) s += ":" + std::to_string(r.players) + ":" + std::to_string(r.flag6);
+    if (form != RowForm::Sketch4) s += ":" + std::to_string(r.players);
+    if (form == RowForm::Capture7) s += ":" + std::to_string(r.flag6);
     return s;
 }
 
@@ -135,10 +341,17 @@ inline std::string format_server_row(const Registration& r, bool shortForm = fal
 // distinguishes "no servers" from "not answered" by the terminator, so the
 // terminator is always sent even when there are zero rows (the natural reading of
 // the grammar; the empty case was never captured — CAPTURE-FINDINGS "Still
-// needed" #1).
-inline std::string format_list(const std::vector<Registration>& regs, bool shortForm = false) {
+// needed" #1). Rows are sorted players-desc, then name, matching production's
+// ordering (the busiest servers surface first in the browser).
+inline std::string format_list(const std::vector<Registration>& regs,
+                               RowForm form = RowForm::Capture7) {
+    std::vector<Registration> sorted = regs;
+    std::stable_sort(sorted.begin(), sorted.end(), [](const Registration& a, const Registration& b) {
+        if (a.players != b.players) return a.players > b.players;
+        return a.name < b.name;
+    });
     std::string out;
-    for (const auto& r : regs) out += format_server_row(r, shortForm) + "\n";
+    for (const auto& r : sorted) out += format_server_row(r, form) + "\n";
     out += "END\n";
     return out;
 }
@@ -150,19 +363,25 @@ inline std::string format_list(const std::vector<Registration>& regs, bool short
 // so this stays testable without sleeping.
 class Registry {
 public:
-    // Add or replace. The dedupe key is (name, ip, port): "Re-registering with
-    // the same name:ip:port replaces the old entry." A replaced entry's old
-    // connection id is returned via `displaced` (0 if none) so the caller can
-    // drop that now-stale connection. Returns false if the registry is full.
+    // Add or replace. The dedupe key is (ip, port), not (name, ip, port): the
+    // dev's prose says name:ip:port, but the production matchmaker's own code
+    // keys on ip:port (latestref-analysis-2026-09-12.md §5) — code wins, and it
+    // matters here because the prose key let a server that renames itself
+    // appear twice in the browser for up to the 45 s TTL (stage 2.2). A replaced
+    // entry's old connection id is returned via `displaced` (0 if none) so the
+    // caller can drop that now-stale connection. Returns false if the registry
+    // is full.
     bool add(const Registration& reg, uint64_t conn, int64_t now, uint64_t* displaced = nullptr) {
         std::lock_guard<std::mutex> lk(mu_);
         if (displaced) *displaced = 0;
         for (auto& e : entries_) {
-            if (e.name == reg.name && e.ip == reg.ip && e.port == reg.port) {
+            if (e.ip == reg.ip && e.port == reg.port) {
                 if (displaced && e.conn != conn) *displaced = e.conn;
                 Registration u = reg;
                 u.conn = conn;
                 u.lastSeen = now;
+                u.players = e.players;  // a re-register (e.g. rename) must not flicker
+                                         // the row back to 0 (production behaviour)
                 e = u;
                 return true;
             }
@@ -182,6 +401,14 @@ public:
             if (e.conn == conn) e.lastSeen = now;
     }
 
+    // Update the reported player count for a registered connection (`PING:<n>`).
+    // No-op if the connection has no entry (e.g. it raced a sweep/remove).
+    void set_players(uint64_t conn, int players) {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& e : entries_)
+            if (e.conn == conn) { e.players = players; break; }
+    }
+
     void remove(uint64_t conn) {
         std::lock_guard<std::mutex> lk(mu_);
         entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
@@ -189,21 +416,73 @@ public:
                        entries_.end());
     }
 
-    // Drop entries not seen within HEARTBEAT_TTL_SEC. Returns the connection ids
-    // that were dropped, so the caller can also close those sockets.
-    std::vector<uint64_t> sweep(int64_t now) {
+    // Drop the connection *without* delisting the entry (stage 2.2): a brief
+    // hiccup on the registration socket shouldn't remove a server that is
+    // plainly still up. The entry survives with conn=0 ("orphaned" — nothing
+    // for the caller to close) and its fate is decided by the next probe-aware
+    // sweep(). `lastSeen` is untouched, so it still ages out normally if the
+    // probe also fails.
+    void orphan(uint64_t conn) {
         std::lock_guard<std::mutex> lk(mu_);
-        std::vector<uint64_t> dropped;
+        for (auto& e : entries_)
+            if (e.conn == conn) { e.conn = 0; break; }
+    }
+
+    // Drop entries not seen within HEARTBEAT_TTL_SEC — unless `probe(ip, port)`
+    // says the advertised address is still reachable, in which case the entry
+    // is kept and its TTL refreshed instead ("alive ⇒ listed", stage 2.2).
+    // `probe` runs with the registry unlocked (candidates are snapshotted
+    // first, decisions applied after), so one slow or timing-out probe can't
+    // block registrations. Omitting `probe` (or passing nullptr) reproduces the
+    // old unconditional-drop behaviour, which is what the offline tests use.
+    // Returns the connection ids of dropped entries (0 for an orphaned one —
+    // the caller has nothing to close there) so live sockets can also be closed.
+    std::vector<uint64_t> sweep(int64_t now,
+                                 const std::function<bool(const std::string&, int)>& probe = nullptr) {
+        struct Key { std::string ip; int port; uint64_t conn; };
+        std::vector<Key> stale;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            for (const auto& e : entries_)
+                if (now - e.lastSeen > HEARTBEAT_TTL_SEC) stale.push_back({e.ip, e.port, e.conn});
+        }
+        std::vector<Key> toDrop, toRefresh;
+        for (const auto& k : stale) {
+            if (probe && probe(k.ip, k.port)) toRefresh.push_back(k);
+            else toDrop.push_back(k);
+        }
+        std::vector<uint64_t> droppedConns;
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const auto& k : toRefresh)
+            for (auto& e : entries_)
+                if (e.ip == k.ip && e.port == k.port) { e.lastSeen = now; break; }
         entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
                            [&](const Registration& e) {
-                               if (now - e.lastSeen > HEARTBEAT_TTL_SEC) {
-                                   dropped.push_back(e.conn);
-                                   return true;
+                               for (const auto& k : toDrop) {
+                                   if (e.ip == k.ip && e.port == k.port) {
+                                       droppedConns.push_back(e.conn);
+                                       return true;
+                                   }
                                }
                                return false;
                            }),
                        entries_.end());
-        return dropped;
+        return droppedConns;
+    }
+
+    // Reload persisted entries at startup, marked stale (conn=0, lastSeen set
+    // far enough in the past that the very next sweep() probes them) so a bare
+    // matchmaker restart never trusts a server that's actually gone by then —
+    // it re-verifies instead of re-listing blind (stage 2.2).
+    void load_stale(const std::vector<Registration>& regs, int64_t now) {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const auto& r : regs) {
+            if (entries_.size() >= MAX_REGISTRATIONS) break;
+            Registration u = r;
+            u.conn = 0;
+            u.lastSeen = now - HEARTBEAT_TTL_SEC - 1;
+            entries_.push_back(std::move(u));
+        }
     }
 
     std::vector<Registration> snapshot() const {

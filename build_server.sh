@@ -60,6 +60,15 @@ echo "Built ./snapz_codec_test  —  SNAPZ raw-DEFLATE/base64 round-trip"
 ./region_test
 echo "Built ./region_test  —  REGION box / encoding / framing"
 
+# Offline chunked-world-store checks: the absent / mined / typed invariant and its
+# CELL_MINED sentinel, a differential against the sparse map it replaces (cells and
+# SNAPZ records both), box scans, the EDMB binary format (round-trip, determinism,
+# rejections) and the legacy text reader — including a real shipped world
+# (ROADMAP-SERVER stage 7.6). No zlib needed.
+"$CXX" -std=c++17 -O2 -Wall world_store_test.cpp -o world_store_test
+./world_store_test
+echo "Built ./world_store_test  —  chunk store / mined sentinel / EDMB / legacy text"
+
 # Offline per-client output-queue checks: the no-split invariant (a queue entry is
 # always a whole line or a whole frame), drain order, world-state FIFO, byte
 # accounting, the two overflow policies, region-job admission and a whole region

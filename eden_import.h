@@ -43,7 +43,8 @@
 
 #include "eden_file.h"
 #include "hardening.h"      // sanitize_text, MAX_BLOCK_TYPE, MAX_PAINT_INDEX
-#include "region_query.h"   // region_box, CELL_* sentinels, REGION_RADIUS
+#include "region_query.h"    // region_box, CELL_* sentinels, REGION_RADIUS
+#include "world_store.h"     // CELL_MINED: the other reserved block id (stage 7.6)
 #include "sign_store.h"     // Sign, SIGN_COORD_MAX, SIGN_Y_MAX, SIGN_TEXT_MAX
 #include "spawn_store.h"    // Spawn, format_spawn_line (eden_spawn.txt grammar)
 
@@ -179,15 +180,18 @@ inline bool eden_parse_air_fill(const std::string& s, AirFill& out) {
 /// server's copy a runtime flag; until then this is also the effective ceiling.
 inline constexpr size_t EDEN_DEFAULT_MAX_WORLD_CELLS = 4'000'000;
 
-/// The largest `REGION` reply ever captured from the real Eden server: ~507 k
-/// records, ~3 MB on the wire, ~395 ms to sort, deflate and send. Not a limit —
-/// a reference point, and the only empirical one there is.
-inline constexpr size_t EDEN_REGION_RECORDS_OBSERVED = 507'000;
+/// The largest `REGION` reply ever captured from the real Eden server: ~254 k
+/// records, ~0.65 MB on the wire (base64), ~5.07 MB decompressed. Not a limit —
+/// a reference point, and the only empirical one there is. (Originally doubled by a
+/// capture-logger bug; corrected 2026-09-12.)
+inline constexpr size_t EDEN_REGION_RECORDS_OBSERVED = 253'671;
 
-/// Default refusal ceiling for worst-case region records: ~4x the largest reply
-/// ever observed. Past this an import is not "big", it is a different shape of
-/// server than any client has been seen to cope with, on a path clients re-hit
-/// every 750 ms. Override with `--max-region-records` (0 disables the check).
+/// Default refusal ceiling for worst-case region records: deliberately ~8x the
+/// largest observed (253,671), chosen to be over-provisioned for realistic worlds.
+/// The previous constant 2M was correct but under-justified (the capture was 2× too
+/// large; the new observed figure is 254k). Past this an import is not "big", it is
+/// a different shape of server than any client has been seen to cope with, on a path
+/// clients re-hit every 750 ms. Override with `--max-region-records` (0 disables it).
 inline constexpr size_t EDEN_DEFAULT_MAX_REGION_RECORDS = 2'000'000;
 
 struct ImportOptions {
@@ -274,7 +278,9 @@ struct ImportProjection {
 
     size_t bad_type_cells   = 0;   ///< type > MAX_BLOCK_TYPE (warn: client may know it)
     size_t bad_paint_cells  = 0;   ///< paint > CELL_MAX_PAINT (warn: dropped on the wire)
-    size_t sentinel_cells   = 0;   ///< type == 255 (hard error: collides with the sentinel)
+    size_t sentinel_cells   = 0;   ///< type 254 or 255 — reserved by the server's cell
+                                   ///< encoding (hard error). 255 is the painted-base
+                                   ///< sentinel; 254 is world_store.h's CELL_MINED.
     int    sentinel_at[3]   = {0, 0, 0};   ///< first offender, server coords
 };
 
@@ -344,7 +350,11 @@ inline ImportProjection eden_project(const EdenWorld& w, const ImportOptions& o)
             p.records      += size_t(cost);
             chunk_records  += size_t(cost);
 
-            if (type == CELL_PAINTED_BASE) {
+            // 255 is the painted-base sentinel and 254 is the chunk store's
+            // "explicitly mined" sentinel (world_store.h, stage 7.6). Neither can
+            // survive a round trip through the server's model, so a world
+            // containing one is refused rather than quietly altered.
+            if (type >= CELL_MINED) {
                 if (p.sentinel_cells == 0) { p.sentinel_at[0] = x; p.sentinel_at[1] = y; p.sentinel_at[2] = z; }
                 ++p.sentinel_cells;
             } else if (type > MAX_BLOCK_TYPE) {

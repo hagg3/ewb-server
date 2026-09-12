@@ -149,16 +149,83 @@ edenserverctl logs            # journalctl -u edenserver, follows
 
 ---
 
-## 6. Backups
+## 6. Multi-world hosting (optional)
+
+For a single world, the setup above is complete. To host multiple independent worlds on the same
+box, use the systemd template unit `edenserver@.service` instead of (or alongside) the single
+`edenserver.service`:
+
+```sh
+# Create the per-instance config directory
+sudo mkdir -p /etc/eden/instances
+sudo chown root:root /etc/eden/instances
+sudo chmod 755 /etc/eden/instances
+
+# For each world, create a config file from the template
+sudo install -m 0600 -o root -g root ops/edenserver.conf.example /etc/eden/instances/myworld.conf
+sudoedit /etc/eden/instances/myworld.conf    # set EDEN_PORT, EDEN_NAME, EDEN_PASSWORD, etc.
+# IMPORTANT: set EDEN_WORLD_DIR=/var/lib/edenserver/worlds/myworld
+
+# Create the world directory
+sudo mkdir -p /var/lib/edenserver/worlds/myworld
+sudo chown edenserver:edenserver /var/lib/edenserver/worlds/myworld
+
+# Put your world files in place (optional)
+sudo -u edenserver cp /path/to/eden_world.model /var/lib/edenserver/worlds/myworld/
+sudo -u edenserver cp /path/to/eden_signs.txt   /var/lib/edenserver/worlds/myworld/
+
+# Enable and start the instance
+sudo systemctl daemon-reload
+sudo systemctl enable --now edenserver@myworld
+
+# Check status and logs
+edenserverctl status myworld
+edenserverctl logs myworld
+```
+
+Each instance runs independently, with its own configuration, world directory, player list, and
+logs. The `edenserverctl` wrapper works with template instances too:
+
+```sh
+edenserverctl start myworld              # systemctl start edenserver@myworld
+edenserverctl stop myworld               # systemctl stop edenserver@myworld
+edenserverctl restart myworld            # systemctl restart edenserver@myworld
+edenserverctl status myworld             # systemctl status edenserver@myworld
+edenserverctl logs 100 myworld           # last 100 lines of edenserver@myworld
+edenserverctl logs-tail 50 myworld       # last 50 lines (non-follow)
+edenserverctl backup myworld             # backup /var/lib/edenserver/worlds/myworld
+```
+
+Logs are tagged per-instance in journald (SyslogIdentifier=edenserver-myworld), so you can
+filter a single world:
+
+```sh
+journalctl -u edenserver@myworld -f         # live logs for myworld
+journalctl -u edenserver@myworld -n 100     # last 100 lines for myworld
+journalctl -u 'edenserver@*'                # all edenserver instances
+```
+
+Each world can have its own firewall port, password, and individual backups via `edenserverctl backup <instance>`.
+For automated per-instance backups on a schedule, create per-instance timer units (copy the pattern from
+`edenserver-backup.service` and `edenserver-backup.timer`, changing the `After=edenserver.service` to
+`After=edenserver@<name>.service` and tweaking the instance in the service name if desired). The existing
+single-instance timer (`edenserver-backup.timer`) works only with the bare `edenserver` unit.
+
+See the `edenserver@.service` file's comments for more detail on the template unit and per-instance variables.
+
+---
+
+## 7. Backups
 
 ```sh
 edenserverctl backup
 # -> /var/lib/edenserver/backups/20260908T181104Z/{eden_world.model,eden_players.txt,eden_signs.txt}.gz
 ```
 
-Backups are **gzipped**. `eden_world.model` is one plaintext `x:y:z:type:color` line per edited
-cell, which deflates hard — a 40 MB world lands at about 7 MB — and nothing reads a backup
-directly, so an hourly timer keeping raw copies just burns disk. `EDEN_BACKUP_LEVEL` (default 6)
+Backups are **gzipped**. `eden_world.model` deflates hard — a 40 MB text world landed at about
+7 MB; the binary `EDMB` format a save writes since stage 7.6 is already ~4x smaller before
+compression — and nothing reads a backup directly, so an hourly timer keeping raw copies just
+burns disk. `EDEN_BACKUP_LEVEL` (default 6)
 tunes it; 9 buys a few percent for several times the CPU. `EDEN_BACKUP_COMPRESS=0` stores plain
 copies as before. Restore a file by decompressing it back into the world dir:
 
@@ -199,7 +266,7 @@ still safe: the server publishes each world/player file with a temp-write +
 
 ---
 
-## 7. Verifying the three exit criteria
+## 8. Verifying the three exit criteria
 
 **a. Survives a reboot.**
 
@@ -249,7 +316,7 @@ like any other log — the server reopens the file per line, so `logrotate` need
 
 ---
 
-## 8. Optional: the `edenadmin` operator GUI
+## 9. Optional: the `edenadmin` operator GUI
 
 `edenadmin` is a small Go binary you run **on your own machine** (not the VPS). It serves a
 local web UI that drives this server over `ssh` — the same `ssh` key you already use, no new
@@ -280,7 +347,7 @@ For the GUI to work without hitting an interactive `sudo` password prompt, the V
 
 The Connection panel probes every one of these and tells you which is missing.
 
-## 9. Optional: fail2ban for password guessers
+## 10. Optional: fail2ban for password guessers
 
 Only relevant if you run with `--password`. `edenserver` already throttles a
 single-IP brute force itself (`--auth-fail-limit`: 5 wrong `JOIN` passwords in

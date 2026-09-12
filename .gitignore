@@ -1,6 +1,10 @@
 # --- Local-only, never published ---
 CLAUDE.md
 WORKING/
+# Third-party reference drops (upstream/community source shared for study).
+# Not ours to redistribute, and they carry operator IPs — read them, never commit them.
+latestREF/
+LatestREF/
 
 # --- Compiled server + offline test binaries (rebuilt by build_server.sh) ---
 /edenserver

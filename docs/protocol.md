@@ -41,7 +41,11 @@ the same commit.**
 - **y** is height, valid range `0 .. 255`.
 - Ground standing height is ≈ **33.92** (positions are floats; block coordinates are integers).
 - Block **type 0 is air**. In the server's stored model `255` means "a natural block that was
-  only painted"; that value is internal and never appears on the wire.
+  only painted"; that value is internal and never appears on the wire. `254` is internal too —
+  it is how the chunk store encodes "explicitly mined" so a dense array can still tell *mined*
+  from *untouched* — and it is mapped back to type `0` before anything reads a cell, so a mined
+  cell reaches this table (and the wire) as plain air. See
+  [architecture.md](architecture.md#world-model).
 
 ## Client → server
 
@@ -145,6 +149,15 @@ explosions with chaining. One burn can therefore change hundreds of cells, which
 charged much more heavily against the per-connection edit budget (see
 [configuration.md](configuration.md)).
 
+A chain reaction is bounded two ways: a recursion-depth guard (an explosion caused by an
+explosion caused by... six levels deep, the same as before), and a hard cap on the *total*
+number of explosions processed for one `ACTION:...:2` (`EXPLODE_MAX_CHAIN`, `explode.h`), added
+because depth alone does not bound fan-out — a dense enough TNT/firework field chains every
+block in the blast into its own explosion, and each one is a ~13³ sphere scan under the world
+lock. Explosions dropped once the cap is hit count toward the same `refused` total as a
+world-cell-cap refusal, so the player gets the existing "part of that explosion was not saved"
+notice rather than the chain silently stopping.
+
 ### At the world cell cap
 
 The server holds at most `--max-world-cells` distinct edited cells. At the cap, an edit to a
@@ -209,17 +222,20 @@ Cells map to records like this:
 |---|---|
 | type `0` (air) | `flag 1`, type `-1` |
 | type `255` (painted natural block) | `flag 3`, paint index |
-| type `1..254`, no paint | `flag 0`, type |
-| type `1..254`, painted | `flag 0`, type **and** `flag 3`, paint index |
+| type `1..253`, no paint | `flag 0`, type |
+| type `1..253`, painted | `flag 0`, type **and** `flag 3`, paint index |
 
 Note that air on the wire is `-1`, never `0` and never `255`. A paint value outside `0..54` is
 **dropped, not clamped**: a solid block then simply renders unpainted, and a painted-base cell
 with no valid colour describes no edit at all and is omitted entirely.
 
-Record order is not semantically significant — a client must merge the `flag 0` and `flag 3`
-records for a cell in either order. This server sorts by `(z, x, y, flag)` before deflating
-purely because sorted records compress materially better than hash-map order;
-`--no-region-sort` disables that.
+A client must merge a cell's `flag 0` and `flag 3` records in either order — that part of the
+order is not significant. Sequencing *between* cells is: this server sorts records by chunk
+(`cx, cz, cy` — 16^3 chunks, ascending), then within a chunk by `x, z, y, flag`, before deflating.
+That is the retail server's own order, recovered byte-exactly from a capture: it hands the client
+every chunk as one contiguous run. It also compresses ~3.7% better than a flat `(z, x, y, flag)`
+sort, since coordinates within a chunk vary over 16 values instead of the full region span.
+`--no-region-sort` disables sorting entirely (hash-map order) for A/B comparison.
 
 An **empty region is answered with `SNAPZ:0:<b64>`** — a well-formed frame decoding to zero
 records. A real frame tells a client "answered, nothing here", where silence leaves it waiting
@@ -333,6 +349,18 @@ Client `MSG:text` is rebroadcast to every other peer as:
 
 Text is capped in length and stripped of ASCII control characters before relay (bytes ≥ `0x80`
 survive, so UTF-8 chat is intact). The username charset rule is the other half of that guard.
+
+Chat is also rate-limited per connection (`--chat-rate`/`--chat-burst`, default 0.5/s with a
+burst of 5 — see [configuration.md](configuration.md#limits)): a human types nowhere near that
+fast, so an over-budget line is a flood, not lag, and the sender is told the line was dropped
+rather than it vanishing silently. `/`-prefixed commands are exempt from this bucket — they have
+their own budget, see [commands.md § Part 2](commands.md#part-2--player-commands).
+
+Movement (`POS`/`VEL`/`POSVEL`) is likewise rate-limited (`--move-rate`/`--move-burst`, default
+40/s with a burst of 80), but for the opposite reason chat is tight: the retail client's observed
+movement rate is ~3-4 Hz, so this bucket exists only to cap a scripted flood, with an order of
+magnitude of headroom above real play plus burst room for a client catching up after a lag spike.
+An over-budget movement update is dropped silently — the same outcome a late packet already has.
 
 **A `MSG:` whose text begins with `/` is not chat.** It is a player command; the server runs it
 and answers this connection only, with `[Server] …` lines (plus `SPAWN:` for a teleport,

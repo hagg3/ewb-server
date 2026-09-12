@@ -362,7 +362,7 @@ int main(int argc, char** argv) {
             probe.air_fill = af;
             const ImportProjection pp = eden_project(world, probe);
             std::string verdict = "ok";
-            if (pp.sentinel_cells) verdict = "block id 255 collision (refused)";
+            if (pp.sentinel_cells) verdict = "reserved block id 254/255 (refused)";
             else if (pp.cells > a.opt.max_world_cells) verdict = "over the cell cap";
             else if (a.opt.max_region_records && pp.worst_region.records > a.opt.max_region_records)
                 verdict = "over the REGION budget";
@@ -483,9 +483,10 @@ int main(int argc, char** argv) {
     bool fatal = false;
     if (p.sentinel_cells) {
         std::cerr << "eden_import: error: " << commas(p.sentinel_cells)
-                  << " voxel(s) have block type 255, which collides with the server's"
-                     " painted-base sentinel — such cells would be silently dropped from"
-                     " every REGION reply. First at x " << p.sentinel_at[0] << ", y "
+                  << " voxel(s) have block type 254 or 255, both reserved by the server's"
+                     " cell encoding (255 is the painted-base sentinel, 254 is the chunk"
+                     " store's mined sentinel) — such cells cannot be stored or sent"
+                     " faithfully. First at x " << p.sentinel_at[0] << ", y "
                   << p.sentinel_at[1] << ", z " << p.sentinel_at[2] << ".\n";
         fatal = true;
     }

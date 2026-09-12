@@ -3,7 +3,8 @@
 // slot upsert, and removing signs with their block — stage 7.2), and the hardening primitives (username validation, `ACTION`
 // payload validation, the world cell cap headroom, token bucket, per-IP connect
 // limiter, constant-time password compare, per-IP failed-auth limiter, text
-// sanitisation).
+// sanitisation) — plus the explode.h TNT/paint chain worklist and its
+// EXPLODE_MAX_CHAIN fan-out bound (stage 7.7).
 //
 //   clang++ -std=c++17 -O2 -Wall protocol_test.cpp -o protocol_test
 //   ./protocol_test
@@ -15,10 +16,16 @@
 
 #include <cstdio>
 #include <map>
+#include <random>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <vector>
 
+#include <cstdint>
+#include <unordered_map>
+
+#include "explode.h"
 #include "hardening.h"
 #include "sign_store.h"
 #include "spawn_store.h"
@@ -209,6 +216,70 @@ static void test_cell_cap_headroom() {
     CHECK(ewb::cell_cap_state(3700000, 4000000) == ewb::CellCapState::Low, "under a tenth left is Low");
     CHECK(ewb::cell_cap_state(3500000, 4000000) == ewb::CellCapState::Ok, "an eighth left is Ok");
     CHECK(ewb::cell_cap_state(0, 1) == ewb::CellCapState::Ok, "tiny cap, empty world");
+}
+
+// --- TNT/paint explosion chain (stage 7.7) -----------------------------------
+
+// Minimal fake world: a map from packed key to a stored cell, nothing stored
+// means "untouched terrain" — mirrors g_world's semantics without pulling in
+// server_posix.cpp.
+struct FakeWorld {
+    std::unordered_map<uint64_t, ewb::ExplodeCell> cells;
+    static uint64_t key(int x, int y, int z) {
+        return (uint64_t(uint32_t(x)) << 40) | (uint64_t(uint32_t(z)) << 16) | uint64_t(uint16_t(y));
+    }
+};
+
+static void test_explode_single_tnt_golden() {
+    FakeWorld fw;
+    size_t setCalls = 0;
+    ewb::ExplodeWorld w;
+    w.get = [&](int x, int y, int z, ewb::ExplodeCell& out) -> bool {
+        auto it = fw.cells.find(FakeWorld::key(x, y, z));
+        if (it == fw.cells.end()) return false;
+        out = it->second;
+        return true;
+    };
+    w.set = [&](int x, int y, int z, int type, int color) -> bool {
+        ++setCalls;
+        fw.cells[FakeWorld::key(x, y, z)] = {(unsigned char)type, (unsigned char)color};
+        return true;  // no cap in this test
+    };
+    fw.cells[FakeWorld::key(100, 100, 100)] = {(unsigned char)w.tntType, 0};
+
+    const size_t refused = ewb::simExplode(w, 100, 100, 100);
+    // Golden: an isolated TNT in an empty world, R=6 sphere, no chain — 923
+    // distinct cells touched (1 explicit center-consume call, then every other
+    // distinct cell the sphere's samples land on; repeat visits to an
+    // already-air cell are skipped). A change here means the destroyed-cell
+    // geometry changed, not just this refactor.
+    CHECK(refused == 0, "an unbounded single TNT refuses nothing");
+    CHECK(setCalls == 923, "an isolated TNT's blast touches the same cell count as before 7.7");
+}
+
+// A dense field where every queried cell reports back another TNT block: the
+// blast chains into an unbounded number of neighbours. Before 7.7 this was
+// bounded only by recursion depth (still a huge, uncapped fan-out per level);
+// after 7.7, EXPLODE_MAX_CHAIN bounds the total explosions processed.
+static void test_explode_chain_capped() {
+    size_t setCalls = 0;
+    ewb::ExplodeWorld w;
+    w.get = [](int, int, int, ewb::ExplodeCell& out) -> bool {
+        out = {(unsigned char)9 /* SV_TNT */, 0};
+        return true;
+    };
+    w.set = [&](int, int, int, int, int) -> bool {
+        ++setCalls;
+        return true;
+    };
+    w.tntType = 9;
+
+    const size_t maxChain = 50;
+    const size_t refused = ewb::simExplode(w, 65536, 100, 65536, maxChain);
+
+    CHECK(setCalls >= 1 && setCalls <= maxChain,
+          "a dense chain processes at most EXPLODE_MAX_CHAIN explosions");
+    CHECK(refused > 0, "a chain that would exceed the cap reports truncation via `refused`");
 }
 
 // --- usernames (stage 1.7) ---------------------------------------------------
@@ -411,6 +482,82 @@ static void test_sanitize_text() {
     CHECK(ewb::sanitize_text("caf\xC3\xA9", 64) == "caf\xC3\xA9", "UTF-8 survives");
 }
 
+// --- parseMessage: hand-rolled split matches std::getline (stage 7.13) ----------
+//
+// server_posix.cpp's parseMessage() used to build a std::stringstream and
+// std::getline() out of it for every inbound line — expensive, and POSVEL (the
+// highest-frequency verb on the wire) pays for it most. Stage 7.13 replaced it
+// with a hand-rolled ':'-delimited substr split. This is not a header under
+// test — server_posix.cpp is a full program (sockets, threads, main()) that
+// this offline suite does not link — so both implementations are reproduced
+// here verbatim and checked against each other instead of against the shipped
+// symbol. Keep these two in lockstep with server_posix.cpp's parseMessage() and
+// its old implementation if either ever changes.
+
+// The original implementation (pre-7.13), reproduced for comparison only.
+static std::vector<std::string> parseMessage_oldStringstream(const std::string& message) {
+    std::vector<std::string> parts;
+    std::stringstream ss(message);
+    std::string part;
+    while (std::getline(ss, part, ':')) {
+        parts.push_back(part);
+    }
+    return parts;
+}
+
+// The stage-7.13 implementation, reproduced for comparison only — must be kept
+// byte-for-byte identical to server_posix.cpp's parseMessage().
+static std::vector<std::string> parseMessage_newSplit(const std::string& message) {
+    std::vector<std::string> parts;
+    size_t start = 0;
+    while (start < message.size()) {
+        const size_t colon = message.find(':', start);
+        if (colon == std::string::npos) {
+            parts.push_back(message.substr(start));
+            break;
+        }
+        parts.push_back(message.substr(start, colon - start));
+        start = colon + 1;
+    }
+    return parts;
+}
+
+static void check_parseMessage_agree(const std::string& in, const char* label) {
+    const std::vector<std::string> a = parseMessage_oldStringstream(in);
+    const std::vector<std::string> b = parseMessage_newSplit(in);
+    CHECK(a == b, label);
+}
+
+static void test_parse_message_equivalence() {
+    check_parseMessage_agree("", "empty string");
+    check_parseMessage_agree(":", "a single colon");
+    check_parseMessage_agree("a:", "trailing colon");
+    check_parseMessage_agree(":a", "leading colon");
+    check_parseMessage_agree("abc", "no colons");
+    check_parseMessage_agree("a::b", "consecutive colons (empty field in the middle)");
+    check_parseMessage_agree("::::", "many consecutive colons, nothing else");
+    check_parseMessage_agree("a:b:c", "plain three-field line");
+    check_parseMessage_agree("POSVEL:1.0:2.0:3.0:0.1:0.2:0.3", "a realistic POSVEL line");
+    check_parseMessage_agree("SIGNP:1:2:3:0:0:0:time 12:30: meet here",
+                              "sign text carries its own colons");
+    check_parseMessage_agree(std::string(1, ':'), "one-character string that is just ':'");
+    check_parseMessage_agree(std::string(200, ':'), "200 consecutive colons");
+
+    // A fuzz pass over random short strings drawn from a small alphabet weighted
+    // toward ':' — this is the case most likely to expose an off-by-one in the
+    // hand-rolled split versus std::getline's "no trailing empty field" quirk.
+    std::mt19937 rng(0xE57713);  // fixed seed: deterministic, reproducible failures
+    std::uniform_int_distribution<int> lenDist(0, 12);
+    static const char alphabet[] = ":::abc012\n\t";
+    std::uniform_int_distribution<int> charDist(0, (int)sizeof(alphabet) - 2);
+    for (int trial = 0; trial < 5000; ++trial) {
+        std::string s;
+        const int len = lenDist(rng);
+        for (int i = 0; i < len; ++i) s.push_back(alphabet[charDist(rng)]);
+        check_parseMessage_agree(s, "fuzz");
+    }
+}
+
 // --- signs removed with their block (stage 7.2) ----------------------------------
 
 static bool same_signs(const std::vector<ewb::Sign>& p, const std::vector<ewb::Sign>& q) {
@@ -503,6 +650,8 @@ int main() {
     test_remove_signs_on_block();
     test_prune_signs();
     test_cell_cap_headroom();
+    test_explode_single_tnt_golden();
+    test_explode_chain_capped();
     test_spawn_parse();
     test_username_validation();
     test_action_extra_validation();
@@ -511,6 +660,7 @@ int main() {
     test_const_time_eq();
     test_auth_failure_limiter();
     test_sanitize_text();
+    test_parse_message_equivalence();
 
     if (g_fail) {
         std::fprintf(stderr, "\n%d check(s) FAILED\n", g_fail);

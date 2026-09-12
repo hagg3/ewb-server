@@ -54,6 +54,8 @@ Practically, when you touch a source file, move the doc in the same row:
 | `server_posix.cpp` — any message handled in `handleClient()`, or anything the server sends | [protocol.md](protocol.md) |
 | `server_posix.cpp` — join sequence, threading, world model, persistence/autosave | [architecture.md](architecture.md), and [protocol.md](protocol.md) if the join order moves |
 | `region_query.h`, `snapz_codec.h` — `REGION`/`SNAPZ` geometry, encoding or framing | [protocol.md](protocol.md) |
+| `world_store.h` — the chunk store, the mined sentinel, the `EDMB` world format, the legacy text reader | [configuration.md](configuration.md) § `eden_world.model` (both formats + `--world-format`); [architecture.md](architecture.md) § World model / Persistence |
+| `explode.h` — TNT/paint explosion chain, `EXPLODE_MAX_CHAIN` fan-out bound | [protocol.md](protocol.md) (`ACTION` mode 2 bounds), [configuration.md](configuration.md) (the compiled-in-limits table) |
 | `out_queue.h`, or anything that writes to a player's socket | [architecture.md](architecture.md) § The output path; [configuration.md](configuration.md) for the per-client bounds |
 | `sign_store.h` — `SIGNQ`/`SIGNP` wire shape | [protocol.md](protocol.md); the `eden_signs.txt` grammar lives in [configuration.md](configuration.md) |
 | `spawn_store.h` — `eden_spawn.txt` grammar (world default spawn) | [configuration.md](configuration.md) § `eden_spawn.txt` and the `--spawn` / `--spawn-file` flags |
@@ -63,7 +65,7 @@ Practically, when you touch a source file, move the doc in the same row:
 | `phase3_live_test.py`, `phase7_live_test.py` — the by-hand live socket tests | [architecture.md](architecture.md) (what each one covers) |
 | `server_posix.cpp` — anything written to the audit channel (`auditLog()`) | [configuration.md](configuration.md) § The audit channel |
 | `host_world.sh`, `run_server.bat` — launcher arguments | [configuration.md](configuration.md), [quickstart.md](quickstart.md) |
-| `ops/edenserver.service`, `ops/edenserver.conf.example`, `ops/edenserver-writeconf` — the systemd `EnvironmentFile` layer (`EDEN_*` keys, `${VAR}` vs `$VAR`) | [configuration.md](configuration.md) § The systemd EnvironmentFile; `ops/INSTALL.md` |
+| `ops/edenserver.service`, `ops/edenserver@.service`, `ops/edenserver.conf.example`, `ops/edenserver-writeconf` — the systemd `EnvironmentFile` layer (`EDEN_*` keys, `${VAR}` vs `$VAR`) | [configuration.md](configuration.md) § The systemd EnvironmentFile; `ops/INSTALL.md` (template unit in § Multi-world hosting) |
 | `ops/edenserverctl` verbs, `ops/edenserver-backup.{service,timer}` | [configuration.md](configuration.md) § Ops wrapper; `ops/INSTALL.md` |
 | `eden_file.h` — `.eden` world-format parsing (header, chunks, spans, signs, ZIP wrapper) | [import.md](import.md) § What it reads; [architecture.md](architecture.md) (file map) |
 | `eden_import.h` / `eden_import.cpp` — the converter: base profile, fill strategies, axis rename, budget projections, flags | [import.md](import.md); [configuration.md](configuration.md) for the files it writes |

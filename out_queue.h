@@ -93,16 +93,23 @@ struct RegionJob {
 
 // --- what the writer is handed ----------------------------------------------
 
-/// One unit of work. Either bytes that are already formatted (`Bytes`) or a slice
-/// of a region job the writer still has to deflate (`Frame`). Deliberately not a
-/// `std::string` in both cases: encoding a frame costs milliseconds and must
-/// happen *outside* the client's queue lock.
+/// One unit of work. Either bytes that are already formatted (`Bytes`), a
+/// **shared** formatted blob one broadcast handed to several clients (`SharedBytes`
+/// — see `push_world`'s `shared_ptr` overload, stage 7.13), or a slice of a region
+/// job the writer still has to deflate (`Frame`). `Frame` is deliberately not a
+/// `std::string`: encoding a frame costs milliseconds and must happen *outside*
+/// the client's queue lock. `SharedBytes` is the same idea applied to a broadcast
+/// blob: a `//set` burst is megabytes, and copying it once per target client in
+/// the broadcasting thread (rather than sharing ownership and letting each
+/// client's own writer thread touch it once, when it is actually ready to send)
+/// was stage 7.13's finding.
 struct OutItem {
-    enum class Kind { None, Bytes, Frame };
+    enum class Kind { None, Bytes, SharedBytes, Frame };
 
     Kind kind = Kind::None;
 
     std::string bytes;                                  ///< Kind::Bytes — write as-is
+    std::shared_ptr<const std::string> shared_bytes;    ///< Kind::SharedBytes — write *shared_bytes
 
     std::shared_ptr<const std::vector<SnapRec>> recs;   ///< Kind::Frame — encode [off, off+count)
     size_t off   = 0;
@@ -111,7 +118,10 @@ struct OutItem {
     bool   last  = false;   ///< last frame of its job (log the completed reply)
 
     bool empty() const { return kind == Kind::None; }
-    void reset() { kind = Kind::None; bytes.clear(); recs.reset(); off = count = 0; first = last = false; }
+    void reset() {
+        kind = Kind::None; bytes.clear(); shared_bytes.reset(); recs.reset();
+        off = count = 0; first = last = false;
+    }
 };
 
 /// Encode a `Kind::Frame` item into its wire line. Needs zlib (via snapz_codec.h).
@@ -185,7 +195,24 @@ public:
         if (blob.empty()) return true;
         if (lo_bytes_ > lim_.lo_max_bytes) { over_budget_ = true; return false; }
         lo_bytes_ += blob.size();
-        lo_.push_back(Slot{std::move(blob), RegionJob{}});
+        Slot s; s.kind = Slot::Kind::String; s.blob = std::move(blob);
+        lo_.push_back(std::move(s));
+        note_peak();
+        return true;
+    }
+
+    /// Same contract as the `std::string` overload, for a blob one broadcast is
+    /// handing to several clients (stage 7.13). The caller builds the
+    /// `shared_ptr` once; every target's queue takes a cheap refcount bump
+    /// instead of its own copy of the whole blob. Accounting (`lo_bytes_`, the
+    /// backlog budget) is identical either way — each client's logical backlog is
+    /// still the full size, it just no longer needs its own storage for it.
+    bool push_world(const std::shared_ptr<const std::string>& blob) {
+        if (!blob || blob->empty()) return true;
+        if (lo_bytes_ > lim_.lo_max_bytes) { over_budget_ = true; return false; }
+        lo_bytes_ += blob->size();
+        Slot s; s.kind = Slot::Kind::Shared; s.shared_blob = blob;
+        lo_.push_back(std::move(s));
         note_peak();
         return true;
     }
@@ -197,7 +224,8 @@ public:
         if (blob.empty()) return true;
         if (lo_bytes_ + blob.size() > lim_.lo_max_bytes) return false;
         lo_bytes_ += blob.size();
-        lo_.push_back(Slot{std::move(blob), RegionJob{}});
+        Slot s; s.kind = Slot::Kind::String; s.blob = std::move(blob);
+        lo_.push_back(std::move(s));
         note_peak();
         return true;
     }
@@ -212,7 +240,8 @@ public:
         if (job.total() == 0 && !job.empty_frame) return true;   // nothing to say
         if (job.frame_records == 0) job.frame_records = SNAPZ_FRAME_RECORDS;
         ++region_jobs_;
-        lo_.push_back(Slot{std::string(), std::move(job)});
+        Slot s; s.kind = Slot::Kind::Job; s.job = std::move(job);
+        lo_.push_back(std::move(s));
         return true;
     }
 
@@ -234,10 +263,17 @@ public:
         }
         while (!lo_.empty()) {
             Slot& s = lo_.front();
-            if (!s.blob.empty()) {
+            if (s.kind == Slot::Kind::String) {
                 out.kind  = OutItem::Kind::Bytes;
                 out.bytes = std::move(s.blob);
                 lo_bytes_ -= out.bytes.size();
+                lo_.pop_front();
+                return true;
+            }
+            if (s.kind == Slot::Kind::Shared) {
+                out.kind         = OutItem::Kind::SharedBytes;
+                out.shared_bytes = std::move(s.shared_blob);
+                lo_bytes_ -= out.shared_bytes ? out.shared_bytes->size() : 0;
                 lo_.pop_front();
                 return true;
             }
@@ -298,8 +334,15 @@ public:
 
 private:
     struct Slot {
-        std::string blob;   ///< non-empty for a ready blob
-        RegionJob   job;    ///< used when `blob` is empty
+        /// Which member is live. Not inferred from emptiness any more (stage
+        /// 7.13 added `Shared`, whose `shared_blob` can't double as an
+        /// "is this slot a blob" flag the way `!blob.empty()` used to).
+        enum class Kind { String, Shared, Job };
+        Kind kind = Kind::String;
+
+        std::string blob;                              ///< Kind::String
+        std::shared_ptr<const std::string> shared_blob; ///< Kind::Shared
+        RegionJob   job;                                ///< Kind::Job
     };
 
     void pop_region() {

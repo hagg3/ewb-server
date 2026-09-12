@@ -30,19 +30,21 @@ server. Unknown flags are ignored.
 | `--password PASS` | *(empty)* | If set, `JOIN` must supply a matching password; empty means an open server. |
 | `--matchmaker HOST[:PORT]` | *(none)* | Register with a matchmaker at this address and hold the registration open (`REGISTER` → `REGISTERED`, then a bare `PING` keep-alive every 20 s). Port defaults to `27020`. Reconnects every ~5 s if the matchmaker is down. See [matchmaker.md](matchmaker.md). |
 | `--advertise IP` | auto-detected | The address clients should use to reach this server, as told to the matchmaker. When omitted and a matchmaker is configured, the server picks this machine's primary non-loopback LAN IPv4 (preferring `192.168.*`, `10.*`, `172.*`) so remote devices do not get handed `127.0.0.1`. |
+| `--tcp-nodelay 0\|1` | `1` | Disables Nagle's algorithm (`TCP_NODELAY`) on every accepted client socket. The writer sends one `send()` per queued line and the hottest line is a ~60-byte `POSVEL` broadcast — exactly what Nagle coalesces — so with Nagle enabled other players' movement arrives in RTT-quantised jerks instead of as each update is sent. `0` restores Nagle if an operator ever wants it back. |
 
 ### Files
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--world FILE` | `eden_world.model` | World edit store. Created on first save if absent. |
+| `--world FILE` | `eden_world.model` | World edit store. Created on first save if absent. Both world formats load — see [`eden_world.model`](#eden_worldmodel). |
+| `--world-format edmb\|text` | `edmb` | What a **save** writes. `edmb` is the binary chunk format (stage 7.6): ~4–5 bytes per cell, and the under-lock part of a save is a serialise rather than a copy of the whole model. `text` writes the pre-7.6 `x:y:z:type:color` file instead — for an operator who wants a grep-able world or to hand the file back to an older build; it costs ~5× the disk and holds the world lock for the whole serialise. **Loading ignores this flag**: the file's first four bytes decide how it is read. |
 | `--signs FILE` | `eden_signs.txt` | Sign sidecar. Read at startup, when signs on blocks the world stores as air are dropped (see [`eden_signs.txt`](#eden_signstxt)); the control socket's `signs add`/`rm`/`reload` also edit it. Absent is normal and silent. |
 | `--spawn-file FILE` | `eden_spawn.txt` beside `--world` | World default-spawn sidecar (one line `x:y:z`), as written by [`eden_import`](import.md). Read once at startup. Absent is normal and silent; a malformed line warns and is ignored. |
 | `--spawn x:y:z` | *(none)* | Set the world default spawn inline; overrides `--spawn-file` and skips reading it. |
+| `--players-file FILE` | `eden_players.txt` beside `--world` | Player-position store. Defaults to the same directory as `--world`, not the process cwd, so two differently-named worlds hosted from one directory no longer share (and silently teleport players between) one file. If a legacy `./eden_players.txt` already exists and the derived path is a different file, it is read instead, so nobody's saved position vanishes on upgrade. |
 
-Player positions are always read from and written to `eden_players.txt` — there is no flag for
-it. All paths are resolved **relative to the process working directory**, so run the
-server from the world's directory (or pass absolute paths).
+All paths are resolved **relative to the process working directory** unless noted otherwise, so
+run the server from the world's directory (or pass absolute paths).
 
 The world default spawn is where a joining player who has **no `eden_players.txt` row of their
 own** is placed (`SPAWN` unicast). A returning player's saved position always wins; with neither,
@@ -55,6 +57,17 @@ the client decides.
 | `--idle-timeout N` | `0` (off) | Exit cleanly after `N` seconds with zero connected clients. Checked on the 15 s autosave tick, so the real granularity is 15 s. ⚠️ Do not combine with a service supervisor set to restart unconditionally — the idle exit is a normal `exit(0)` and would become a start/idle/exit loop. |
 | `--handshake-timeout N` | `15` | Seconds a freshly accepted connection has to send its `JOIN` before the server drops it. Stops a peer from opening TCP connections that send nothing and holding client slots until the ~2 h TCP keepalive reaps them. `0` disables (not recommended on an internet-facing port). |
 | `--idle-timeout-conn N` | `300` | Seconds of total silence tolerated on a socket *after* `JOIN` before it is dropped. The retail client sends `PING` every 10 s and `POS` while moving, so a genuinely silent joined socket is dead. `0` disables. Distinct from the world-level `--idle-timeout` above. |
+
+#### Shutdown
+
+`SIGTERM` and `SIGINT` (what `systemctl stop`, `docker stop`, and Ctrl-C all send) are handled,
+not left at their default of killing the process outright. On either signal the server saves the
+world, player positions and signs, gives every connected client's writer up to
+`SV_CLOSE_DRAIN_SEC` (5 s, compiled in) to drain its queue, then exits — so a clean stop no longer
+depends on catching the next 15 s autosave tick. The same save-drain-exit path runs for
+`--idle-timeout`'s self-exit and the control socket's `stop` command, so all three shutdown
+routes behave the same way. `TimeoutStopSec` in `ops/edenserver.service` gives this room to
+finish; see that file.
 
 ### Operator control socket
 
@@ -149,6 +162,10 @@ keeping a copy that outlives `journalctl --vacuum`.
 | `--max-world-cells N` | `4000000` | Ceiling on distinct edited world cells held in memory (and written to `eden_world.model`). At the cap, edits to cells the world already holds still apply but **every new cell is refused** — a block placed in open air, a natural block mined or painted — so from a player's seat some builds save and others vanish. **Size it above the world, never equal to it:** [`eden_import`](import.md)'s summary prints the value to use (the cell count plus a quarter, at least 1,000,000 more, rounded up to 100,000). The server warns at startup when the loaded world is at the cap or within a tenth of it, logs refusals at most once a minute (`world cell cap reached`), and tells the player whose edit was refused; every `Saved world` log line shows the cap. Also the upper clamp for `--we-max-cells` and the derived `fill` cap. Your RAM is the real limit. A value below `1` falls back to the default with a warning; a non-default value is logged at startup. |
 | `--action-rate N` | `512` | Sustained terrain edits per second per connection. `0` disables the limit entirely. |
 | `--action-burst N` | `1024` | Edits a connection may spend at once before the sustained rate applies. |
+| `--move-rate N` | `40` | Sustained `POS`/`VEL`/`POSVEL` updates per second per connection. `0` disables the limit entirely. |
+| `--move-burst N` | `80` | Movement updates a connection may spend at once before the sustained rate applies. |
+| `--chat-rate N` | `0.5` | Sustained `MSG` (chat) lines per second per connection — i.e. one line every two seconds sustained. `0` disables the limit entirely. Does not apply to `/`-prefixed commands, which have their own budget (see [Player commands](#player-commands) above). |
+| `--chat-burst N` | `5` | Chat lines a connection may spend at once before the sustained rate applies. |
 | `--connect-limit N` | `10` | New connections allowed per source IP per 10 s window. `0` disables. ⚠️ It is per *source address*, so a whole LAN behind one NAT address shares the allowance — as does a test harness on loopback. |
 | `--auth-fail-limit N` | `5` | Wrong-password `JOIN` attempts allowed per source IP inside a 60 s window before that IP is locked out at `accept()`. The lockout starts at 60 s and **doubles** on every further failure, up to 1 h; an IP that stops guessing for an hour has its escalation reset. `0` disables. Per-IP only — a distributed guesser is not stopped by this (see below). |
 
@@ -156,6 +173,21 @@ The defaults accommodate bulk editing by a scripted client draining a queue at s
 edits per second. Tighten them if you host strangers. A refused edit is dropped, not fatal.
 Burn costs 64 against the budget rather than 1, because a single burn can write hundreds of
 cells via explosion simulation.
+
+`POS`/`VEL`/`POSVEL` and `MSG` fan out to every other connected client the same way `ACTION`
+does, but until stage 7.14 neither had a limiter — `--action-rate` bounded edits, not the update
+rate itself. Movement and chat are throttled differently because their failure modes differ:
+- **Movement** is meant to be frequent — real play generates it continuously — so `--move-rate`/
+  `--move-burst` exist only to cap a scripted flood, not to pace a real player. The defaults sit
+  an order of magnitude above the retail client's observed movement rate (~3-4 Hz, `POSVEL`
+  only), with enough burst headroom that a client catching up after a lag spike is never
+  throttled. An over-budget update is **dropped silently** — the same cost a laggy player already
+  pays when a packet is late.
+- **Chat** from a human is naturally infrequent, so `--chat-rate`/`--chat-burst` are tight: a
+  burst of a few lines (typing a longer thought across messages) is fine, but a sustained rate
+  faster than a human types is not. Unlike movement, an over-budget chat line is **not** silent —
+  the sender is told their message was dropped, itself rate-limited so the notice can't become
+  its own flood.
 
 The password compare at `JOIN` is constant-time. `--auth-fail-limit` throttles a **single-IP**
 brute force; a distributed guesser (many IPs, few tries each) still slips through it. If you
@@ -240,6 +272,8 @@ in `server_posix.cpp` (and its headers) if you must.
 | Block a player `//up` stands on | 58 |
 | Failed-auth counting window | 60 s |
 | Auth lockout: base / max / reset-after | 60 s / 1 h (doubling) / 1 h idle |
+| Max explosions chained from one `ACTION:...:2` (`EXPLODE_MAX_CHAIN`, `explode.h`) | 4,096 |
+| Explosion chain recursion-depth guard | 6 |
 
 ## The systemd EnvironmentFile (`/etc/edenserver.conf`)
 
@@ -383,14 +417,19 @@ usage in [matchmaker.md](matchmaker.md); the flags:
 |---|---|---|
 | `--port N` | `27020` | TCP port to listen on (all interfaces). A bare leading number also works. |
 | `--advertise-ip IP` | *(peer address)* | Override the advertised address for every registration. |
-| `--short-list` | off | Emit the 4-field `SERVER:` row instead of the 7-field capture grammar. |
+| `--short-list` | off | Emit the 4-field developer-sketch `SERVER:` row instead of the 7-field default. |
+| `--prod-list` | off | Emit the 6-field `SERVER:` row (no `flag6`) instead of the 7-field default. |
 | `--verbose` | off | Log every `LIST` / `HOST` / bad line, not just registrations. |
 | `--allow-host` | off | Honour client `HOST:` requests by spawning a local `edenserver`. |
 | `--edenserver PATH` | `./edenserver` | Binary to spawn for `HOST`. |
-| `--world DIR` | `.` | Working directory for a spawned server. |
+| `--world DIR` | `.` | Working directory for a spawned server; each `HOST` name gets its own `world_<slug>.model` inside it. |
 | `--host-ports LO-HI` | `27600-27699` | Port range `HOST` allocates from. |
+| `--publicip IP` | *(unset)* | Address to advertise for a `HOST`-spawned server. Falls back to `--advertise-ip`, then the requester's peer address. |
+| `--registry-file PATH` | `eden_registry.txt` | Where the live registry is persisted (atomic temp+rename, ~10 s). `--registry-file ""` disables persistence. See [matchmaker.md](matchmaker.md). |
 
-`edenmatch` holds all state in memory — no config file, nothing on disk.
+`edenmatch` caps concurrent connections at 256 total / 24 per source IP, refusing (and logging)
+anything past that. It otherwise holds registrations in memory, backstopped by the persisted
+registry file above.
 
 ## `edenctl`
 
@@ -470,14 +509,32 @@ unset it afterwards.
 
 ## File formats
 
-All of them are plain text, LF-terminated, and safe to hand-edit while the server is stopped.
+The sidecars are plain text, LF-terminated, and safe to hand-edit while the server is stopped.
+`eden_world.model` is the exception: since stage 7.6 a save writes the **binary `EDMB`** format
+described below (the text form is still read, and still written with `--world-format text`).
 `eden_world.model` and `eden_players.txt` are rewritten by the server via a temp file plus
 `rename()`, so an edit made while it is running will be overwritten at the next save.
 
 ### `eden_world.model`
 
-One edited cell per line. The base terrain is generated identically on every client and is not
-stored — only the differences are.
+Only the **differences** from the base terrain are stored: the base is generated identically on
+every client. Two formats exist, and **both load** — the first four bytes decide, so no world
+ever needs a migration step:
+
+| Format | Written by | Read by |
+|---|---|---|
+| `EDMB` (binary, 16³ chunks) | the server's save, since stage 7.6 | the server |
+| text, one cell per line | [`eden_import`](import.md); the server with `--world-format text`; every build before 7.6 | the server |
+
+A world loaded from text is written back as `EDMB` on the first save unless `--world-format text`
+is given. Convert deliberately by starting the server on the world and asking the control socket
+to `save`.
+
+⚠️ `wc -l eden_world.model` is the cell count **only for a text world**. For an `EDMB` world use
+the `[Server] Loaded N world cells` line the server prints at startup — that is also the number
+`--max-world-cells` has to sit above (see [Limits](#limits)).
+
+#### The text format
 
 ```
 x:y:z:type:color
@@ -487,7 +544,7 @@ x:y:z:type:color
 |---|---|---|
 | `x`, `z` | `0 .. 16777215` | Horizontal position, centred on 65536. |
 | `y` | `0 .. 255` | Height. |
-| `type` | `0`, `1..254`, `255` | `0` = air (mined). `1..254` = a placed block of that type. `255` = a natural block that was only painted. |
+| `type` | `0`, `1..253`, `255` | `0` = air (mined). `1..253` = a placed block of that type. `255` = a natural block that was only painted. `254` is reserved (see the `EDMB` section below) and loads as mined air with a warning. |
 | `color` | `0 .. 54` | Paint index; `0` = unpainted. |
 
 A line with fewer than four fields is skipped; a missing fifth field is read as `0`. Fields are
@@ -499,6 +556,33 @@ order — do not expect a stable diff between saves.
 65521:31:65552:0:0      # mined cell (air) near the origin
 65544:34:65558:2:0      # block type 2 placed
 ```
+
+#### The `EDMB` binary format
+
+```
+["EDMB"][u32 version = 1][u64 chunkCount]
+  per chunk: [i32 cx][i32 cy][i32 cz][u32 cellCount]
+             cellCount x ( [u16 localIdx][u8 type][u8 color] )
+```
+
+All integers little-endian and packed. A chunk is 16×16×16 blocks at
+`(cx*16, cy*16, cz*16)`; `localIdx` is `(ly << 8) | (lz << 4) | lx` inside it. Only cells that
+carry an edit are listed — a cell the file does not mention is untouched base terrain, and a
+listed cell with `type == 0` was **explicitly mined** (it renders as air even where the base
+terrain has a block). `type` and `color` mean exactly what they mean in the text format, with one
+reservation: **block type 254 is reserved** by the server's in-memory cell encoding
+(`world_store.h`), so it cannot be stored. The server refuses to be the source of one (`ACTION`
+caps block types at 127), `eden_import` refuses to write one, and a world that somehow contains
+one loads that cell as mined air with a counted warning.
+
+Chunks are written in ascending coordinate order and cells in ascending `localIdx`, so a save is
+byte-deterministic for a given world — unlike the text format, which is written in hash order.
+The file is roughly **4–5 bytes per cell** against the text format's ~19, which is what makes
+`--max-world-cells` affordable to raise on a small host.
+
+A truncated or corrupt `EDMB` file loads as far as it parses and warns loudly rather than
+starting with an empty world; stop the server before it saves over the file if you want to keep
+the original.
 
 ### `eden_players.txt`
 

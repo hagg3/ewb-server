@@ -43,10 +43,13 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>   // TCP_NODELAY — disables Nagle on client sockets (stage 7.11)
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <unistd.h>
+#include <poll.h>
+#include <fcntl.h>
 #include <cstring>
 #include <cerrno>
 #include <csignal>
@@ -80,6 +83,8 @@
 #include "hardening.h"      // names, token buckets, ACTION validation   (stage 1.7)
 #include "control.h"        // Tier 1 operator control socket             (stage 3.2)
 #include "worldedit.h"      // Tier 2 player command surface              (stage 3.3)
+#include "explode.h"        // TNT/paint explosion chain, bounded fan-out (stage 7.7)
+#include "world_store.h"    // 16^3 chunk store + EDMB format + text load (stage 7.6)
 
 typedef int SOCKET;
 constexpr SOCKET INVALID_SOCKET = -1;
@@ -101,7 +106,23 @@ struct PlayerInfo {
 std::vector<SOCKET> clients;
 std::map<SOCKET, PlayerInfo> playerInfoMap;
 std::mutex clientsMutex;
-bool serverRunning = true;
+std::atomic<bool> serverRunning{true};
+
+// SIGTERM/SIGINT (systemctl stop, docker stop, Ctrl-C) default to killing the
+// process outright, which drops everything since the last 15s autosave tick.
+// The handler below only sets serverRunning=false and wakes the accept loop's
+// poll() via a self-pipe (write() is async-signal-safe; accept() itself is not
+// interruptible in a portable way once poll() has already returned). The actual
+// save + drain + exit runs on the main thread, never inside the handler.
+static int g_wakePipe[2] = {-1, -1};
+static void handleShutdownSignal(int) {
+    serverRunning = false;
+    if (g_wakePipe[1] >= 0) {
+        const char b = 0;
+        ssize_t ignored = write(g_wakePipe[1], &b, 1);
+        (void)ignored;
+    }
+}
 SOCKET listenSocket = INVALID_SOCKET;
 
 // --- Authoritative world state ---
@@ -111,6 +132,11 @@ SOCKET listenSocket = INVALID_SOCKET;
 // map. New players are sent the whole log when they join; live edits are relayed.
 // --- Configuration (set from command-line flags in main) ---
 std::string g_worldFile  = "eden_world.model";  // world model (block deltas)
+// Which format saveWorld() writes (stage 7.6). Loading always accepts both — the
+// magic bytes decide — so this only exists for an operator who wants a grep-able
+// world or to hand the file back to a pre-7.6 build. Text costs ~5x the disk and
+// holds the world lock for the whole serialise; EDMB is the default for a reason.
+bool        g_saveText   = false;               // --world-format text
 std::string g_serverName = "Eden Server";       // shown in the matchmaker list
 std::string g_password   = "";                  // empty = open server
 std::string g_matchHost  = "";                  // matchmaker host; empty = don't register
@@ -128,6 +154,7 @@ bool        g_haveWorldSpawn = false;            // a default spawn point is con
 ewb::Spawn  g_worldSpawn;                        // the default spawn handed to a player with no saved position
 bool        g_legacySnapshot = false;            // push the ACTION dump on JOIN (--legacy-snapshot)
 int         g_connectLimit = 10;                 // connects per IP per window; 0 = off (--connect-limit)
+bool        g_tcpNodelay = true;                 // disable Nagle on client sockets; --tcp-nodelay 0 to keep it
 
 // --- Connection-lifecycle hardening (stage 1.10) ---
 int         g_authFailLimit    = 5;   // wrong-password attempts per IP per minute before an escalating lockout; 0 = off (--auth-fail-limit)
@@ -176,6 +203,25 @@ std::atomic<uint64_t> g_rgnRefused{0};      // regions refused for output backpr
 std::atomic<uint64_t> g_rgnPendingRecs{0};  // records queued for encoding, across all clients
 std::atomic<uint64_t> g_slowDrops{0};       // clients disconnected for not draining (7.3)
 
+// Lock-hold instrumentation (stage 7.6 step 1). The counters above measure *work*
+// (cells, records, bytes); these measure the thing that actually makes a busy
+// server feel slow — how long `g_worldMtx` is unavailable to everyone else. Every
+// `ACTION` needs that lock, so a REGION scan or a save snapshot holding it is a
+// stall for every other player. Reported by the `region-stats` control verb.
+std::atomic<uint64_t> g_rgnLockMicros{0};   // total time serveRegion() held g_worldMtx
+std::atomic<uint64_t> g_rgnLockMaxMicros{0};// worst single serveRegion() hold
+std::atomic<uint64_t> g_saveCount{0};       // saveWorld() calls that actually wrote
+std::atomic<uint64_t> g_saveLockMicros{0};  // total time saveWorld() held g_worldMtx
+std::atomic<uint64_t> g_saveLockMaxMicros{0};
+std::atomic<uint64_t> g_saveWriteMicros{0}; // total time in the out-of-lock disk write
+std::atomic<uint64_t> g_saveBytes{0};       // bytes the last save wrote
+
+/// `max = std::max(max, v)`, for the atomics above.
+static inline void bumpMax(std::atomic<uint64_t>& m, uint64_t v) {
+    uint64_t cur = m.load(std::memory_order_relaxed);
+    while (v > cur && !m.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
+}
+
 // Safety limits (hardening for public hosting).
 static const int    SV_WORLD_HEIGHT   = 256;       // must match the game's T_HEIGHT
 static const size_t SV_MAX_WORLD_CELLS_DEFAULT = 4000000;   // default edited-cell ceiling
@@ -219,6 +265,31 @@ static const double SV_SIGNP_RATE  = 1.0;
 static double SV_ACTION_BURST     = 1024.0;
 static double SV_ACTION_RATE      = 512.0;  // tokens/second (0 = unlimited)
 static const double SV_ACTION_COST_BURN = 64.0;
+
+// Per-connection movement budget (stage 7.14). POS/VEL/POSVEL are the highest-
+// frequency verbs on the wire and, like ACTION, fan out to every other peer, but
+// unlike ACTION they had no limiter at all — a scripted flood costs the server a
+// parse plus an (N-1)-way broadcast per packet with nothing in the way. The
+// private capture notes (see CAPTURE-FINDINGS.md, cited in docs/protocol.md) put
+// the retail client's observed movement rate at ~3-4 Hz (POSVEL only; it does not
+// send bare POS/VEL). This budget is not meant to pace a real player — it exists
+// only to cap a scripted flood — so it sits an order of magnitude above that
+// observed rate, with a burst large enough to absorb a client catching up after a
+// lag spike (several queued updates arriving back-to-back) without dropping any
+// of them. --move-rate / --move-burst (0 = unlimited) let an operator retune it.
+static double SV_MOVE_BURST        = 80.0;
+static double SV_MOVE_RATE         = 40.0;   // tokens/second (0 = unlimited)
+
+// Per-connection chat budget (stage 7.14). Unlike movement, chat floods are a
+// plain griefing vector (every line is relayed verbatim to every peer) and a
+// human typist has nowhere near the cadence a script does, so this bucket is
+// tight: a handful of lines in a row (burst) is normal after a pause to type,
+// but a sustained rate faster than "a few lines per 10 seconds" is not a human.
+// Unlike movement, an over-budget chat line is not silently dropped: the sender
+// is told they are being throttled (see MSG dispatch), so a real player who
+// trips it understands what happened. --chat-rate / --chat-burst (0 = unlimited).
+static double SV_CHAT_BURST        = 5.0;
+static double SV_CHAT_RATE         = 0.5;   // tokens/second (0 = unlimited) == 1 line/2s sustained
 
 // Per-IP connect pacing. SV_MAX_CLIENTS bounds concurrency but not churn — a
 // connect flood still spawns a thread per attempt. The default 10 in 10 s allows a
@@ -283,8 +354,14 @@ std::string detectLanIP() {
 //   1..254   = a placed block of that type
 // This lets the server keep an accurate picture of the landscape and hand a
 // correct snapshot to any joiner, regardless of the order edits arrived in.
-struct Cell { unsigned char type; unsigned char color; };
-static std::unordered_map<uint64_t, Cell> g_world;
+//
+// Stage 7.6: the model behind this is `ewb::WorldStore` — a map of 16^3 chunks,
+// not a cell-per-entry hash map. Everything below still speaks in **logical**
+// cells (`type 0` = mined air, `255` = painted base), because the store maps its
+// in-array "explicitly mined" sentinel back to 0 on every read; see the invariant
+// table at the top of world_store.h. Nothing in this file may see a 254.
+using Cell = ewb::WorldCell;
+static ewb::WorldStore g_world;
 static std::mutex g_worldMtx;        // lock order: before g_signMtx, never after it (see Signs)
 static std::mutex g_saveMtx;         // serializes on-disk writes (world + players)
 std::atomic<bool> editsDirty{false};
@@ -305,6 +382,9 @@ static_assert((int)ewb::MAX_PAINT_INDEX == (int)ewb::CELL_MAX_PAINT,
 static_assert(ewb::MAX_BLOCK_TYPE < SV_PAINTED_BASE,
               "a placeable block type must never collide with the painted-base sentinel");
 static_assert(ewb::SIGN_Y_MAX + 1 == SV_WORLD_HEIGHT, "sign y range must match the world height");
+static_assert(ewb::WS_WORLD_HEIGHT == SV_WORLD_HEIGHT,
+              "world_store.h's chunk-store Y bound must match the world height, or a box query "
+              "could silently miss chunks above WS_MAX_CY");
 
 static inline uint64_t wkey(int x,int y,int z){
     return (((uint64_t)(uint32_t)x & 0xFFFFFFull) << 40)
@@ -331,7 +411,7 @@ static bool worldSet(int x,int y,int z,int type,int color){
     // Cap the number of distinct edited cells so a malicious/buggy client can't
     // grow the map (and the on-disk save) without bound. Updates to existing
     // cells are always allowed; only brand-new cells are refused past the cap.
-    if(g_world.find(k)==g_world.end() && g_world.size()>=g_maxWorldCells){
+    if(!g_world.contains(x,y,z) && g_world.size()>=g_maxWorldCells){
         // ⚠️ From the player's seat this is silent data loss: their client has
         // already drawn the block. This used to log once per process, and on the
         // first public server that one line scrolled away while every new block
@@ -349,62 +429,34 @@ static bool worldSet(int x,int y,int z,int type,int color){
         }
         return false;
     }
-    g_world[k] = { (unsigned char)type, (unsigned char)color };
+    g_world.set(x, y, z, (unsigned char)type, (unsigned char)color);
     editsDirty = true;
     // A sign hangs on a block; a block that is now air has no face left to hang one on.
     if(type==SV_AIR) removeSignsOnBlock(k);
     return true;
 }
 static bool worldGet(int x,int y,int z, Cell& out){
-    auto it = g_world.find(wkey(x,y,z));
-    if(it==g_world.end()) return false;
-    out = it->second; return true;
+    return g_world.get(x, y, z, out);
 }
 
-// Simulate a TNT / paint explosion centred on (x,y,z) — mirrors Terrain::explode:
-// a spherical radius; color!=0 paints the sphere, color==0 destroys it. TNT hit by
-// the blast chains. Caller holds g_worldMtx. Cells the cap refuses are added to
-// `refused`.
-static void simExplode(int cx,int cy,int cz,int depth, size_t& refused){
-    if(depth>6) return;                        // guard runaway chains
-    Cell center; bool haveCenter = worldGet(cx,cy,cz,center);
-    int color = haveCenter ? center.color : 0;
-    bool painting = (color != 0);
-    if(!worldSet(cx,cy,cz, SV_AIR, 0)) ++refused;   // the TNT itself is consumed by its own blast
-    struct P3{int x,y,z;};
-    std::vector<P3> chain;
-    const int R = SV_EXPLOSION_RADIUS;
-    for(int i=1;i<=R;i++){
-        int yy=R-i;
-        for(int j=cx-R;j<=cx+R;j++) for(int k=cz-R;k<=cz+R;k++){
-            int ox=j-cx, oz=k-cz;
-            if(ox*ox+oz*oz+yy*yy > R*R) continue;
-            int ys[2]={cy-yy, cy+yy};
-            for(int s=0;s<2;s++){
-                int sy=ys[s];
-                if(sy<0||sy>=1024) continue;
-                Cell c; bool have=worldGet(j,sy,k,c);
-                if(painting){
-                    if(have){
-                        if(c.type==SV_AIR) continue;
-                        if(c.type==SV_TNT && c.color==0) continue;
-                        worldSet(j,sy,k, c.type, color);             // existing cell: never refused
-                    }else{
-                        if(!worldSet(j,sy,k, SV_PAINTED_BASE, color)) ++refused;   // paint a base block
-                    }
-                }else{
-                    if(have){
-                        if(c.type==SV_AIR) continue;
-                        if(c.type==SV_TNT || c.type==SV_FIREWORK) chain.push_back({j,sy,k});
-                        else if(c.type!=SV_BEDROCK && c.type!=SV_STEEL) worldSet(j,sy,k, SV_AIR, 0);
-                    }else{
-                        if(!worldSet(j,sy,k, SV_AIR, 0)) ++refused;  // destroy a base block
-                    }
-                }
-            }
-        }
-    }
-    for(const P3& t: chain) simExplode(t.x,t.y,t.z, depth+1, refused);
+// Simulate a TNT / paint explosion centred on (x,y,z). The algorithm itself
+// (worklist, chain cap, depth guard — ROADMAP-SERVER 7.7) lives in explode.h so
+// it can be unit-tested offline; this just wires it to g_world. Caller holds
+// g_worldMtx. Cells the cap refuses, and chain links dropped once
+// ewb::EXPLODE_MAX_CHAIN explosions have been processed, are added to `refused`.
+static void simExplode(int cx,int cy,int cz, size_t& refused){
+    ewb::ExplodeWorld w;
+    w.get = [](int x,int y,int z, ewb::ExplodeCell& out) -> bool {
+        Cell c; if(!worldGet(x,y,z,c)) return false;
+        out.type = c.type; out.color = c.color; return true;
+    };
+    w.set = [](int x,int y,int z,int type,int color) -> bool {
+        return worldSet(x,y,z,type,color);
+    };
+    w.airType = SV_AIR; w.tntType = SV_TNT; w.fireworkType = SV_FIREWORK;
+    w.bedrockType = SV_BEDROCK; w.steelType = SV_STEEL; w.paintedBaseType = SV_PAINTED_BASE;
+    w.yMin = 0; w.yMax = 1024;
+    refused += ewb::simExplode(w, cx, cy, cz);
 }
 
 // Apply one terrain action to the model. mode: 0 build 1 mine 2 burn 3 paint.
@@ -419,33 +471,77 @@ static size_t simAction(int mode,int x,int y,int z,int extra){
                   if(!worldSet(x,y,z, have? c.type : SV_PAINTED_BASE, extra)) ++refused;
                   break; }
         case 2: { Cell c; bool have=worldGet(x,y,z,c);            // BURN
-                  if(have && (c.type==SV_TNT || c.type==SV_FIREWORK)) simExplode(x,y,z,0,refused);
+                  if(have && (c.type==SV_TNT || c.type==SV_FIREWORK)) simExplode(x,y,z,refused);
                   else if(have && c.type!=SV_AIR) worldSet(x,y,z, SV_AIR, 0);
                   break; }
     }
     return refused;
 }
 
+// Read the world file. **Both formats load** (stage 7.6): the first four bytes
+// decide. `EDMB` is the binary chunk format saveWorld() writes; anything else is
+// the legacy `x:y:z:type:color` text this server shipped with, and which
+// `eden_import` still writes — so no world needs a migration step, and a world
+// saved by an older build keeps working. The format is *not* sticky: unless
+// --world-format text says otherwise, the next save writes EDMB.
 void loadWorld() {
-    std::ifstream f(g_worldFile);
+    std::ifstream f(g_worldFile, std::ios::binary);
     if (!f) return;
-    std::string line;
+    std::string blob((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     std::lock_guard<std::mutex> lock(g_worldMtx);
-    while (std::getline(f, line)) {
-        if (line.empty()) continue;
-        int v[5]={0,0,0,0,0}, n=0; std::stringstream ss(line); std::string p;
-        while (n<5 && std::getline(ss,p,':')) v[n++]=atoi(p.c_str());
-        if (n>=4) g_world[wkey(v[0],v[1],v[2])] = { (unsigned char)v[3], (unsigned char)v[4] };
+    const bool binary = ewb::WorldStore::is_edmb(blob.data(), blob.size());
+    if (binary) {
+        std::string err;
+        if (!g_world.load_edmb(blob.data(), blob.size(), err)) {
+            std::cerr << "[Server] WARNING: " << g_worldFile << " is a damaged EDMB world ("
+                      << err << "); loaded " << g_world.size()
+                      << " cell(s) before the damage. Saving will overwrite it — stop the"
+                         " server now if you want to keep the file." << std::endl;
+        }
+    } else {
+        std::istringstream in(blob);
+        ewb::world_load_text(in, g_world);
     }
-    std::cout << "[Server] Loaded " << g_world.size() << " world cells from " << g_worldFile << std::endl;
+    // world_store.h reserves in-array type 254 for "explicitly mined"; a block of
+    // literal type 254 cannot be produced by this server (ACTION caps types at
+    // MAX_BLOCK_TYPE, painted base is 255) but could in principle sit in an old
+    // hand-made file. Say so rather than changing it silently.
+    if (g_world.reserved_coerced())
+        std::cerr << "[Server] warning: " << g_world.reserved_coerced()
+                  << " cell(s) in " << g_worldFile << " used the reserved block type 254"
+                     " and were loaded as mined air (see world_store.h)." << std::endl;
+    std::cout << "[Server] Loaded " << g_world.size() << " world cells from " << g_worldFile
+              << " (" << (binary ? "EDMB" : "legacy text") << ", " << g_world.chunk_count()
+              << " chunks)" << std::endl;
 }
 
 void saveWorld() {
-    std::unordered_map<uint64_t,Cell> snap;
+    // The snapshot under the lock is a **serialised blob**, not a copy of the
+    // model (stage 7.6). Before, this copied the whole cell map — 1.2 s under
+    // g_worldMtx on a 13.9M-cell world, which is 1.2 s in which nobody's ACTION
+    // lands. Serialising straight to EDMB is both faster and ~4 bytes/cell
+    // instead of a ~19-byte text line.
+    std::string blob;
+    size_t cells = 0;
+    const auto tSave0 = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(g_worldMtx);
         if (!editsDirty.exchange(false)) return;   // nothing changed
-        snap = g_world;
+        cells = g_world.size();
+        blob.reserve(g_saveText ? cells * 20 : cells * 4 + g_world.chunk_count() * 16 + 16);
+        if (g_saveText) g_world.for_each([&](int x,int y,int z,unsigned char t,unsigned char c){
+            char line[64];
+            blob.append(line, (size_t)snprintf(line, sizeof line, "%d:%d:%d:%d:%d\n",
+                                               x, y, z, (int)t, (int)c));
+        });
+        else blob = g_world.to_edmb();
+    }
+    const auto tSave1 = std::chrono::steady_clock::now();
+    {   // stage 7.6 step 1: the snapshot's lock hold, which every ACTION waits on.
+        const uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                                tSave1 - tSave0).count();
+        g_saveLockMicros.fetch_add(us, std::memory_order_relaxed);
+        bumpMax(g_saveLockMaxMicros, us);
     }
     // Atomic, serialized write: fill a temp file then rename() over the real one,
     // so a crash/kill mid-write can never leave a truncated world, and two
@@ -453,21 +549,25 @@ void saveWorld() {
     std::lock_guard<std::mutex> save(g_saveMtx);
     std::string tmp = g_worldFile + ".tmp";
     {
-        std::ofstream f(tmp, std::ios::trunc);
+        std::ofstream f(tmp, std::ios::trunc | std::ios::binary);
         if(!f){ std::cerr << "[Server] save: cannot open " << tmp << std::endl; editsDirty = true; return; }
-        for (const auto& kv : snap) {
-            int x,y,z; wunkey(kv.first,x,y,z);
-            f << x << ":" << y << ":" << z << ":" << (int)kv.second.type << ":" << (int)kv.second.color << "\n";
-        }
+        f.write(blob.data(), (std::streamsize)blob.size());
         f.flush();
         if(!f){ std::cerr << "[Server] save: write error to " << tmp << std::endl; editsDirty = true; return; }
+        g_saveBytes.store((uint64_t)blob.size(), std::memory_order_relaxed);
     }
     if(std::rename(tmp.c_str(), g_worldFile.c_str()) != 0){
         std::cerr << "[Server] save: rename " << tmp << " -> " << g_worldFile << " failed" << std::endl;
         editsDirty = true; return;
     }
-    std::cout << "[Server] Saved world (" << snap.size() << " cells, cap " << g_maxWorldCells
-              << ")." << std::endl;
+    const uint64_t writeUs = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::steady_clock::now() - tSave1).count();
+    g_saveCount.fetch_add(1, std::memory_order_relaxed);
+    g_saveWriteMicros.fetch_add(writeUs, std::memory_order_relaxed);
+    std::cout << "[Server] Saved world (" << cells << " cells, cap " << g_maxWorldCells
+              << ", " << g_saveBytes.load(std::memory_order_relaxed) << " B, snapshot "
+              << (std::chrono::duration_cast<std::chrono::microseconds>(tSave1 - tSave0).count() / 1000)
+              << " ms under lock, write " << (writeUs / 1000) << " ms)." << std::endl;
 }
 
 // --- Player position persistence ----------------------------------------------
@@ -475,7 +575,9 @@ void saveWorld() {
 struct SavedPos { float x, y, z; };
 static std::map<std::string, SavedPos> g_playerPos;
 static std::mutex g_posMtx;
-static std::string g_posFile = "eden_players.txt";
+// Empty means "derive from --world's directory" (stage 7.15); --players-file
+// overrides outright. Resolved once in main() before loadPlayerPos() runs.
+static std::string g_posFile = "";
 static std::atomic<bool> g_posDirty{false};
 
 void loadPlayerPos() {
@@ -836,8 +938,11 @@ static size_t pruneOrphanSigns() {
         std::lock_guard<std::mutex> wl(g_worldMtx);   // lock order: world, then signs
         std::lock_guard<std::mutex> sl(g_signMtx);
         ewb::prune_signs(g_signs, [](const ewb::Sign& s) {
-            const auto it = g_world.find(wkey(s.x, s.y, s.z));
-            return it != g_world.end() && it->second.type == SV_AIR;
+            // "present *and* air" — an absent cell is untouched base terrain and
+            // still holds its sign. The chunk store keeps that distinction
+            // (stage 7.6): a mined cell reads back as logical type 0.
+            Cell c;
+            return g_world.get(s.x, s.y, s.z, c) && c.type == SV_AIR;
         }, &dropped);
         if (!dropped.empty()) signsChangedLocked();
     }
@@ -860,10 +965,16 @@ static size_t pruneOrphanSigns() {
 // Wire (Eden dev, WORKING/matchmakerinfo.txt; own matchmaker in edenmatch.cpp):
 //   -> REGISTER:<name>:<port>:<hasPassword>[:<advertiseIP>]
 //   <- REGISTERED
-//   -> PING          every ~20s — a bare no-op that just resets the TTL (~45s).
-// The heartbeat carries no player count: the dev's PING is argument-less. (A
-// count channel would be a separate message; edenmatch tolerates `PING:<n>` but
-// nothing documented consumes it.)
+//   -> PING:<n>      every ~20s, comfortably inside the ~45s TTL. `n` is the
+//                    count channel (production matchmaker source, 2026-09-12
+//                    community drop; see WORKING/latestref-analysis-2026-09-12.md
+//                    §2 — supersedes the earlier "PING is argument-less" reading
+//                    of the lossy dev paste in WORKING/matchmakerinfo.txt).
+static int joinedPlayerCount() {
+    std::lock_guard<std::mutex> lock(clientsMutex);
+    return static_cast<int>(playerInfoMap.size());
+}
+
 void matchmakerThread() {
     while (serverRunning) {
         int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -895,10 +1006,12 @@ void matchmakerThread() {
                           << " as \"" << g_serverName << "\"" << (g_password.empty() ? "" : " [locked]")
                           << std::endl;
 
-                // Heartbeat: bare PING every ~20s, comfortably inside the ~45s TTL.
+                // Send a count immediately so a fresh server doesn't advertise a
+                // stale/zero row for up to 20s until the first heartbeat, then
+                // repeat every ~20s, comfortably inside the ~45s TTL.
                 while (serverRunning) {
-                    const char ping[] = "PING\n";
-                    if (send(s, ping, sizeof(ping) - 1, 0) <= 0) break;
+                    std::string ping = "PING:" + std::to_string(joinedPlayerCount()) + "\n";
+                    if (send(s, ping.c_str(), ping.size(), 0) <= 0) break;
                     for (int i = 0; i < 20 && serverRunning; i++)
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                 }
@@ -1047,6 +1160,23 @@ static void pushWorld(const std::shared_ptr<ClientOut>& o, std::string blob) {
     o->cv.notify_one();
 }
 
+// Same contract as pushWorld(), for a blob one broadcast is handing to several
+// clients (stage 7.13's broadcastWorld fix): the caller builds the shared_ptr
+// once and every target's queue takes a refcount bump instead of its own copy
+// of the whole blob.
+static void pushWorld(const std::shared_ptr<ClientOut>& o,
+                       const std::shared_ptr<const std::string>& blob) {
+    if (!o || !blob || blob->empty()) return;
+    bool over;
+    {
+        std::lock_guard<std::mutex> lk(o->m);
+        if (o->closing || o->dead || o->tooSlow) return;
+        over = !o->q.push_world(blob);
+    }
+    if (over) { dropTooSlow(o); return; }
+    o->cv.notify_one();
+}
+
 // The answer to a request the client made and can make again: the SIGNQ burst.
 // False means refuse the request — the client re-asks, and nothing about the world
 // is lost. (The legacy snapshot is *not* one of these: it is unsolicited, so it
@@ -1093,6 +1223,24 @@ static void flushOut(const std::shared_ptr<ClientOut>& o, int ms) {
     std::unique_lock<std::mutex> lk(o->m);
     o->drained.wait_for(lk, std::chrono::milliseconds(ms),
                         [&] { return o->dead || (o->q.idle() && !o->writing); });
+}
+
+// The one clean-stop path: signal handler wake, idle-timeout self-stop, and the
+// control socket's `stop` all funnel through this. Saves the world/positions/
+// signs, gives every connected client's writer up to SV_CLOSE_DRAIN_SEC to empty
+// its queue, then exits immediately — `_exit`, not `exit`, so a shutdown racing
+// other live threads (writer threads, the matchmaker thread) never runs static
+// destructors out from under them (7.9's "idle-timeout std::exit" finding).
+static void shutdownAndExit() {
+    serverRunning = false;
+    saveWorld();
+    savePlayerPos();
+    saveSigns();
+    for (const auto& o : outSnapshot(INVALID_SOCKET))
+        flushOut(o, SV_CLOSE_DRAIN_SEC * 1000);
+    std::cout << "[Server] Shutting down." << std::endl;
+    std::cout.flush();
+    _exit(0);
 }
 
 // Give this client's log lines their player name once JOIN has one.
@@ -1176,6 +1324,11 @@ static void clientWriter(std::shared_ptr<ClientOut> o) {
 
         const auto t0 = std::chrono::steady_clock::now();
         std::string bytes;
+        // `buf` is what actually gets written: `bytes` for Frame/Bytes items, or
+        // the shared blob directly for SharedBytes — stage 7.13, so a broadcast
+        // blob shared across clients (`broadcastWorld`) is never copied at all,
+        // not even here on the drain side.
+        const std::string* buf = &bytes;
         if (item.kind == ewb::OutItem::Kind::Frame) {
             if (item.first) {
                 jobFrames = jobRecords = jobBytes = 0;
@@ -1197,12 +1350,15 @@ static void clientWriter(std::shared_ptr<ClientOut> o) {
                 o->drained.notify_all();
                 continue;
             }
+        } else if (item.kind == ewb::OutItem::Kind::SharedBytes) {
+            buf = item.shared_bytes.get();
+            if (!buf) buf = &bytes;   // defensive; push_world never queues a null/empty shared blob
         } else {
             bytes = std::move(item.bytes);
         }
         const auto t1 = std::chrono::steady_clock::now();
 
-        const bool ok = writeAll(*o, bytes, lastProgress, leaving);
+        const bool ok = writeAll(*o, *buf, lastProgress, leaving);
 
         if (item.kind == ewb::OutItem::Kind::Frame) {
             ++jobFrames;
@@ -1219,16 +1375,18 @@ static void clientWriter(std::shared_ptr<ClientOut> o) {
                                          std::chrono::steady_clock::now() - jobStart).count();
                 std::string who;
                 { std::lock_guard<std::mutex> lk(o->m); who = o->name; }
-                std::cout << "[Server] REGION drain " << who << ": " << jobFrames << " frame(s), "
+                std::ostringstream drainLine;   // one flush instead of several (stage 7.12)
+                drainLine << "[Server] REGION drain " << who << ": " << jobFrames << " frame(s), "
                           << jobRecords << " records, " << jobBytes << " B wire, encode "
-                          << (jobEncodeUs / 1000) << " ms, drain " << drainMs << " ms" << std::endl;
+                          << (jobEncodeUs / 1000) << " ms, drain " << drainMs << " ms";
+                std::cout << drainLine.str() << std::endl;
             }
         }
 
         {
             std::lock_guard<std::mutex> lk(o->m);
             o->writing = false;
-            o->sentBytes += bytes.size();
+            o->sentBytes += buf->size();
             if (!ok) o->dead = true;
         }
         o->drained.notify_all();
@@ -1323,9 +1481,8 @@ void sendWorldSnapshot(SOCKET clientSocket) {
         cells = g_world.size();
         blob.reserve(cells * 48);   // ~one to three lines per cell
         char line[96];
-        for (const auto& kv : g_world) {
-            int x,y,z; wunkey(kv.first,x,y,z);
-            const Cell& c = kv.second;
+        g_world.for_each([&](int x, int y, int z, unsigned char type, unsigned char color) {
+            const Cell c{type, color};
             // "server" sender so the client never mistakes these for its own echoes.
             if (c.type == SV_AIR) {
                 blob.append(line, snprintf(line, sizeof(line), "ACTION:server:0:%d:%d:%d:1\n", x,y,z));                 // mine
@@ -1343,7 +1500,7 @@ void sendWorldSnapshot(SOCKET clientSocket) {
                 if (c.color != 0 && c.color <= ewb::CELL_MAX_PAINT)
                     blob.append(line, snprintf(line, sizeof(line), "ACTION:server:0:%d:%d:%d:3:%d\n", x,y,z,(int)c.color)); // then paint
             }
-        }
+        });
     }
     // pushWorld, not pushReply: this is an unsolicited push of world state that the
     // client has no way to ask for again, and it is the whole world in one blob —
@@ -1434,10 +1591,13 @@ static void serveSigns(SOCKET clientSocket, const std::string& who, BurstLimiter
 // `net/region.rs` etiquette rules exist to avoid triggering, and reproducing it
 // would make every other player's edits queue behind one player's walk.
 //
-// The scan itself is a filtered pass over the whole `unordered_map` (no spatial
-// index). At the 4M-cell cap that is a few tens of ms — already far better than the
-// ~1 s/region observed on the real server. Only add a chunk index if the log line
-// below says the scan actually exceeds ~100 ms on a realistic world.
+// ⚠️ **The scan is chunk-indexed** (stage 7.6). It used to be a filtered pass over
+// the whole cell map, which measured ~80 ms of lock hold per region on a
+// 13.9M-cell world — every other player's ACTION queued behind it, 256 times a
+// session per client. `world_store.h` keeps the model as 16^3 chunks, so this now
+// touches only the chunks the box covers. `region-stats` reports the lock hold;
+// if it ever climbs again, the next lever is emitting records per chunk instead of
+// into one vector.
 //
 // ⚠️ **This function no longer sends anything** (stage 7.3). It scans, sorts, and
 // hands the record vector to the client's writer thread, which encodes one frame
@@ -1480,19 +1640,32 @@ static void serveRegion(SOCKET clientSocket, const std::string& who, int cx, int
     const ewb::RegionBox box = ewb::region_box(cx, cz, g_regionRadius);
 
     std::vector<ewb::SnapRec> recs;
-    size_t scanned = 0, inBox = 0;
+    size_t scanned = 0, inBox = 0, worldCells = 0;
+    ewb::WorldStore::BoxScan scan;
+    clock::time_point tLock0;
     const auto t0 = clock::now();
     {
         std::lock_guard<std::mutex> lock(g_worldMtx);
-        scanned = g_world.size();
-        for (const auto& kv : g_world) {
-            int x, y, z; wunkey(kv.first, x, y, z);
-            if (!box.contains(x, z)) continue;
-            ++inBox;
-            ewb::emit_cell_records(x, y, z, kv.second.type, kv.second.color, recs);
-        }
+        tLock0 = clock::now();   // stage 7.6: hold, not wait-plus-hold
+        worldCells = g_world.size();
+        // Stage 7.6: only the chunks whose x/z footprint meets the box. This used
+        // to walk every cell in the world and filter — on a 13.9M-cell world that
+        // was a 13.9M-iteration scan under the lock every ACTION needs, per
+        // region, up to SV_MAX_REGIONS_PER_SESSION times a session.
+        scan = g_world.for_each_in_box(box.x0, box.x1, box.z0, box.z1,
+                                       [&](int x, int y, int z, unsigned char t, unsigned char c) {
+            ewb::emit_cell_records(x, y, z, t, c, recs);
+        });
+        scanned = scan.cells_visited;
+        inBox   = scan.cells_emitted;
     }   // <-- lock released here; nothing below re-takes it.
     const auto t1 = clock::now();
+    {   // stage 7.6 step 1: how long every other player's ACTION waited on us.
+        const uint64_t lockUs =
+            (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - tLock0).count();
+        g_rgnLockMicros.fetch_add(lockUs, std::memory_order_relaxed);
+        bumpMax(g_rgnLockMaxMicros, lockUs);
+    }
 
     if (g_regionSort) ewb::sort_records(recs);
     const auto t2 = clock::now();
@@ -1520,10 +1693,12 @@ static void serveRegion(SOCKET clientSocket, const std::string& who, int cx, int
     const bool overGlobal  = g_regionPending && pending > g_regionPending;
     if (overGlobal || !pushRegion(outFor(clientSocket), std::move(job))) {
         g_rgnRefused.fetch_add(1, std::memory_order_relaxed);
-        std::cerr << "[Server] REGION #" << lim.served << " " << who << " refused: "
-                  << (overGlobal ? "server region backlog" : "this client's region queue")
-                  << " is full (" << records << " records, " << pending
-                  << " pending server-wide). They will re-ask." << std::endl;
+        std::ostringstream refusedLine;   // one flush instead of several (stage 7.12)
+        refusedLine << "[Server] REGION #" << lim.served << " " << who << " refused: "
+                    << (overGlobal ? "server region backlog" : "this client's region queue")
+                    << " is full (" << records << " records, " << pending
+                    << " pending server-wide). They will re-ask.";
+        std::cerr << refusedLine.str() << std::endl;
         return;
     }
 
@@ -1543,11 +1718,19 @@ static void serveRegion(SOCKET clientSocket, const std::string& who, int cx, int
         (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t2 - t0).count(),
         std::memory_order_relaxed);
 
-    std::cout << "[Server] REGION #" << lim.served << " " << who << " (" << cx << "," << cz
-              << ") box x[" << box.x0 << ".." << box.x1 << "] z[" << box.z0 << ".." << box.z1
-              << "]: " << inBox << "/" << scanned << " cells -> " << records << " records, "
-              << frames << " frame(s) queued, scan " << scanMs << " ms, sort " << sortMs
-              << " ms" << std::endl;
+    // `unitbuf` (main(), for live logs under journald) flushes on every `<<`, so
+    // composing into one string first turns this from 30 write() syscalls into
+    // one (stage 7.12) with identical output and identical liveness.
+    std::ostringstream regionLine;
+    regionLine << "[Server] REGION #" << lim.served << " " << who << " (" << cx << "," << cz
+               << ") box x[" << box.x0 << ".." << box.x1 << "] z[" << box.z0 << ".." << box.z1
+               << "]: " << inBox << " cells from " << scan.chunks_visited << "/"
+               << scan.chunks_total << " chunks (" << scanned << " slots, world "
+               << worldCells << " cells) -> " << records << " records, "
+               << frames << " frame(s) queued, scan " << scanMs << " ms (lock held "
+               << (std::chrono::duration_cast<std::chrono::microseconds>(t1 - tLock0).count() / 1000)
+               << " ms), sort " << sortMs << " ms";
+    std::cout << regionLine.str() << std::endl;
 }
 
 // Relay a latency-sensitive line — movement, chat, a [Server] notice — to every
@@ -1572,7 +1755,12 @@ void broadcastMessage(const std::string& message, SOCKET senderSocket) {
 void broadcastWorld(const std::string& blob, SOCKET senderSocket) {
     if (blob.empty()) return;
     const auto targets = outSnapshot(senderSocket);
-    for (const auto& o : targets) pushWorld(o, blob);
+    if (targets.empty()) return;
+    // Stage 7.13: one copy into the shared blob, then every target's enqueue is a
+    // refcount bump instead of a copy of the whole thing — this used to copy
+    // `blob` once per client (megabytes x N for a `//set` burst).
+    const auto shared = std::make_shared<const std::string>(blob);
+    for (const auto& o : targets) pushWorld(o, shared);
 }
 
 void removeClient(SOCKET clientSocket) {
@@ -1582,12 +1770,28 @@ void removeClient(SOCKET clientSocket) {
 }
 
 // Parse message with format "PREFIX:data1:data2:..."
+//
+// Stage 7.13: this used to build a std::stringstream and getline() out of it,
+// which every inbound line pays for (POSVEL, by far the highest-frequency verb,
+// most of all). std::getline(ss, part, ':') has one edge case a naive substr
+// split has to reproduce deliberately, not by accident: it does NOT emit a
+// trailing empty field after a trailing delimiter (getline hits EOF with nothing
+// left to extract and just stops), but it DOES emit empty fields everywhere else
+// (leading colon, consecutive colons). Hence the loop below stops as soon as
+// `start` reaches the end of the string instead of always pushing one more
+// field. Equivalence against the old stringstream implementation is checked in
+// protocol_test.cpp ("parseMessage: hand-rolled split matches std::getline").
 std::vector<std::string> parseMessage(const std::string& message) {
     std::vector<std::string> parts;
-    std::stringstream ss(message);
-    std::string part;
-    while (std::getline(ss, part, ':')) {
-        parts.push_back(part);
+    size_t start = 0;
+    while (start < message.size()) {
+        const size_t colon = message.find(':', start);
+        if (colon == std::string::npos) {
+            parts.push_back(message.substr(start));
+            break;
+        }
+        parts.push_back(message.substr(start, colon - start));
+        start = colon + 1;
     }
     return parts;
 }
@@ -1952,12 +2156,26 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
         std::ostringstream ss;
         ss << "REGION service since start:\n"
            << "  requests served : " << reqs << "\n"
-           << "  cells scanned   : " << g_rgnCellsScanned.load(std::memory_order_relaxed) << "\n"
+           << "  slots scanned   : " << g_rgnCellsScanned.load(std::memory_order_relaxed)
+                                     << "  (chunk slots visited, not the whole world — stage 7.6)\n"
            << "  records emitted : " << g_rgnRecords.load(std::memory_order_relaxed) << "\n"
            << "  bytes out       : " << g_rgnBytesOut.load(std::memory_order_relaxed) << "\n"
            << "  total time      : " << (us / 1000) << " ms  (scan + sort; encode and"
                                         " drain are the writer's)\n"
            << "  mean per region : " << (reqs ? (double)us / reqs / 1000.0 : 0.0) << " ms\n"
+           << "world lock held (stage 7.6 — what every other player's ACTION waits on):\n"
+           << "  REGION scans    : " << (g_rgnLockMicros.load(std::memory_order_relaxed) / 1000)
+                                     << " ms total, mean "
+                                     << (reqs ? (double)g_rgnLockMicros.load(std::memory_order_relaxed) / reqs / 1000.0 : 0.0)
+                                     << " ms, worst "
+                                     << (g_rgnLockMaxMicros.load(std::memory_order_relaxed) / 1000.0) << " ms\n"
+           << "  world saves     : " << g_saveCount.load(std::memory_order_relaxed) << " write(s), snapshot "
+                                     << (g_saveLockMicros.load(std::memory_order_relaxed) / 1000)
+                                     << " ms under lock (worst "
+                                     << (g_saveLockMaxMicros.load(std::memory_order_relaxed) / 1000.0)
+                                     << " ms), disk "
+                                     << (g_saveWriteMicros.load(std::memory_order_relaxed) / 1000)
+                                     << " ms, last file " << g_saveBytes.load(std::memory_order_relaxed) << " B\n"
            << "backpressure since start (stage 7.3):\n"
            << "  regions refused : " << g_rgnRefused.load(std::memory_order_relaxed)
                                      << "  (client queue full or server backlog)\n"
@@ -2040,12 +2258,9 @@ static void handleControlClient(int fd) {
     close(fd);
     g_ctlConns.fetch_sub(1, std::memory_order_relaxed);
     if (stopServer) {
-        saveWorld();
-        savePlayerPos();
-        saveSigns();
         if (!g_controlSocket.empty()) unlink(g_controlSocket.c_str());
         std::cout << "Server terminated (control: stop)." << std::endl;
-        std::exit(0);
+        shutdownAndExit();
     }
 }
 
@@ -2836,10 +3051,18 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
     BurstLimiter signLimiter;     // ...and SIGNQ pacing
     ewb::TokenBucket actionBucket(SV_ACTION_BURST, SV_ACTION_RATE);   // stage 1.7
     bool actionWarned = false;    // log the first refusal per connection, not each one
+    ewb::TokenBucket moveBucket(SV_MOVE_BURST, SV_MOVE_RATE);   // stage 7.14: POS/VEL/POSVEL
+    bool moveWarned = false;      // log the first refusal per connection, not each one
+    ewb::TokenBucket chatBucket(SV_CHAT_BURST, SV_CHAT_RATE);   // stage 7.14: MSG
+    ewb::TokenBucket chatThrottleNotice(1.0, 1.0 / 10.0);   // tell the player, but <= 1 per 10 s
     WeSession we;                 // Tier 2 selection / clipboard / undo (stage 3.3)
     ewb::TokenBucket signWriteBucket(SV_SIGNP_BURST, SV_SIGNP_RATE);   // player SIGNP writes
     bool signWarned = false;      // log the first sign-write refusal, not each one
     ewb::TokenBucket capNotice(1.0, 1.0 / 30.0);   // "world is full" to this player, <= 1 per 30 s
+    // "Invalid POS/VEL/POSVEL/ACTION message" were unconditional and per-malformed-
+    // packet, so a garbage-packet flood was an unthrottled journal flood too
+    // (stage 7.12). Same shape as capNotice: <= 1 line per 30 s per connection.
+    ewb::TokenBucket invalidMsgNotice(1.0, 1.0 / 30.0);
 
     // Client->server messages are newline-framed: accumulate bytes and process
     // one complete '\n'-terminated line at a time. This makes parsing robust to
@@ -2894,12 +3117,282 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
             auto parts = parseMessage(message);
             if (parts.empty()) continue;
 
-            std::string command = parts[0];
+            const std::string& command = parts[0];
 
+            // POSVEL:px:py:pz:vx:vy:vz
+            // Dispatch order below is frequency-tuned (stage 7.13: POSVEL is by far
+            // the most frequent verb on the wire, then POS/VEL/ACTION/MSG) — do not
+            // "tidy" it back into protocol/alphabetical order.
+            if (command == "POSVEL" && parts.size() >= 7) {
+                // Movement budget (stage 7.14): sized far above a real client's
+                // observed rate, so a refusal here means a scripted flood, not a
+                // laggy player. Dropped silently — see SV_MOVE_RATE above.
+                if (SV_MOVE_RATE > 0.0 && !moveBucket.allow(monoSeconds())) {
+                    if (!moveWarned) {
+                        std::cerr << "[Server] " << username
+                                  << " exceeded the movement rate limit; dropping updates."
+                                  << std::endl;
+                        moveWarned = true;
+                    }
+                    continue;
+                }
+                try {
+                    float px = std::stof(parts[1]), py = std::stof(parts[2]), pz = std::stof(parts[3]);
+                    float vx = std::stof(parts[4]), vy = std::stof(parts[5]), vz = std::stof(parts[6]);
+                    {
+                        std::lock_guard<std::mutex> lock(clientsMutex);
+                        if (playerInfoMap.count(clientSocket)) {
+                            auto& info = playerInfoMap[clientSocket];
+                            info.posX = px; info.posY = py; info.posZ = pz;
+                            info.velX = vx; info.velY = vy; info.velZ = vz;
+                        }
+                    }
+                    rememberPos(username, px, py, pz);
+                    std::string broadcastMsg = "POSVEL:" + username + ":" + std::to_string(characterType) + ":" +
+                                               parts[1] + ":" + parts[2] + ":" + parts[3] + ":" +
+                                               parts[4] + ":" + parts[5] + ":" + parts[6] + "\n";
+                    broadcastMessage(broadcastMsg, clientSocket);
+                } catch (...) {
+                    if (invalidMsgNotice.allow(monoSeconds()))
+                        std::cout << "[Server] Invalid POSVEL message from " << username << std::endl;
+                }
+            }
+            // POS:x:y:z
+            else if (command == "POS" && parts.size() >= 4) {
+                if (SV_MOVE_RATE > 0.0 && !moveBucket.allow(monoSeconds())) {
+                    if (!moveWarned) {
+                        std::cerr << "[Server] " << username
+                                  << " exceeded the movement rate limit; dropping updates."
+                                  << std::endl;
+                        moveWarned = true;
+                    }
+                    continue;
+                }
+                try {
+                    float px = std::stof(parts[1]);
+                    float py = std::stof(parts[2]);
+                    float pz = std::stof(parts[3]);
+                    {
+                        std::lock_guard<std::mutex> lock(clientsMutex);
+                        if (playerInfoMap.count(clientSocket)) {
+                            playerInfoMap[clientSocket].posX = px;
+                            playerInfoMap[clientSocket].posY = py;
+                            playerInfoMap[clientSocket].posZ = pz;
+                        }
+                    }
+                    rememberPos(username, px, py, pz);
+                    std::string broadcastMsg = "POS:" + username + ":" + std::to_string(characterType) + ":" +
+                                               parts[1] + ":" + parts[2] + ":" + parts[3] + "\n";
+                    broadcastMessage(broadcastMsg, clientSocket);
+                } catch (...) {
+                    if (invalidMsgNotice.allow(monoSeconds()))
+                        std::cout << "[Server] Invalid POS message from " << username << std::endl;
+                }
+            }
+            // VEL:x:y:z
+            else if (command == "VEL" && parts.size() >= 4) {
+                if (SV_MOVE_RATE > 0.0 && !moveBucket.allow(monoSeconds())) {
+                    if (!moveWarned) {
+                        std::cerr << "[Server] " << username
+                                  << " exceeded the movement rate limit; dropping updates."
+                                  << std::endl;
+                        moveWarned = true;
+                    }
+                    continue;
+                }
+                try {
+                    float vx = std::stof(parts[1]);
+                    float vy = std::stof(parts[2]);
+                    float vz = std::stof(parts[3]);
+                    {
+                        std::lock_guard<std::mutex> lock(clientsMutex);
+                        if (playerInfoMap.count(clientSocket)) {
+                            playerInfoMap[clientSocket].velX = vx;
+                            playerInfoMap[clientSocket].velY = vy;
+                            playerInfoMap[clientSocket].velZ = vz;
+                        }
+                    }
+                    std::string broadcastMsg = "VEL:" + username + ":" + std::to_string(characterType) + ":" +
+                                               parts[1] + ":" + parts[2] + ":" + parts[3] + "\n";
+                    broadcastMessage(broadcastMsg, clientSocket);
+                } catch (...) {
+                    if (invalidMsgNotice.allow(monoSeconds()))
+                        std::cout << "[Server] Invalid VEL message from " << username << std::endl;
+                }
+            }
+            // ACTION:x:y:z:mode[:typeOrColor]   mode 0=build 1=mine 2=burn 3=paint
+            else if (command == "ACTION" && parts.size() >= 5) {
+                try {
+                    int x = std::stoi(parts[1]);
+                    int y = std::stoi(parts[2]);
+                    int z = std::stoi(parts[3]);
+                    int mode = std::stoi(parts[4]);
+
+                    // Reject out-of-range coordinates so a malformed/malicious
+                    // client can't corrupt the model or grow it without bound.
+                    // y is a hard world height; x/z are the 24-bit key range.
+                    if(y < 0 || y >= SV_WORLD_HEIGHT ||
+                       x < 0 || z < 0 || x > 0xFFFFFF || z > 0xFFFFFF){
+                        if(g_verbose) std::cout << "[Server] rejected out-of-range ACTION ("
+                                                << x << "," << y << "," << z << ") from "
+                                                << username << std::endl;
+                        continue;
+                    }
+
+                    // Validate the payload *at ingest* (stage 1.7). Nothing checked
+                    // this before, so any byte could land in Cell::type/Cell::color,
+                    // be persisted, and be broadcast verbatim to every peer.
+                    // `emit_cell_records` guards the SNAPZ wire; this guards the
+                    // model and the relay. In particular a paint of 255 would put the
+                    // painted-base sentinel's own value into Cell::color.
+                    const int rawExtra = (parts.size() >= 6) ? std::stoi(parts[5]) : 0;
+                    if (!ewb::action_extra_valid(mode, rawExtra)) {
+                        if (g_verbose) std::cout << "[Server] rejected ACTION mode " << mode
+                                                 << " extra " << rawExtra << " from "
+                                                 << username << std::endl;
+                        continue;
+                    }
+
+                    // Per-connection edit budget. A refused edit is dropped, not
+                    // queued and not fatal — a laggy burst from a real player should
+                    // cost them a block, not their session.
+                    const double cost = (mode == 2) ? SV_ACTION_COST_BURN : 1.0;
+                    if (SV_ACTION_RATE > 0.0 && !actionBucket.allow(monoSeconds(), cost)) {
+                        if (!actionWarned) {
+                            std::cerr << "[Server] " << username
+                                      << " exceeded the ACTION rate limit; dropping edits."
+                                      << std::endl;
+                            actionWarned = true;
+                        }
+                        continue;
+                    }
+
+                    std::string broadcastMsg;
+                    std::string editSuffix;   // "x:y:z:mode[:extra]" relayed to peers
+                    std::string coords = std::to_string(x) + ":" + std::to_string(y) + ":" + std::to_string(z);
+                    std::string who = username + ":" + std::to_string(characterType);
+                    int extra = 0;            // block type (build) / color (paint)
+                    // ⚠️ The peer-relay shape `ACTION:<user>:<type>:x:y:z:mode[:extra]`
+                    // is **unconfirmed**: every capture to date was single-client, so
+                    // no relay has ever been observed. The `server`-sender form
+                    // (`ACTION:server:0:...`) is separately corroborated by the modded
+                    // server. A two-client session (stage 1.8 rung 5) settles this.
+                    switch (mode) {
+                        case 0: { // BUILD
+                            extra = rawExtra;
+                            editSuffix   = coords + ":0:" + std::to_string(extra);
+                            broadcastMsg = "ACTION:" + who + ":" + editSuffix + "\n";
+                            if(g_verbose) std::cout << "[" << username << "] BUILD at (" << x << "," << y << "," << z << ") type=" << extra << std::endl;
+                            break;
+                        }
+                        case 1: { // MINE
+                            editSuffix   = coords + ":1";
+                            broadcastMsg = "ACTION:" + who + ":" + editSuffix + "\n";
+                            if(g_verbose) std::cout << "[" << username << "] MINE at (" << x << "," << y << "," << z << ")" << std::endl;
+                            break;
+                        }
+                        case 2: { // BURN
+                            editSuffix   = coords + ":2";
+                            broadcastMsg = "ACTION:" + who + ":" + editSuffix + "\n";
+                            if(g_verbose) std::cout << "[" << username << "] BURN at (" << x << "," << y << "," << z << ")" << std::endl;
+                            break;
+                        }
+                        case 3: { // PAINT
+                            extra = rawExtra;
+                            editSuffix   = coords + ":3:" + std::to_string(extra);
+                            broadcastMsg = "ACTION:" + who + ":" + editSuffix + "\n";
+                            if(g_verbose) std::cout << "[" << username << "] PAINT at (" << x << "," << y << "," << z << ") color=" << extra << std::endl;
+                            break;
+                        }
+                        default:
+                            std::cout << "[" << username << "] Unknown action mode: " << mode << std::endl;
+                            continue;
+                    }
+                    // Simulate the action into the authoritative world model so the
+                    // server always has an accurate picture (handles TNT/paint
+                    // explosions and burning too).
+                    const size_t refused = simAction(mode, x, y, z, extra);
+                    // A mine or a blast that took a sign's block took the sign. The client
+                    // sends nothing for the sign itself (LIVE-FINDINGS 2026-09-11).
+                    drainSignRemovals();
+                    if (refused && mode != 2) {
+                        // The world is at its cell cap and this edit did not land.
+                        // Keep it off the peers — they would draw a block no REGION
+                        // will ever send back — and tell the player, whose client
+                        // has already drawn it. Otherwise the first anyone hears of
+                        // it is the build being gone on their next join.
+                        if (mode == 0) {
+                            // Take the block back out of the sender's world. The cell
+                            // was absent from the model, so as far as the server knows
+                            // it is untouched terrain, and a client only builds into
+                            // air. ⚠️ The `ACTION:server:0` shape the command relay uses.
+                            std::string undo;
+                            emitEditWire(undo, x, y, z, SV_AIR, 0);
+                            sendWorldTo(clientSocket, undo);
+                        }
+                        if (capNotice.allow(monoSeconds()))
+                            weSay(clientSocket, "This world is full, so that edit was not saved."
+                                                " Please tell the server operator.");
+                        continue;
+                    }
+                    // Relay the ORIGINAL action to everyone EXCEPT the sender (who
+                    // already applied it locally). Peers re-simulate it themselves;
+                    // the model above is what late joiners are snapshotted from.
+                    broadcastWorld(broadcastMsg, clientSocket);
+                    // A burn is relayed even when part of its blast was refused:
+                    // every client simulates the explosion itself regardless.
+                    if (refused && capNotice.allow(monoSeconds()))
+                        weSay(clientSocket, "This world is full, so part of that explosion was"
+                                            " not saved. Please tell the server operator.");
+                } catch (...) {
+                    if (invalidMsgNotice.allow(monoSeconds()))
+                        std::cout << "[Server] Invalid ACTION message from " << username << std::endl;
+                }
+            }
+            // MSG:text
+            //
+            // ⚠️ There is deliberately **no "exit"/"quit" kill-switch** here (stage
+            // 1.6). The reference server disconnected anyone who typed either word
+            // in chat — a player discussing quitting got kicked for it. Closing the
+            // game is how you disconnect; nothing replaces it.
+            else if (command == "MSG" && parts.size() >= 2) {
+                // Bound the line and strip control bytes: chat is relayed verbatim
+                // to every peer, and the username charset rule (which stops `]` from
+                // forging `[name (Tn)]` structure) is only half the guard.
+                std::string msgContent = ewb::sanitize_text(message.substr(4), SV_MAX_CHAT);
+                if (msgContent.empty()) continue;
+
+                // A '/'-prefixed line is a Tier 2 command, not chat (stage 3.3).
+                // It is answered on this socket and never relayed: broadcasting
+                // it would leak one player's `/msg` text — and their command
+                // history — to the whole server. WorldEdit's own `cells`/`cmds`
+                // buckets (stage 3.3) already pace commands, so the chat budget
+                // below applies only to actual broadcast chat, not commands.
+                if (msgContent[0] == '/') {
+                    if (!joined) continue;
+                    if (!g_weEnabled) { weSay(clientSocket, "Commands are disabled on this server."); continue; }
+                    handleWorldEditLine(clientSocket, username, msgContent, we, regionLimiter);
+                    continue;
+                }
+
+                // Chat budget (stage 7.14): unlike movement, an over-budget line is a
+                // griefing vector, not a lag artifact, so it is told to the sender
+                // rather than silently eaten (the notice is itself rate-limited, so
+                // a spammer can't turn the notice into its own flood).
+                if (SV_CHAT_RATE > 0.0 && !chatBucket.allow(monoSeconds())) {
+                    if (chatThrottleNotice.allow(monoSeconds()))
+                        weSay(clientSocket, "You're sending chat too fast; that message was dropped.");
+                    continue;
+                }
+
+                std::string broadcastMsg = "[" + username + " (T" + std::to_string(characterType) + ")] " + msgContent + "\n";
+                std::cout << broadcastMsg;
+                broadcastMessage(broadcastMsg, clientSocket);
+            }
             // JOIN:username:characterType[:password[:clientTag]]
             // The native client sends five fields (`JOIN:Player6835:17:EDEN6:zr`);
             // `clientTag` is a constant `zr` we neither require nor interpret.
-            if (command == "JOIN" && parts.size() >= 3) {
+            else if (command == "JOIN" && parts.size() >= 3) {
                 // One JOIN per connection. A second one would let a client rename
                 // itself past the duplicate check below and out from under whatever
                 // its first name is rate-limited or logged as.
@@ -3044,227 +3537,6 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                 std::cout << joinMsg;
                 broadcastMessage(joinMsg, clientSocket);
             }
-            // MSG:text
-            //
-            // ⚠️ There is deliberately **no "exit"/"quit" kill-switch** here (stage
-            // 1.6). The reference server disconnected anyone who typed either word
-            // in chat — a player discussing quitting got kicked for it. Closing the
-            // game is how you disconnect; nothing replaces it.
-            else if (command == "MSG" && parts.size() >= 2) {
-                // Bound the line and strip control bytes: chat is relayed verbatim
-                // to every peer, and the username charset rule (which stops `]` from
-                // forging `[name (Tn)]` structure) is only half the guard.
-                std::string msgContent = ewb::sanitize_text(message.substr(4), SV_MAX_CHAT);
-                if (msgContent.empty()) continue;
-
-                // A '/'-prefixed line is a Tier 2 command, not chat (stage 3.3).
-                // It is answered on this socket and never relayed: broadcasting
-                // it would leak one player's `/msg` text — and their command
-                // history — to the whole server.
-                if (msgContent[0] == '/') {
-                    if (!joined) continue;
-                    if (!g_weEnabled) { weSay(clientSocket, "Commands are disabled on this server."); continue; }
-                    handleWorldEditLine(clientSocket, username, msgContent, we, regionLimiter);
-                    continue;
-                }
-
-                std::string broadcastMsg = "[" + username + " (T" + std::to_string(characterType) + ")] " + msgContent + "\n";
-                std::cout << broadcastMsg;
-                broadcastMessage(broadcastMsg, clientSocket);
-            }
-            // ACTION:x:y:z:mode[:typeOrColor]   mode 0=build 1=mine 2=burn 3=paint
-            else if (command == "ACTION" && parts.size() >= 5) {
-                try {
-                    int x = std::stoi(parts[1]);
-                    int y = std::stoi(parts[2]);
-                    int z = std::stoi(parts[3]);
-                    int mode = std::stoi(parts[4]);
-
-                    // Reject out-of-range coordinates so a malformed/malicious
-                    // client can't corrupt the model or grow it without bound.
-                    // y is a hard world height; x/z are the 24-bit key range.
-                    if(y < 0 || y >= SV_WORLD_HEIGHT ||
-                       x < 0 || z < 0 || x > 0xFFFFFF || z > 0xFFFFFF){
-                        if(g_verbose) std::cout << "[Server] rejected out-of-range ACTION ("
-                                                << x << "," << y << "," << z << ") from "
-                                                << username << std::endl;
-                        continue;
-                    }
-
-                    // Validate the payload *at ingest* (stage 1.7). Nothing checked
-                    // this before, so any byte could land in Cell::type/Cell::color,
-                    // be persisted, and be broadcast verbatim to every peer.
-                    // `emit_cell_records` guards the SNAPZ wire; this guards the
-                    // model and the relay. In particular a paint of 255 would put the
-                    // painted-base sentinel's own value into Cell::color.
-                    const int rawExtra = (parts.size() >= 6) ? std::stoi(parts[5]) : 0;
-                    if (!ewb::action_extra_valid(mode, rawExtra)) {
-                        if (g_verbose) std::cout << "[Server] rejected ACTION mode " << mode
-                                                 << " extra " << rawExtra << " from "
-                                                 << username << std::endl;
-                        continue;
-                    }
-
-                    // Per-connection edit budget. A refused edit is dropped, not
-                    // queued and not fatal — a laggy burst from a real player should
-                    // cost them a block, not their session.
-                    const double cost = (mode == 2) ? SV_ACTION_COST_BURN : 1.0;
-                    if (SV_ACTION_RATE > 0.0 && !actionBucket.allow(monoSeconds(), cost)) {
-                        if (!actionWarned) {
-                            std::cerr << "[Server] " << username
-                                      << " exceeded the ACTION rate limit; dropping edits."
-                                      << std::endl;
-                            actionWarned = true;
-                        }
-                        continue;
-                    }
-
-                    std::string broadcastMsg;
-                    std::string editSuffix;   // "x:y:z:mode[:extra]" relayed to peers
-                    std::string coords = std::to_string(x) + ":" + std::to_string(y) + ":" + std::to_string(z);
-                    std::string who = username + ":" + std::to_string(characterType);
-                    int extra = 0;            // block type (build) / color (paint)
-                    // ⚠️ The peer-relay shape `ACTION:<user>:<type>:x:y:z:mode[:extra]`
-                    // is **unconfirmed**: every capture to date was single-client, so
-                    // no relay has ever been observed. The `server`-sender form
-                    // (`ACTION:server:0:...`) is separately corroborated by the modded
-                    // server. A two-client session (stage 1.8 rung 5) settles this.
-                    switch (mode) {
-                        case 0: { // BUILD
-                            extra = rawExtra;
-                            editSuffix   = coords + ":0:" + std::to_string(extra);
-                            broadcastMsg = "ACTION:" + who + ":" + editSuffix + "\n";
-                            if(g_verbose) std::cout << "[" << username << "] BUILD at (" << x << "," << y << "," << z << ") type=" << extra << std::endl;
-                            break;
-                        }
-                        case 1: { // MINE
-                            editSuffix   = coords + ":1";
-                            broadcastMsg = "ACTION:" + who + ":" + editSuffix + "\n";
-                            if(g_verbose) std::cout << "[" << username << "] MINE at (" << x << "," << y << "," << z << ")" << std::endl;
-                            break;
-                        }
-                        case 2: { // BURN
-                            editSuffix   = coords + ":2";
-                            broadcastMsg = "ACTION:" + who + ":" + editSuffix + "\n";
-                            if(g_verbose) std::cout << "[" << username << "] BURN at (" << x << "," << y << "," << z << ")" << std::endl;
-                            break;
-                        }
-                        case 3: { // PAINT
-                            extra = rawExtra;
-                            editSuffix   = coords + ":3:" + std::to_string(extra);
-                            broadcastMsg = "ACTION:" + who + ":" + editSuffix + "\n";
-                            if(g_verbose) std::cout << "[" << username << "] PAINT at (" << x << "," << y << "," << z << ") color=" << extra << std::endl;
-                            break;
-                        }
-                        default:
-                            std::cout << "[" << username << "] Unknown action mode: " << mode << std::endl;
-                            continue;
-                    }
-                    // Simulate the action into the authoritative world model so the
-                    // server always has an accurate picture (handles TNT/paint
-                    // explosions and burning too).
-                    const size_t refused = simAction(mode, x, y, z, extra);
-                    // A mine or a blast that took a sign's block took the sign. The client
-                    // sends nothing for the sign itself (LIVE-FINDINGS 2026-09-11).
-                    drainSignRemovals();
-                    if (refused && mode != 2) {
-                        // The world is at its cell cap and this edit did not land.
-                        // Keep it off the peers — they would draw a block no REGION
-                        // will ever send back — and tell the player, whose client
-                        // has already drawn it. Otherwise the first anyone hears of
-                        // it is the build being gone on their next join.
-                        if (mode == 0) {
-                            // Take the block back out of the sender's world. The cell
-                            // was absent from the model, so as far as the server knows
-                            // it is untouched terrain, and a client only builds into
-                            // air. ⚠️ The `ACTION:server:0` shape the command relay uses.
-                            std::string undo;
-                            emitEditWire(undo, x, y, z, SV_AIR, 0);
-                            sendWorldTo(clientSocket, undo);
-                        }
-                        if (capNotice.allow(monoSeconds()))
-                            weSay(clientSocket, "This world is full, so that edit was not saved."
-                                                " Please tell the server operator.");
-                        continue;
-                    }
-                    // Relay the ORIGINAL action to everyone EXCEPT the sender (who
-                    // already applied it locally). Peers re-simulate it themselves;
-                    // the model above is what late joiners are snapshotted from.
-                    broadcastWorld(broadcastMsg, clientSocket);
-                    // A burn is relayed even when part of its blast was refused:
-                    // every client simulates the explosion itself regardless.
-                    if (refused && capNotice.allow(monoSeconds()))
-                        weSay(clientSocket, "This world is full, so part of that explosion was"
-                                            " not saved. Please tell the server operator.");
-                } catch (...) {
-                    std::cout << "[Server] Invalid ACTION message from " << username << std::endl;
-                }
-            }
-            // POS:x:y:z
-            else if (command == "POS" && parts.size() >= 4) {
-                try {
-                    float px = std::stof(parts[1]);
-                    float py = std::stof(parts[2]);
-                    float pz = std::stof(parts[3]);
-                    {
-                        std::lock_guard<std::mutex> lock(clientsMutex);
-                        if (playerInfoMap.count(clientSocket)) {
-                            playerInfoMap[clientSocket].posX = px;
-                            playerInfoMap[clientSocket].posY = py;
-                            playerInfoMap[clientSocket].posZ = pz;
-                        }
-                    }
-                    rememberPos(username, px, py, pz);
-                    std::string broadcastMsg = "POS:" + username + ":" + std::to_string(characterType) + ":" +
-                                               parts[1] + ":" + parts[2] + ":" + parts[3] + "\n";
-                    broadcastMessage(broadcastMsg, clientSocket);
-                } catch (...) {
-                    std::cout << "[Server] Invalid POS message from " << username << std::endl;
-                }
-            }
-            // VEL:x:y:z
-            else if (command == "VEL" && parts.size() >= 4) {
-                try {
-                    float vx = std::stof(parts[1]);
-                    float vy = std::stof(parts[2]);
-                    float vz = std::stof(parts[3]);
-                    {
-                        std::lock_guard<std::mutex> lock(clientsMutex);
-                        if (playerInfoMap.count(clientSocket)) {
-                            playerInfoMap[clientSocket].velX = vx;
-                            playerInfoMap[clientSocket].velY = vy;
-                            playerInfoMap[clientSocket].velZ = vz;
-                        }
-                    }
-                    std::string broadcastMsg = "VEL:" + username + ":" + std::to_string(characterType) + ":" +
-                                               parts[1] + ":" + parts[2] + ":" + parts[3] + "\n";
-                    broadcastMessage(broadcastMsg, clientSocket);
-                } catch (...) {
-                    std::cout << "[Server] Invalid VEL message from " << username << std::endl;
-                }
-            }
-            // POSVEL:px:py:pz:vx:vy:vz
-            else if (command == "POSVEL" && parts.size() >= 7) {
-                try {
-                    float px = std::stof(parts[1]), py = std::stof(parts[2]), pz = std::stof(parts[3]);
-                    float vx = std::stof(parts[4]), vy = std::stof(parts[5]), vz = std::stof(parts[6]);
-                    {
-                        std::lock_guard<std::mutex> lock(clientsMutex);
-                        if (playerInfoMap.count(clientSocket)) {
-                            auto& info = playerInfoMap[clientSocket];
-                            info.posX = px; info.posY = py; info.posZ = pz;
-                            info.velX = vx; info.velY = vy; info.velZ = vz;
-                        }
-                    }
-                    rememberPos(username, px, py, pz);
-                    std::string broadcastMsg = "POSVEL:" + username + ":" + std::to_string(characterType) + ":" +
-                                               parts[1] + ":" + parts[2] + ":" + parts[3] + ":" +
-                                               parts[4] + ":" + parts[5] + ":" + parts[6] + "\n";
-                    broadcastMessage(broadcastMsg, clientSocket);
-                } catch (...) {
-                    std::cout << "[Server] Invalid POSVEL message from " << username << std::endl;
-                }
-            }
             // REGION:x:z — the client asks for the world around a point; we answer
             // with a SNAPZ burst. See serveRegion().
             else if (command == "REGION" && parts.size() >= 3) {
@@ -3377,11 +3649,13 @@ int main(int argc, char* argv[]) {
 
     // Args: [port] and/or flags:
     //   --port N  --name "My World"  --password PASS  --world FILE  --signs FILE
-    //   --spawn x:y:z  --spawn-file FILE  --max-world-cells N
+    //   --world-format edmb|text   (what a save writes; loading accepts both)
+    //   --spawn x:y:z  --spawn-file FILE  --players-file FILE  --max-world-cells N
     //   --matchmaker HOST[:PORT]
     //   --region-radius N  --no-region-sort  --no-region-empty-frame
     //   --action-rate N  --action-burst N   (0 = unlimited)
-    //   --legacy-snapshot  --connect-limit N
+    //   --move-rate N  --move-burst N   --chat-rate N  --chat-burst N   (0 = unlimited)
+    //   --legacy-snapshot  --connect-limit N  --tcp-nodelay 0|1  (1 = default, disables Nagle)
     //   --auth-fail-limit N  --handshake-timeout N  --idle-timeout-conn N  (0 = off)
     //   --control-rate N  --control-burst N  --control-max-conns N  --audit-file FILE
     // A bare leading number is still accepted as the port (back-compat).
@@ -3392,8 +3666,15 @@ int main(int argc, char* argv[]) {
         else if (a == "--name")       g_serverName = next("Eden Server");
         else if (a == "--password")   g_password   = next("");
         else if (a == "--world")      g_worldFile  = next("eden_world.model");
+        else if (a == "--world-format") {        // stage 7.6: edmb (default) | text
+            const std::string v = next("edmb");
+            if (v == "text") g_saveText = true;
+            else if (v == "edmb") g_saveText = false;
+            else { std::cerr << "[Server] --world-format must be 'edmb' or 'text'" << std::endl; return 1; }
+        }
         else if (a == "--signs")      g_signFile   = next("eden_signs.txt");
         else if (a == "--spawn-file") g_spawnFile  = next("eden_spawn.txt");
+        else if (a == "--players-file") g_posFile  = next("eden_players.txt");
         else if (a == "--spawn") {
             // Inline default spawn; overrides (and skips) eden_spawn.txt.
             const std::string v = next("x:y:z");
@@ -3412,6 +3693,7 @@ int main(int argc, char* argv[]) {
         // bring-up fallback — see sendWorldSnapshot().
         else if (a == "--legacy-snapshot") g_legacySnapshot = true;
         else if (a == "--connect-limit") g_connectLimit = std::atoi(next("10").c_str());
+        else if (a == "--tcp-nodelay") g_tcpNodelay = std::atoi(next("1").c_str()) != 0;
         // Connection-lifecycle hardening (stage 1.10).
         else if (a == "--auth-fail-limit")   g_authFailLimit    = std::atoi(next("5").c_str());
         else if (a == "--handshake-timeout") g_handshakeTimeout = std::atoi(next("15").c_str());
@@ -3462,6 +3744,10 @@ int main(int argc, char* argv[]) {
         else if (a == "--client-write-timeout")  g_writeTimeout  = std::atoi(next("60").c_str());
         else if (a == "--action-rate")  SV_ACTION_RATE  = std::atof(next("512").c_str());
         else if (a == "--action-burst") SV_ACTION_BURST = std::atof(next("1024").c_str());
+        else if (a == "--move-rate")    SV_MOVE_RATE    = std::atof(next("40").c_str());
+        else if (a == "--move-burst")   SV_MOVE_BURST   = std::atof(next("80").c_str());
+        else if (a == "--chat-rate")    SV_CHAT_RATE    = std::atof(next("0.5").c_str());
+        else if (a == "--chat-burst")   SV_CHAT_BURST   = std::atof(next("5").c_str());
         else if (a == "--matchmaker") {
             std::string mm = next("");
             size_t c = mm.find(':');
@@ -3589,6 +3875,26 @@ int main(int argc, char* argv[]) {
                           : g_worldFile.substr(0, slash + 1) + "eden_spawn.txt";
     }
 
+    // Default the player-position file to <worlddir>/eden_players.txt, the same
+    // directory the world/spawn files live in. 5.3 did this for the spawn sidecar
+    // and missed this one, so every world hosted from one cwd shared a single
+    // ./eden_players.txt — a stale row from one world silently teleported a
+    // returning player into an unrelated one (LIVE-FINDINGS 5.4 #6, stage 7.15).
+    // --players-file overrides outright. Otherwise: if a legacy ./eden_players.txt
+    // already exists and the derived path is a different file, keep reading the
+    // legacy one so nobody's saved position vanishes on upgrade.
+    if (g_posFile.empty()) {
+        const size_t slash = g_worldFile.find_last_of('/');
+        g_posFile = (slash == std::string::npos)
+                        ? std::string("eden_players.txt")
+                        : g_worldFile.substr(0, slash + 1) + "eden_players.txt";
+        if (g_posFile != "eden_players.txt") {
+            std::ifstream legacy("eden_players.txt");
+            if (legacy.good()) g_posFile = "eden_players.txt";
+        }
+    }
+    std::cout << "[Server] Player positions: " << g_posFile << std::endl;
+
     // If we're registering with a matchmaker but weren't told which IP to
     // advertise, auto-detect this machine's LAN address so remote devices get a
     // reachable address instead of the matchmaker's view of our peer IP.
@@ -3601,6 +3907,27 @@ int main(int argc, char* argv[]) {
     // SIGPIPE fires when writing to a socket the peer already closed; ignore it
     // so a disconnecting client can't take the whole server down.
     signal(SIGPIPE, SIG_IGN);
+
+    // SIGTERM/SIGINT (systemctl stop, docker stop, Ctrl-C) used to default-terminate
+    // the process, losing everything since the last 15s autosave tick (stage 7.9).
+    // The wake pipe must exist before the handler is installed: a signal delivered
+    // before the accept loop starts polling just leaves its byte buffered there.
+    if (pipe(g_wakePipe) != 0) {
+        std::cerr << "[Server] wake pipe: " << strerror(errno) << std::endl;
+        return 1;
+    }
+    // Non-blocking read end: the drain loop after poll() wakes reads until empty,
+    // and a blocking read() there would hang forever once the one buffered byte
+    // is gone (write() stays blocking — it only ever pushes a single byte).
+    fcntl(g_wakePipe[0], F_SETFL, O_NONBLOCK);
+    {
+        struct sigaction sa{};
+        sa.sa_handler = handleShutdownSignal;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGTERM, &sa, nullptr);
+        sigaction(SIGINT, &sa, nullptr);
+    }
 
     // Load the saved world model + player positions, and periodically persist them.
     loadWorld();
@@ -3654,6 +3981,16 @@ int main(int argc, char* argv[]) {
     else
         std::cout << "[Server] ACTION budget: " << SV_ACTION_RATE << "/s, "
                   << SV_ACTION_BURST << " burst (BURN costs " << SV_ACTION_COST_BURN << ")." << std::endl;
+    if (SV_MOVE_RATE <= 0.0)
+        std::cout << "[Server] --move-rate 0: per-connection movement rate limit disabled." << std::endl;
+    else
+        std::cout << "[Server] Movement budget: " << SV_MOVE_RATE << "/s, "
+                  << SV_MOVE_BURST << " burst (POS/VEL/POSVEL, over-budget dropped silently)." << std::endl;
+    if (SV_CHAT_RATE <= 0.0)
+        std::cout << "[Server] --chat-rate 0: per-connection chat rate limit disabled." << std::endl;
+    else
+        std::cout << "[Server] Chat budget: " << SV_CHAT_RATE << "/s, "
+                  << SV_CHAT_BURST << " burst (over-budget chat is told to the sender)." << std::endl;
 
     // Register with the matchmaker if one was configured.
     if (!g_matchHost.empty()) {
@@ -3705,10 +4042,7 @@ int main(int argc, char* argv[]) {
                     if (idleAccum >= g_idleTimeout) {
                         std::cout << "[Server] Idle for " << idleAccum
                                   << "s with no players; shutting down." << std::endl;
-                        saveWorld();
-                        savePlayerPos();
-                        saveSigns();
-                        std::exit(0);
+                        shutdownAndExit();
                     }
                 } else {
                     idleAccum = 0;
@@ -3752,14 +4086,50 @@ int main(int argc, char* argv[]) {
     int clientIdCounter = 0;
     ewb::ConnectLimiter connectLimiter((size_t)std::max(g_connectLimit, 0), SV_CONNECT_WINDOW_SEC);
     double lastConnectRefusalLog = 0.0;
+    double lastAcceptFailLog = 0.0;
 
     while (serverRunning) {
+        // accept() blocks indefinitely with no client waiting, so a bare
+        // "while (serverRunning) accept(...)" never notices the flag flip on
+        // shutdown. poll() on the listen socket + the signal handler's wake pipe
+        // makes shutdown immediate instead of "whenever the next client connects".
+        pollfd pfds[2] = {
+            { listenSocket, POLLIN, 0 },
+            { g_wakePipe[0], POLLIN, 0 },
+        };
+        const int pr = poll(pfds, 2, -1);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            std::cerr << "[Server] poll failed: " << strerror(errno) << std::endl;
+            break;
+        }
+        if (pfds[1].revents & POLLIN) {
+            char drain[16];
+            while (read(g_wakePipe[0], drain, sizeof(drain)) > 0) {}
+            break;   // serverRunning is already false
+        }
+        if (!(pfds[0].revents & POLLIN)) continue;
+
         sockaddr_in clientAddr{};
         socklen_t clientAddrLen = sizeof(clientAddr);
         SOCKET clientSocket = accept(listenSocket, reinterpret_cast<sockaddr*>(&clientAddr), &clientAddrLen);
 
         if (clientSocket == INVALID_SOCKET) {
-            if (serverRunning) std::cerr << "Accept failed: " << strerror(errno) << std::endl;
+            // EINTR/ECONNABORTED are routine (a signal, or a peer that reset before we
+            // could accept it) and not worth a log line. EMFILE/ENFILE/ENOBUFS/ENOMEM
+            // are resource exhaustion: without a sleep, poll() keeps reporting the
+            // listen socket readable and this becomes a tight 100%-CPU loop that also
+            // floods the log with one line per iteration.
+            if (serverRunning && errno != EINTR && errno != ECONNABORTED) {
+                const double now = monoSeconds();
+                if (now - lastAcceptFailLog >= 1.0) {
+                    std::cerr << "[Server] Accept failed: " << strerror(errno) << std::endl;
+                    lastAcceptFailLog = now;
+                }
+                if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            }
             continue;
         }
 
@@ -3829,6 +4199,15 @@ int main(int argc, char* argv[]) {
         // Detect peers that vanish without a FIN so their thread can exit.
         int ka = 1; setsockopt(clientSocket, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
 
+        // Nagle holds a small write until the previous segment is ACKed; the
+        // writer sends one queue item per send() and the hottest item is a
+        // ~60-byte POSVEL broadcast, so without this every other player's
+        // movement arrives in RTT-quantised jerks (stage 7.11).
+        if (g_tcpNodelay) {
+            int nd = 1;
+            setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
+        }
+
         int clientId = ++clientIdCounter;
         std::cout << "[Server] Client #" << clientId << " connected from " << clientIP << std::endl;
 
@@ -3846,6 +4225,6 @@ int main(int argc, char* argv[]) {
     }
 
     close(listenSocket);
-    std::cout << "Server terminated." << std::endl;
-    return 0;
+    shutdownAndExit();
+    return 0;   // unreachable: shutdownAndExit() calls _exit()
 }

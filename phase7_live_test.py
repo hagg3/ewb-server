@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Live socket test for ROADMAP-SERVER stages 7.3 / 7.4 (per-client output).
+"""Live socket test for ROADMAP-SERVER stages 7.3 / 7.4 / 7.9 (per-client output,
+shutdown behaviour).
 
     ./build_server.sh && python3 phase7_live_test.py [path/to/edenserver]
 
@@ -29,10 +30,14 @@ Covers:
          re-asks) rather than served a partial burst.
   6  7.3 — a client too far behind on *world state* is disconnected (it resyncs on
          rejoin) rather than quietly missing edits, and everyone else carries on.
+  7  7.9 — SIGTERM (systemctl stop / docker stop / Ctrl-C) saves an edit made
+         moments earlier and exits promptly, instead of the old behaviour of
+         dying immediately and only ever persisting up to the last 15 s
+         autosave tick.
 
 Group 1 spends ~35 s deliberately reading at ~50 KB/s; the whole pass is ~1 min.
 """
-import base64, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, zlib
+import base64, os, re, shutil, socket, struct, subprocess, sys, tempfile, threading, time, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "edenserver")
@@ -444,6 +449,73 @@ def group6_world_backlog():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# --- group 7: SIGTERM saves instead of losing the last autosave window --------
+
+def edmb_has_cell(blob, x, y, z, type_, color):
+    """Is (x,y,z) stored as `type_`/`color` in a saved world? (stage 7.6)
+
+    The save format is EDMB — a 16^3 chunk store — since 7.6; a world saved by an
+    older build (or with --world-format text) is still the `x:y:z:type:color`
+    text this checks for as a fallback. See docs/configuration.md.
+    """
+    if not blob.startswith(b"EDMB"):
+        return ("%d:%d:%d:%d:%d" % (x, y, z, type_, color)) in blob.decode("utf-8", "replace")
+    ver, chunks = struct.unpack_from("<IQ", blob, 4)
+    if ver != 1:
+        raise AssertionError("unknown EDMB version %d" % ver)
+    want_chunk = (x >> 4, y >> 4, z >> 4)
+    want_idx = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15)
+    o = 16
+    for _ in range(chunks):
+        cx, cy, cz, n = struct.unpack_from("<iiiI", blob, o)
+        o += 16
+        if (cx, cy, cz) == want_chunk:
+            for _ in range(n):
+                idx, t, col = struct.unpack_from("<HBB", blob, o)
+                o += 4
+                if idx == want_idx:
+                    return t == type_ and col == color
+        else:
+            o += 4 * n
+    return False
+
+
+def group7_sigterm_saves():
+    print("\n[7] 7.9 — SIGTERM saves in-flight edits, not just the last autosave tick")
+    d = tempfile.mkdtemp(prefix="ewb7-")
+    try:
+        open(os.path.join(d, "eden_world.model"), "w").close()
+        open(os.path.join(d, "eden_signs.txt"), "w").close()
+        srv = Server(d)
+        c = join("sigtermer")
+        try:
+            c.recv(256)                                   # the welcome/CAPS burst
+            # An edit with the client still connected and never disconnecting —
+            # only the SIGTERM path, not the per-client disconnect save, can be
+            # what persists this.
+            c.sendall(b"ACTION:65530:34:65530:0:9\n")
+            time.sleep(0.3)
+
+            t0 = time.time()
+            srv.stop()                                    # Server.stop() -> SIGTERM
+            dt = time.time() - t0
+            print("       server exited %.2f s after SIGTERM" % dt)
+            check(dt < 3.0, "shutdown was prompt, not a wait for the next accept()/idle tick")
+            check(not srv.alive(), "the process actually exited")
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+        with open(os.path.join(d, "eden_world.model"), "rb") as f:
+            saved = f.read()
+        check(edmb_has_cell(saved, 65530, 34, 65530, 9, 0),
+              "the in-flight block edit was on disk after SIGTERM, not lost")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     if not os.path.exists(SERVER):
         print("no %s — run ./build_server.sh first" % SERVER)
@@ -467,6 +539,7 @@ def main():
 
     group3_write_timeout()
     group6_world_backlog()
+    group7_sigterm_saves()
 
     print()
     if fails:

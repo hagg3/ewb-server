@@ -1,8 +1,15 @@
 #!/bin/sh
 # edenserverctl — thin management wrapper for the edenserver systemd unit.
 #
-#   edenserverctl start | stop | restart | status [--porcelain] | logs [N]
-#                 | logs-tail [N] | backup
+#   edenserverctl <command> [instance]
+#
+#   Commands:
+#     start | stop | restart | status [--porcelain] | logs [N]
+#     logs-tail [N] | backup
+#
+#   instance:  optional instance name for a template unit (e.g. "myworld" runs
+#              edenserver@myworld instead of edenserver). Omit for the single-world
+#              edenserver unit. See ops/INSTALL.md § Multi-world.
 #
 # It is a convenience layer over `systemctl` and `journalctl -u`, plus a
 # world-file backup. Nothing here does anything you could not do by hand with
@@ -11,23 +18,77 @@
 #
 # Configuration (environment overrides, all optional):
 #   EDENSERVER_SERVICE     systemd unit name          (default: edenserver)
-#   EDENSERVER_WORLD_DIR   world directory to back up  (default: /var/lib/edenserver/world)
+#   EDENSERVER_WORLD_DIR   world directory to back up  (default: /var/lib/edenserver/world,
+#                          or /var/lib/edenserver/worlds/<instance> if instance given)
 #   EDENSERVER_BACKUP_DIR  where backups are written   (default: /var/lib/edenserver/backups)
 #   EDENSERVER_BACKUP_COMPRESS  1 = gzip each file (default), 0 = store plain
 #   EDENSERVER_BACKUP_LEVEL     gzip level 1-9              (default: 6)
 
 set -eu
 
+# Parse command and arguments. Instance (if provided) is the last argument.
+cmd="${1:-}"
+instance=""
+n=200
+
+# Extract instance and command-specific args based on the command type.
+# Instance, if present, is always the last argument provided.
+case "$cmd" in
+    logs|logs-tail)
+        # Can be: logs [N] [instance], where N is numeric and instance is non-numeric
+        if [ -n "${3:-}" ]; then
+            # Three args: command, N, instance
+            n="$2"
+            instance="$3"
+        elif [ -n "${2:-}" ]; then
+            # Two args: command, something
+            if printf '%s' "$2" | grep -qE '^[0-9]+$'; then
+                # It's numeric, so it's N
+                n="$2"
+            else
+                # It's non-numeric, so it's instance
+                n=200
+                instance="$2"
+            fi
+        fi
+        ;;
+    status)
+        # Can be: status [--porcelain] [instance]
+        if [ "${2:-}" = "--porcelain" ]; then
+            # --porcelain flag provided
+            instance="${3:-}"
+        elif [ -n "${2:-}" ]; then
+            # Second arg is instance
+            instance="$2"
+        fi
+        ;;
+    *)
+        # Simple commands: command [instance]
+        instance="${2:-}"
+        ;;
+esac
+
 SERVICE="${EDENSERVER_SERVICE:-edenserver}"
+# If an instance was specified, switch to the template unit form.
+if [ -n "$instance" ]; then
+    SERVICE="edenserver@$instance"
+fi
+
 # EDENSERVER_* is the documented interface. EDEN_WORLD_DIR / EDEN_BACKUP_DIR are
 # the keys used in /etc/edenserver.conf; honouring them as a fallback lets the
 # systemd backup timer point at the active world by sourcing that one file.
-WORLD_DIR="${EDENSERVER_WORLD_DIR:-${EDEN_WORLD_DIR:-/var/lib/edenserver/world}}"
+# When an instance is given, default WORLD_DIR to that instance's directory.
+default_world_dir="/var/lib/edenserver/world"
+if [ -n "$instance" ]; then
+    default_world_dir="/var/lib/edenserver/worlds/$instance"
+fi
+WORLD_DIR="${EDENSERVER_WORLD_DIR:-${EDEN_WORLD_DIR:-$default_world_dir}}"
 BACKUP_DIR="${EDENSERVER_BACKUP_DIR:-${EDEN_BACKUP_DIR:-/var/lib/edenserver/backups}}"
 
-# Backups are gzipped by default. eden_world.model is a plaintext
-# "x:y:z:type:color" line per cell, which deflates to roughly a sixth of its size
-# (a 40 MB world -> ~7 MB), and nothing reads a backup directly, so there is no
+# Backups are gzipped by default. eden_world.model deflates to roughly a sixth of
+# its size as text (a 40 MB world -> ~7 MB); since stage 7.6 a save writes the
+# binary EDMB format, which is ~4x smaller again before gzip. Either way nothing
+# reads a backup directly (the file is copied byte-for-byte), so there is no
 # reason to keep the raw bytes on disk. Level 6 is deliberate: on that same world
 # level 9 buys ~4% more for ~6x the CPU time, which matches the Eden editor's own
 # conclusion for its .bak.zip snapshots. Set COMPRESS=0 for plain copies.
@@ -41,21 +102,28 @@ WORLD_FILES="eden_world.model eden_players.txt eden_signs.txt eden_spawn.txt"
 
 usage() {
     cat <<EOF
-Usage: edenserverctl <command>
+Usage: edenserverctl <command> [instance]
 
-  start            systemctl start $SERVICE
-  stop             systemctl stop $SERVICE
-  restart          systemctl restart $SERVICE
-  status           systemctl status $SERVICE (falls back to is-active)
+Commands (single-world or multi-world with instance name):
+  start            systemctl start \$SERVICE
+  stop             systemctl stop \$SERVICE
+  restart          systemctl restart \$SERVICE
+  status           systemctl status \$SERVICE (falls back to is-active)
   status --porcelain
                    machine-readable Key=Value lines (ActiveState, SubState,
                    MainPID, ExecMainStartTimestamp, Result) — no pager, no follow
-  logs [N]         journalctl -u $SERVICE -n N (default 200), then follow (-f)
-  logs-tail [N]    journalctl -u $SERVICE -n N (default 200), --no-pager, NO -f —
+  logs [N]         journalctl -u \$SERVICE -n N (default 200), then follow (-f)
+  logs-tail [N]    journalctl -u \$SERVICE -n N (default 200), --no-pager, NO -f —
                    the scriptable counterpart to 'logs'
   backup           gzip the world files into a timestamped dir under
-                   $BACKUP_DIR
+                   \$BACKUP_DIR
                    (EDENSERVER_BACKUP_COMPRESS=0 stores them plain)
+
+Examples:
+  edenserverctl start              # start edenserver (single-world)
+  edenserverctl start myworld      # start edenserver@myworld (multi-world instance)
+  edenserverctl logs 100 myworld   # last 100 lines of edenserver@myworld logs
+  edenserverctl backup myworld     # backup /var/lib/edenserver/worlds/myworld
 
 Environment: EDENSERVER_SERVICE, EDENSERVER_WORLD_DIR, EDENSERVER_BACKUP_DIR,
              EDENSERVER_BACKUP_COMPRESS, EDENSERVER_BACKUP_LEVEL
@@ -126,7 +194,6 @@ do_backup() {
     fi
 }
 
-cmd="${1:-}"
 case "$cmd" in
     start)   exec systemctl start   "$SERVICE" ;;
     stop)    exec systemctl stop    "$SERVICE" ;;
@@ -140,11 +207,9 @@ case "$cmd" in
         systemctl status "$SERVICE" --no-pager || systemctl is-active "$SERVICE"
         ;;
     logs)
-        n="${2:-200}"
         exec journalctl -u "$SERVICE" -n "$n" -f
         ;;
     logs-tail)
-        n="${2:-200}"
         exec journalctl -u "$SERVICE" -n "$n" --no-pager
         ;;
     backup)  do_backup ;;

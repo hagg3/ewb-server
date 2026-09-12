@@ -153,12 +153,13 @@ with every cell inside a 29×29-chunk box, and clients re-request regions roughl
 It reports **records**, not cells, because that is what goes on the wire: air is one record, a
 plain solid is one, and a *painted* solid is two (a type record and a colour record).
 
-For reference, the largest reply ever captured from the real Eden server was about 507,000
-records — roughly 3 MB on the wire and 395 ms to encode. `eden_import` warns above that and
-refuses above 2,000,000 (`--max-region-records`, `0` disables it). A dense fill of one box would
-be around 7 million records: 141 MB inflated and several seconds per request, on a path the
-client hits twice a second. That is the failure this number exists to catch, and after the fact
-it looks like a server bug rather than an import choice.
+For reference, the largest reply ever captured from the real Eden server was about 253,671
+records — roughly 0.65 MB on the wire (base64) and ~5.07 MB decompressed. `eden_import` warns
+above that and refuses above 2,000,000 (`--max-region-records`, `0` disables it). A dense fill
+of one box would be around 7 million records: 141 MB inflated and several seconds per request,
+on a path the client hits twice a second. That is the failure this number exists to catch, and
+after the fact it looks like a server bug rather than an import choice. (The original 507,000
+figure was 2× too large due to a capture-logger bug; corrected 2026-09-12.)
 
 ---
 
@@ -166,7 +167,7 @@ it looks like a server bug rather than an import choice.
 
 | Condition | Behaviour |
 |---|---|
-| block type `255` | **hard error.** 255 is the server's internal painted-base sentinel, so such cells would be silently dropped from every `REGION` reply. Game block ids run 0–127, so this should never occur |
+| block type `254` or `255` | **hard error.** Both are reserved by the server's cell encoding — `255` is the painted-base sentinel (such cells would be silently dropped from every `REGION` reply) and `254` is the chunk store's "explicitly mined" sentinel (such cells would load back as air). Game block ids run 0–127, so this should never occur |
 | block type `> 127` | warning; kept verbatim. The client may know blocks this tool does not |
 | paint `> 54` | warning; kept in the model file. The server drops an out-of-palette colour on the wire, so the block renders unpainted |
 | a sign outside the server's coordinate range | dropped and counted |

@@ -239,15 +239,16 @@ static void test_sentinel_and_paint_flags() {
         if (z == 40 && lx == 3 && ly == 4) return {255, 7};    // the sentinel
         if (z == 41 && lx == 3 && ly == 4) return {74, 200};   // paint out of palette
         if (z == 42 && lx == 3 && ly == 4) return {200, 0};    // unknown block id
+        if (z == 43 && lx == 3 && ly == 4) return {254, 0};    // the chunk store's mined sentinel
         return base_profile(z);
     }), 0});
     ImportProjection p = eden_project(load(build_world(w)), ImportOptions{});
-    CHECK(p.sentinel_cells == 1, "type 255 is counted");
+    CHECK(p.sentinel_cells == 2, "type 255 and type 254 are both counted as reserved");
     CHECK(p.sentinel_at[0] == 65539 && p.sentinel_at[1] == 40 && p.sentinel_at[2] == 65540,
           "type 255 reports the first offender in server coords");
     CHECK(p.bad_paint_cells == 1, "paint over 54 is counted");
     CHECK(p.bad_type_cells == 1, "a block id over 127 is counted, not the sentinel again");
-    CHECK(p.cells == 3, "anomalous voxels are still emitted, not silently dropped");
+    CHECK(p.cells == 4, "anomalous voxels are still emitted, not silently dropped");
 }
 
 // ── signs ───────────────────────────────────────────────────────────────────

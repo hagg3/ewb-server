@@ -15,6 +15,10 @@ build system beyond a shell script and no link step beyond `-lz` and `-pthread`.
 server_posix.cpp     The server: sockets, threads, world model, persistence, dispatch.
 snapz_codec.h        Raw DEFLATE + base64 + SNAPZ frame encoding.
 region_query.h       REGION box geometry, Cell -> wire-record table, record ordering, framing.
+world_store.h        The world model: the 16^3 chunk store, the "explicitly mined"
+                     sentinel and its logical-air mapping, the EDMB binary save
+                     format, and the legacy x:y:z:type:color reader kept for
+                     every world shipped before it.
 out_queue.h          Per-client output queue policy: the two queues (latency-sensitive
                      lines vs. the ordered world-state stream), region replies as
                      lazily-encoded jobs, drain order, byte accounting, and the two
@@ -55,6 +59,10 @@ Each header has an offline test binary built and run by `build_server.sh`:
 ```
 snapz_codec_test.cpp   SNAPZ round-trip (deflate/base64/frame).
 region_test.cpp        Region box, cell encoding, frame splitting.
+world_store_test.cpp   The absent / mined / typed invariant, a differential against the hash
+                       map it replaced (cells and SNAPZ records), box scans, EDMB
+                       round-trip + rejections, the legacy text reader, and a real
+                       shipped world through both paths.
 out_queue_test.cpp     The no-split invariant (a queue entry is always a whole line or a
                        whole frame), drain order, world-state FIFO, byte accounting, both
                        overflow policies, region-job admission, a whole region draining to
@@ -233,6 +241,15 @@ sending happen later, on the client's writer thread. Holding the world lock acro
 multi-hundred-millisecond region reply would queue every other player's edits behind one
 player's walk.
 
+**And the scan itself is chunk-indexed** (stage 7.6). It used to walk every cell in the world and
+filter by the reply box, so a big world paid for its whole size on every request — up to
+`SV_MAX_REGIONS_PER_SESSION` = 256 requests per client per session. `WorldStore::for_each_in_box`
+visits only the chunks whose x/z footprint meets the box. On a synthetic 13.9 M-cell world
+(no live host was available to measure on) that moved the per-region lock hold from **80 ms mean /
+92 ms worst to 29 ms / 32 ms**, with the remainder now dominated by emitting the ~1.4 M records
+the box genuinely contains rather than by the scan. `region-stats` reports the lock hold, both for
+`REGION` and for the save snapshot, so this is re-measurable rather than asserted.
+
 Per-connection state that only one thread touches carries no lock at all: the `REGION` and
 `SIGNQ` burst limiters, the `ACTION` token bucket, and the whole player-command session (its
 selection, clipboard, undo history and cell budget) are locals in the client handler. The
@@ -272,22 +289,39 @@ password.
 
 ## World model
 
-The base terrain is deterministic on every client, so the server stores only **edits**: a hash
-map from a packed `(x, y, z)` key to a `Cell { type, color }`.
+The base terrain is deterministic on every client, so the server stores only **edits**. They live
+in `world_store.h`'s `WorldStore`: a map of **16×16×16 chunks**, each a pair of flat
+`type[4096]` / `color[4096]` arrays plus a count of the slots that carry an edit.
 
-| `type` | Meaning |
+| `type` (logical) | Meaning |
 |---|---|
-| `0` | air — the cell was removed |
-| `1..254` | a placed block of that type |
+| `0` | air — the cell was explicitly mined |
+| `1..253` | a placed block of that type |
+| `254` | **reserved** — see the sentinel note below; the store cannot hold one |
 | `255` | a natural (base) block that was only painted |
 
 The `255` painted-base value is **internal and never reaches the wire**; the encoder emits a
 standalone paint record for such a cell. See [protocol.md](protocol.md) for the mapping.
 
-The key packs x and z into 24 bits each and y into 16, which is where the coordinate bounds
-enforced on `ACTION`, `REGION` and sign lines come from. A cap on the number of distinct edited
+**The mined sentinel.** The store has to distinguish three states — *no edit*, *explicitly
+mined*, *a block of type t* — and a dense byte array has no "absent". So inside a chunk array
+the value `0` means **no edit** (a cell nobody has touched, rendered from base terrain), and
+explicitly-mined air is stored as `254` (`ewb::CELL_MINED`). Every accessor maps that back to
+logical `0` on the way out, so `cell.type == SV_AIR` still means air everywhere in the server,
+`region_query.h`'s encoder still emits a `flag 1` air record for it, and neither the wire nor the
+`EDMB` file ever contains a 254. The cost is that literal block type 254 is unusable: `ACTION`
+caps types at 127 and `eden_import` refuses to emit 254 or 255, so nothing can produce one, and a
+file that somehow contains one loads that cell as mined air with a counted warning. The
+equivalence between this store and the hash map it replaced — cells *and* emitted `SNAPZ` records,
+on a real shipped world — is what `world_store_test.cpp` exists to hold down.
+
+A chunk is keyed by `(x>>4, y>>4, z>>4)` of a coordinate packed exactly as the old map's key was:
+x and z into 24 bits each, y into 16 — which is where the coordinate bounds enforced on `ACTION`,
+`REGION` and sign lines come from. A cap on the number of distinct edited
 cells bounds memory and the on-disk file: past the cap, updates to existing cells still apply
-and brand-new cells are refused. `worldSet()` reports each refusal and `simAction()` counts
+and brand-new cells are refused. (Chunked storage is what makes that cap affordable to raise:
+~8 KB per populated chunk and ~4 bytes per cell on disk, against ~19 bytes of text per cell
+before.) `worldSet()` reports each refusal and `simAction()` counts
 them, so the `ACTION` handler can keep a refused edit off the peers and tell the player rather
 than drop it silently ([protocol.md](protocol.md#at-the-world-cell-cap)).
 
@@ -315,18 +349,25 @@ lock is released, so a `fill` over many signed blocks formats the burst once, no
 
 ## Persistence
 
-Plaintext files, all read at startup and all written relative to the process working
-directory (see [configuration.md](configuration.md) for the grammars):
+All read at startup and all written relative to the process working directory (see
+[configuration.md](configuration.md) for the grammars). The sidecars are plain text; the world
+file is binary `EDMB` since stage 7.6, and **both** formats load — `loadWorld()` sniffs the four
+magic bytes and falls back to the legacy `x:y:z:type:color` reader, so every world shipped before
+7.6 (and everything `eden_import` writes) still loads with no migration step:
 
 | File | Written | Notes |
 |---|---|---|
-| `eden_world.model` | autosave, and when a client disconnects | only when the dirty flag is set |
+| `eden_world.model` | autosave, and when a client disconnects | only when the dirty flag is set. Written as `EDMB` (binary chunks) unless `--world-format text`; read as either |
 | `eden_players.txt` | same | last known position per username |
 | `eden_signs.txt` | autosave, disconnect and control `save`/`stop` after a player's sign write or an edit that removed signs with their block; at once on control `signs add`/`rm`, and at startup or `signs reload` when signs on blocks stored as air were dropped | only when the sign list changed |
 | `eden_spawn.txt` | never | read-only; the default spawn for a player with no `eden_players.txt` row. `--spawn`/`--spawn-file` override. Malformed → one warning, ignored |
 
 Writes are **atomic and serialised**: the snapshot is taken under the data lock, written to a
-`.tmp` file, flushed, and `rename()`d over the real file while holding `g_saveMtx`. A crash or
+`.tmp` file, flushed, and `rename()`d over the real file while holding `g_saveMtx`. For the world
+the "snapshot" is the **serialised `EDMB` blob**, not a copy of the model — on that same synthetic
+13.9 M-cell world, copying the old hash map held `g_worldMtx` for 1.24 s per save while
+serialising holds it for 0.18 s, and the write that follows went from 5.8 s / 276 MB of text to
+0.11 s / 56 MB. A crash or
 kill mid-write can therefore never leave a truncated world, and a disconnect-save racing the
 autosave cannot interleave. If any step fails, the dirty flag is set again so the next save
 retries.
@@ -348,7 +389,11 @@ thread. Because that keepalive reap takes ~2 h on a default Linux, the client ha
 `SO_RCVTIMEO` — first to `--handshake-timeout` (a connection that never sends `JOIN` is dropped,
 so it cannot squat a client slot), then, after a successful `JOIN`, to `--idle-timeout-conn`
 (a joined socket that goes fully silent past that ceiling is dropped; the retail client pings
-every 10 s).
+every 10 s). `TCP_NODELAY` is also set on each accepted socket (`--tcp-nodelay 0` to turn it
+off): the writer does one `send()` per queued line and the highest-frequency line is a ~60-byte
+`POSVEL` broadcast, which is exactly the shape Nagle holds back waiting for the previous
+segment's ACK — so without it, movement broadcasts arrive in RTT-quantised bursts instead of
+as each one is sent.
 
 Standard output is unbuffered (`std::unitbuf`) so logs appear live under a service manager
 rather than being held in a pipe buffer.

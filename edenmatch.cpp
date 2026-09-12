@@ -6,14 +6,20 @@
 // only sockets, threads, and the optional on-demand HOST spawn.
 //
 // Build:  part of build_server.sh  (also: c++ -std=c++17 -O2 -pthread edenmatch.cpp -o edenmatch)
-// Run:    ./edenmatch [--port 27020] [--advertise-ip IP] [--short-list] [--verbose]
+// Run:    ./edenmatch [--port 27020] [--advertise-ip IP] [--verbose]
+//         SERVER: row width: default is the 7-field capture grammar; --prod-list emits the
+//                           6-field form, --short-list the 4-field sketch form (see matchmaker.h)
 //         on-demand hosting: --allow-host [--edenserver PATH] [--host-ports LO-HI] [--world DIR]
+//                            [--publicip IP]
+//         registry persistence: --registry-file PATH  (default eden_registry.txt; empty disables)
 //
 // Point a server at it with:  ./edenserver --matchmaker <edenmatch-host>[:27020]
 #include "matchmaker.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -23,6 +29,7 @@
 #include <climits>
 #include <csignal>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -31,17 +38,20 @@ using namespace edenmatch;
 
 static std::atomic<bool>     g_running{true};
 static std::atomic<uint64_t> g_nextConn{1};
-static Registry              g_registry;
+static Registry               g_registry;
+static ConnCaps               g_connCaps;    // stage 2.2: global + per-IP concurrent cap
 
 static int         g_port         = DEFAULT_PORT;
 static std::string g_advertiseIP;                 // global override for the per-peer fallback
-static bool        g_shortList    = false;
+static RowForm     g_rowForm      = RowForm::Capture7;  // SERVER: row width (stage 2.3)
 static bool        g_verbose      = false;
 static bool        g_allowHost    = false;
 static std::string g_edenserver   = "./edenserver";
 static std::string g_worldDir     = ".";
+static std::string g_publicIp;                    // stage 2.4: address to advertise for a HOST spawn
 static int         g_hostPortLo   = 27600;
 static int         g_hostPortHi   = 27699;
+static std::string g_registryFile = "eden_registry.txt";   // stage 2.2; empty disables persistence
 
 static int64_t monoSeconds() {
     using namespace std::chrono;
@@ -92,6 +102,71 @@ static std::string peerAddr(const sockaddr_in& sa) {
     return ip;
 }
 
+// RAII release of a ConnCaps slot acquired by the accept loop, covering every
+// exit path out of handleConn (LIST reply, HOST reply, REGISTER drop, error).
+struct ConnCapGuard {
+    std::string ip;
+    explicit ConnCapGuard(std::string ip_) : ip(std::move(ip_)) {}
+    ~ConnCapGuard() { g_connCaps.release(ip); }
+};
+
+// Is a server still actually there? TCP-connect its advertised address with a
+// short timeout — the injected "is this address reachable" predicate sweep()
+// probes stale entries with before reaping them (stage 2.2, "alive ⇒ listed").
+// Non-blocking connect + poll() so one unreachable/firewalled peer can't stall
+// the sweeper for the OS connect timeout (which can be minutes).
+static bool probeReachable(const std::string& ip, int port) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return false;
+    fcntl(s, F_SETFD, FD_CLOEXEC);
+    int fl = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, fl | O_NONBLOCK);
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) { close(s); return false; }
+
+    bool ok = false;
+    int rc = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    if (rc == 0) {
+        ok = true;
+    } else if (errno == EINPROGRESS) {
+        pollfd pfd{s, POLLOUT, 0};
+        if (poll(&pfd, 1, 2000) > 0 && (pfd.revents & POLLOUT)) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            ok = getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0;
+        }
+    }
+    close(s);
+    return ok;
+}
+
+// Write `content` to `path` via temp file + rename, so a crash mid-write can
+// never leave a truncated registry file (same pattern as the server's
+// world/player saves). Returns false on error.
+static bool writeFileAtomic(const std::string& path, const std::string& content) {
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f) return false;
+        f << content;
+        f.flush();
+        if (!f) return false;
+    }
+    return std::rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+// Persist the live registry to g_registryFile (stage 2.2) so a matchmaker
+// restart reloads it instead of blanking the browser until every server's next
+// reconnect. Called from the sweeper's ~10 s tick; a no-op if disabled.
+static void persistRegistry() {
+    if (g_registryFile.empty()) return;
+    if (!writeFileAtomic(g_registryFile, serialize_registry(g_registry.snapshot())))
+        logline("warning: failed to persist " + g_registryFile);
+}
+
 // ---- on-demand HOST -------------------------------------------------------
 
 // True if some registered server is already using this loopback port — cheap way
@@ -125,8 +200,10 @@ static int allocHostPort() {
 }
 
 // Fork+exec an edenserver for a HOST request and wait (up to ~30 s) for it to
-// register back. Returns the reply line to send the client.
-static std::string handleHost(const std::string& line) {
+// register back. Returns the reply line to send the client. `peerIp` is the
+// HOST requester's address — the last fallback for the address we advertise
+// for the spawned server when neither --publicip nor --advertise-ip is set.
+static std::string handleHost(const std::string& line, const std::string& peerIp) {
     if (!g_allowHost) return "HOSTFAIL:spawn";
 
     // HOST:name[:hasPassword[:password]]
@@ -137,8 +214,29 @@ static std::string handleHost(const std::string& line) {
     bool hasPw = f.size() >= 3 && !f[2].empty() && f[2] != "0";
     std::string pw = f.size() >= 4 ? f[3] : std::string();
 
+    // Join-existing: a HOST for a name that's already live returns the
+    // running server instead of spawning a duplicate that would fight it for
+    // the same world file (stage 2.4).
+    if (const Registration* live = find_live_by_name(g_registry.snapshot(), name)) {
+        logline("HOST '" + name + "' -> joined existing " + live->ip + ":" +
+                std::to_string(live->port));
+        return "HOSTED:" + live->ip + ":" + std::to_string(live->port);
+    }
+
     int port = allocHostPort();
     if (port < 0) return "HOSTFAIL:full";
+
+    // Address advertised for the spawned server, both in the reply to this
+    // requester and in the child's own --advertise (so remote browse clients
+    // get a dialable address too, not a loopback that only worked for the
+    // matchmaker's own host) — stage 2.4.
+    std::string advertiseIp = !g_publicIp.empty()   ? g_publicIp
+                             : !g_advertiseIP.empty() ? g_advertiseIP
+                                                       : peerIp;
+    // One world file per name (stage 2.4 bug fix): before this, every HOST
+    // exec'd without --world, so all hosted worlds silently shared (and
+    // corrupted) the one eden_world.model in g_worldDir.
+    std::string worldFile = "world_" + world_slug(name) + ".model";
 
     pid_t pid = fork();
     if (pid < 0) return "HOSTFAIL:spawn";
@@ -147,7 +245,8 @@ static std::string handleHost(const std::string& line) {
         std::string sport = std::to_string(port);
         std::string mm = "127.0.0.1:" + std::to_string(g_port);
         std::vector<std::string> argv = {g_edenserver, "--port", sport, "--name", name,
-                                         "--matchmaker", mm, "--advertise", "127.0.0.1",
+                                         "--matchmaker", mm, "--advertise", advertiseIp,
+                                         "--world", worldFile,
                                          "--idle-timeout", "180"};
         if (hasPw) { argv.push_back("--password"); argv.push_back(pw); }
         std::vector<char*> cargv;
@@ -165,8 +264,8 @@ static std::string handleHost(const std::string& line) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         for (const auto& r : g_registry.snapshot())
             if (r.port == port) {
-                logline("HOST '" + name + "' -> 127.0.0.1:" + std::to_string(port));
-                return "HOSTED:127.0.0.1:" + std::to_string(port);
+                logline("HOST '" + name + "' -> " + r.ip + ":" + std::to_string(port));
+                return "HOSTED:" + r.ip + ":" + std::to_string(port);
             }
     }
     return "HOSTFAIL:timeout";
@@ -177,6 +276,7 @@ static std::string handleHost(const std::string& line) {
 static void handleConn(int fd, sockaddr_in peer) {
     uint64_t id   = g_nextConn.fetch_add(1);
     std::string ip = peerAddr(peer);
+    ConnCapGuard capGuard(ip);   // released on every return path below (stage 2.2)
     std::string carry, line;
 
     if (!readLine(fd, carry, line)) { close(fd); return; }
@@ -184,13 +284,13 @@ static void handleConn(int fd, sockaddr_in peer) {
     // ---- game client: one-shot browse / host ----
     if (line == "LIST" || line == "LISTP") {
         auto regs = g_registry.snapshot();
-        sendAll(fd, format_list(regs, g_shortList));
+        sendAll(fd, format_list(regs, g_rowForm));
         vlog("LIST from " + ip + " -> " + std::to_string(regs.size()) + " server(s)");
         close(fd);
         return;
     }
     if (line.rfind("HOST:", 0) == 0) {
-        std::string reply = handleHost(line);
+        std::string reply = handleHost(line, ip);
         sendAll(fd, reply + "\n");
         vlog("HOST from " + ip + " -> " + reply);
         close(fd);
@@ -223,7 +323,11 @@ static void handleConn(int fd, sockaddr_in peer) {
             if (!readLine(fd, carry, line)) break;
             g_registry.touch(id, monoSeconds());
             if (line == "PING" || line.rfind("PING:", 0) == 0) {
-                continue;  // no-op, no reply (dev: "No-op that resets the idle timer")
+                // No reply either way (dev: "No-op that resets the idle timer").
+                // `PING:<n>` additionally updates the row's advertised player count.
+                int players;
+                if (parse_ping(line, players)) g_registry.set_players(id, players);
+                continue;
             }
             if (line.rfind("REGISTER:", 0) == 0) {
                 Registration r2;
@@ -234,8 +338,12 @@ static void handleConn(int fd, sockaddr_in peer) {
             }
             // anything else: ignored, connection stays up
         }
-        g_registry.remove(id);
-        logline("drop  '" + reg.name + "' (conn " + std::to_string(id) + " closed)");
+        // Orphan, don't delist (stage 2.2): a brief hiccup on this socket
+        // shouldn't drop a server that is plainly still up. The row survives
+        // with no owning connection until the sweeper's probe decides its fate.
+        g_registry.orphan(id);
+        logline("orphan '" + reg.name + "' (conn " + std::to_string(id) +
+                " closed; awaiting probe/TTL)");
         close(fd);
         return;
     }
@@ -250,9 +358,10 @@ static void sweeper() {
     while (g_running) {
         for (int i = 0; i < 10 && g_running; ++i)
             std::this_thread::sleep_for(std::chrono::seconds(1));
-        for (uint64_t conn : g_registry.sweep(monoSeconds()))
+        for (uint64_t conn : g_registry.sweep(monoSeconds(), probeReachable))
             logline("drop  conn " + std::to_string(conn) + " (no heartbeat in " +
-                    std::to_string(HEARTBEAT_TTL_SEC) + "s)");
+                    std::to_string(HEARTBEAT_TTL_SEC) + "s, probe failed)");
+        persistRegistry();   // stage 2.2, piggybacked on the same ~10s tick
     }
 }
 
@@ -266,11 +375,14 @@ static void parseArgs(int argc, char** argv) {
         };
         if      (a == "--port")          g_port        = std::atoi(next("27020").c_str());
         else if (a == "--advertise-ip")  g_advertiseIP = next("");
-        else if (a == "--short-list")    g_shortList   = true;
+        else if (a == "--short-list")    g_rowForm     = RowForm::Sketch4;
+        else if (a == "--prod-list")     g_rowForm     = RowForm::Prod6;
         else if (a == "--verbose")       g_verbose     = true;
         else if (a == "--allow-host")    g_allowHost   = true;
         else if (a == "--edenserver")    g_edenserver  = next("./edenserver");
         else if (a == "--world")         g_worldDir    = next(".");
+        else if (a == "--publicip")      g_publicIp    = next("");
+        else if (a == "--registry-file") g_registryFile = next("eden_registry.txt");
         else if (a == "--host-ports") {
             std::string r = next("27600-27699");
             size_t d = r.find('-');
@@ -297,8 +409,32 @@ int main(int argc, char** argv) {
         else logline("warning: --edenserver '" + g_edenserver + "' not found; HOST will fail");
     }
 
+    // Reload a persisted registry (stage 2.2) before we start listening: entries
+    // come back orphaned and stale, so the sweeper's very first tick probes each
+    // one before trusting it — a restart re-verifies rather than re-lists blind.
+    if (!g_registryFile.empty()) {
+        std::ifstream f(g_registryFile);
+        if (f) {
+            std::vector<Registration> loaded;
+            std::string line;
+            while (std::getline(f, line)) {
+                Registration r;
+                if (parse_persisted_line(line, r)) loaded.push_back(r);
+            }
+            if (!loaded.empty()) {
+                g_registry.load_stale(loaded, monoSeconds());
+                logline("loaded " + std::to_string(loaded.size()) + " server(s) from " +
+                        g_registryFile + " (stale — verifying via probe)");
+            }
+        }
+    }
+
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("socket"); return 1; }
+    // The listen fd must not survive a HOST spawn's fork+exec: without this,
+    // every hosted edenserver inherits it, the port stays bound for as long as
+    // any hosted server lives, and a matchmaker restart can't rebind (stage 2.2).
+    fcntl(srv, F_SETFD, FD_CLOEXEC);
     int yes = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
     sockaddr_in addr{};
@@ -312,7 +448,8 @@ int main(int argc, char** argv) {
     if (listen(srv, 64) != 0) { perror("listen"); return 1; }
 
     logline("listening on 0.0.0.0:" + std::to_string(g_port) +
-            (g_shortList ? "  [short-list]" : "") +
+            (g_rowForm == RowForm::Sketch4 ? "  [short-list]" :
+             g_rowForm == RowForm::Prod6   ? "  [prod-list]"  : "") +
             (g_allowHost ? "  [HOST enabled]" : ""));
     std::thread(sweeper).detach();
 
@@ -321,6 +458,23 @@ int main(int argc, char** argv) {
         socklen_t plen = sizeof(peer);
         int fd = accept(srv, reinterpret_cast<sockaddr*>(&peer), &plen);
         if (fd < 0) continue;
+        // Every accepted fd, not just the listener, must not survive a HOST
+        // spawn's fork+exec: without this a hosted edenserver also inherits
+        // every other live client's socket (stage 2.2).
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+        std::string peerIp = peerAddr(peer);
+        if (!g_connCaps.tryAcquire(peerIp)) {
+            logline("refused " + peerIp + ": connection cap (global " +
+                     std::to_string(g_connCaps.total()) + "/" + std::to_string(MAX_CONNS_GLOBAL) +
+                     ", this IP " + std::to_string(g_connCaps.forIp(peerIp)) + "/" +
+                     std::to_string(MAX_CONNS_PER_IP) + ")");
+            close(fd);
+            continue;
+        }
+        // The slot acquired above is released by handleConn's ConnCapGuard
+        // (constructed from the same peer address) on every exit path.
+
         std::thread(handleConn, fd, peer).detach();
     }
     close(srv);

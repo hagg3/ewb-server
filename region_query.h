@@ -53,7 +53,7 @@ constexpr int REGION_CHUNK = 16;
 constexpr int REGION_COORD_MAX = 0xFFFFFF;
 
 /// Records per full `SNAPZ` frame. The capture shows a flat 3000 for every frame
-/// and a short final one (170 frames, last = 1671) — the split is **not** aligned
+/// and a short final one (85 frames, last = 1671) — the split is **not** aligned
 /// to world chunks.
 constexpr size_t SNAPZ_FRAME_RECORDS = 3000;
 
@@ -141,17 +141,33 @@ inline void emit_cell_records(int x, int y, int z, unsigned char type, unsigned 
 
 // --- ordering ----------------------------------------------------------------
 
-/// Sort by `(z, x, y, flag)` before deflating. `g_world` is an `unordered_map`, so
-/// unsorted records arrive in hash order — near-random leading bytes. Sorted ones
-/// are near-monotonic and compress materially better (the capture's own ratio was
-/// ~5.8×). Record order is **not semantically significant**: VuencLink's
-/// `ingest_snapz` merges `flag 0` / `flag 3` in either order, and the real client
-/// must too, since the capture shows both orders occurring. `flag` is the last key
-/// only to make the output deterministic.
+/// Sort by chunk (`cx, cz, cy` — 16^3 chunks, ascending), then within a chunk by
+/// `x, z, y, flag`. Recovered byte-exactly from the Pass-2 capture (stage 7.8):
+/// the native server hands the client each chunk as one contiguous run, 1.00
+/// runs per chunk; re-sorting the captured 253,671 records by this key
+/// reproduces the captured stream exactly. `g_world` is an `unordered_map`, so
+/// unsorted records arrive in hash order; this key is *also* near-monotonic
+/// within a chunk (16 values per axis instead of the full ~464-block span), so
+/// it compresses 3.7% better than the flat `(z,x,y,flag)` order this replaced,
+/// on top of being 44x better chunk locality.
+///
+/// Record order is **not semantically significant for merging**: VuencLink's
+/// `ingest_snapz` merges a cell's `flag 0` / `flag 3` records in either order,
+/// and the capture shows both orders occurring for a single cell. But chunk
+/// grouping *is* significant for whatever the client's mesh builder does with
+/// each incoming block — a community report attributes client-side lag to
+/// per-block mesh updates, which we cannot verify (we've never had the client's
+/// source) but which chunk-major order can only help, never hurt. `flag` is the
+/// last key only to make the output deterministic.
 inline void sort_records(std::vector<SnapRec>& v) {
     std::sort(v.begin(), v.end(), [](const SnapRec& a, const SnapRec& b) {
-        if (a.z != b.z) return a.z < b.z;
+        const int acx = a.x >> 4, acz = a.z >> 4, acy = a.y >> 4;
+        const int bcx = b.x >> 4, bcz = b.z >> 4, bcy = b.y >> 4;
+        if (acx != bcx) return acx < bcx;
+        if (acz != bcz) return acz < bcz;
+        if (acy != bcy) return acy < bcy;
         if (a.x != b.x) return a.x < b.x;
+        if (a.z != b.z) return a.z < b.z;
         if (a.y != b.y) return a.y < b.y;
         return a.flag < b.flag;
     });

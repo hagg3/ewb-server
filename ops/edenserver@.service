@@ -1,17 +1,27 @@
-# edenserver.service — systemd unit for the standalone Eden world-backend server.
+# edenserver@.service — systemd template unit for multi-world Eden world-backend server.
 #
-# Install:   cp ops/edenserver.service /etc/systemd/system/edenserver.service
-#            (edit the paths / args below to match your box, then:)
-#            systemctl daemon-reload && systemctl enable --now edenserver
+# This is a template unit that allows multiple independent edenserver instances,
+# each identified by an instance name (e.g. "myworld"), to run on the same machine.
 #
-# See ops/INSTALL.md for the full runbook (creating the user, firewall, backups,
-# verifying the exit criteria).
+# Install:   1. Create per-instance config files in /etc/eden/instances/ (see below)
+#               mkdir -p /etc/eden/instances
+#               cp ops/edenserver.conf.example /etc/eden/instances/<name>.conf
+#               sudoedit /etc/eden/instances/<name>.conf
+#            2. Create the world directories:
+#               mkdir -p /var/lib/edenserver/worlds/<name>
+#               chown edenserver:edenserver /var/lib/edenserver/worlds/<name>
+#            3. Enable and start the instance:
+#               systemctl daemon-reload
+#               systemctl enable --now edenserver@<name>
+#
+# See ops/INSTALL.md for the full runbook and ops/INSTALL.md § Multi-world for
+# instance-specific setup, verification, and edenserverctl usage.
 #
 # ---------------------------------------------------------------------------
 # Logging / std::unitbuf
 #   edenserver calls `std::cout << std::unitbuf` at startup so every log line is
 #   flushed immediately instead of sitting in a block buffer until the process
-#   exits. That is what makes `journalctl -u edenserver -f` show live output.
+#   exits. That is what makes `journalctl -u edenserver@<name> -f` show live output.
 #   To keep it working: run the binary DIRECTLY (as ExecStart does below). Do not
 #   wrap it in a shell pipeline, `stdbuf`, `tee`, or anything that re-buffers its
 #   stdout — that would defeat the unitbuf and logs would only appear in chunks.
@@ -19,10 +29,11 @@
 #
 # ---------------------------------------------------------------------------
 # Configuration — EnvironmentFile, and the ${VAR} vs $VAR split
-#   Every setting is an environment variable in /etc/edenserver.conf (copy it
-#   from ops/edenserver.conf.example). `EnvironmentFile=-/etc/edenserver.conf`
+#   Every setting is an environment variable in /etc/eden/instances/<name>.conf
+#   (copy it from ops/edenserver.conf.example and edit EDEN_WORLD_DIR,
+#   EDEN_PORT, EDEN_NAME, etc. for this instance). `EnvironmentFile=-/etc/eden/instances/%i.conf`
 #   (leading `-`) means a missing file is not a startup failure, so this template
-#   still works before anyone adopts the conf file — but ExecStart then expands
+#   still works before anyone creates the config — but ExecStart then expands
 #   the required keys to empty and the server exits with a flag error in the
 #   journal. Create the file.
 #
@@ -47,7 +58,7 @@
 # ---------------------------------------------------------------------------
 
 [Unit]
-Description=Eden world-backend server
+Description=Eden world-backend server (%i)
 Documentation=https://github.com/hagg3/ewb-server
 After=network-online.target
 Wants=network-online.target
@@ -59,18 +70,18 @@ Type=simple
 User=edenserver
 Group=edenserver
 
-# The state root. Every world file is addressed absolutely off ${EDEN_WORLD_DIR}
-# in ExecStart, so CWD is only a fallback; it must still be a directory the
-# service user can reach.
-WorkingDirectory=/var/lib/edenserver
+# The state root for this instance. Every world file is addressed absolutely
+# off ${EDEN_WORLD_DIR} in ExecStart, so CWD is only a fallback; it must still
+# be a directory the service user can reach.
+WorkingDirectory=/var/lib/edenserver/worlds/%i
 
-# All settings come from /etc/edenserver.conf. `-` => a missing file is tolerated
-# (the server then errors on the empty flags, visibly, in the journal).
-EnvironmentFile=-/etc/edenserver.conf
+# Per-instance settings from /etc/eden/instances/<name>.conf. `-` => a missing file
+# is tolerated (the server then errors on the empty flags, visibly, in the journal).
+EnvironmentFile=-/etc/eden/instances/%i.conf
 
 # Braced ${VAR} for the always-set keys; bare $EDEN_EXTRA_ARGS for the optional
-# spaceless tail. Edit /etc/edenserver.conf, not this line. See the conf header
-# and the note block above for why the split matters.
+# spaceless tail. Edit /etc/eden/instances/%i.conf, not this line. See the conf
+# header and the note block above for why the split matters.
 ExecStart=/usr/local/bin/edenserver --port ${EDEN_PORT} --name ${EDEN_NAME} --world ${EDEN_WORLD_DIR}/eden_world.model --signs ${EDEN_WORLD_DIR}/eden_signs.txt --spawn-file ${EDEN_WORLD_DIR}/eden_spawn.txt --ban-file ${EDEN_WORLD_DIR}/eden_bans.txt --ops-file ${EDEN_WORLD_DIR}/eden_ops.txt --control-socket ${EDEN_WORLD_DIR}/edenserver.sock --max-world-cells ${EDEN_MAX_WORLD_CELLS} --password ${EDEN_PASSWORD} $EDEN_EXTRA_ARGS
 
 Restart=on-failure
@@ -82,10 +93,10 @@ RestartSec=2s
 # exiting. This is that window, with slack.
 TimeoutStopSec=20
 
-# Live logs to the journal: journalctl -u edenserver -f
+# Live logs to the journal: journalctl -u edenserver@<name> -f
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=edenserver
+SyslogIdentifier=edenserver-%i
 
 # --- Sandboxing (defence in depth; the server is network-facing) ---
 NoNewPrivileges=true
