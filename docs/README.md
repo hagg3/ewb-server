@@ -59,7 +59,8 @@ Practically, when you touch a source file, move the doc in the same row:
 | `out_queue.h`, or anything that writes to a player's socket | [architecture.md](architecture.md) § The output path; [configuration.md](configuration.md) for the per-client bounds |
 | `sign_store.h` — `SIGNQ`/`SIGNP` wire shape | [protocol.md](protocol.md); the `eden_signs.txt` grammar lives in [configuration.md](configuration.md) |
 | `spawn_store.h` — `eden_spawn.txt` grammar (world default spawn) | [configuration.md](configuration.md) § `eden_spawn.txt` and the `--spawn` / `--spawn-file` flags |
-| `hardening.h` — limits, username rules, `ACTION` validation | [protocol.md](protocol.md) (what clients may send) and [configuration.md](configuration.md) (what an operator can tune) |
+| `motd_store.h` — `eden_motd.txt` grammar (the join welcome message) | [configuration.md](configuration.md) § `eden_motd.txt` and `--motd-file`; [protocol.md](protocol.md) § Join sequence; [commands.md](commands.md) for `motd reload` |
+| `hardening.h` — limits, username rules, `ACTION` and movement validation, the pre-`JOIN` verb gate | [protocol.md](protocol.md) (what clients may send, and when) and [configuration.md](configuration.md) (what an operator can tune) |
 | `build_server.sh` — compiler, flags, dependencies, or the test suites it runs | [quickstart.md](quickstart.md), [architecture.md](architecture.md) |
 | `admin/` — the optional `edenadmin` operator GUI (separate Go module) | `admin/README.md` (not part of `docs/`); mention it in [quickstart.md](quickstart.md) / [architecture.md](architecture.md) only where it touches the build |
 | `phase3_live_test.py`, `phase7_live_test.py` — the by-hand live socket tests | [architecture.md](architecture.md) (what each one covers) |
@@ -67,6 +68,7 @@ Practically, when you touch a source file, move the doc in the same row:
 | `host_world.sh`, `run_server.bat` — launcher arguments | [configuration.md](configuration.md), [quickstart.md](quickstart.md) |
 | `ops/edenserver.service`, `ops/edenserver@.service`, `ops/edenserver.conf.example`, `ops/edenserver-writeconf` — the systemd `EnvironmentFile` layer (`EDEN_*` keys, `${VAR}` vs `$VAR`) | [configuration.md](configuration.md) § The systemd EnvironmentFile; `ops/INSTALL.md` (template unit in § Multi-world hosting) |
 | `ops/edenserverctl` verbs, `ops/edenserver-backup.{service,timer}` | [configuration.md](configuration.md) § Ops wrapper; `ops/INSTALL.md` |
+| `ops/motd-edit.sh` — the interactive welcome-message editor | `ops/INSTALL.md` § The welcome message; [configuration.md](configuration.md) § `eden_motd.txt`; [commands.md](commands.md) for the `motd` verbs |
 | `eden_file.h` — `.eden` world-format parsing (header, chunks, spans, signs, ZIP wrapper) | [import.md](import.md) § What it reads; [architecture.md](architecture.md) (file map) |
 | `eden_import.h` / `eden_import.cpp` — the converter: base profile, fill strategies, axis rename, budget projections, flags | [import.md](import.md); [configuration.md](configuration.md) for the files it writes |
 | A new header + `*_test.cpp` pair | [architecture.md](architecture.md) (the file map) and whichever doc above owns its behaviour |

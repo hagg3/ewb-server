@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Live socket test for ROADMAP-SERVER stages 7.3 / 7.4 / 7.9 (per-client output,
-shutdown behaviour).
+"""Live socket test for ROADMAP-SERVER stages 7.3 / 7.4 / 7.9 / 7.16 / 7.17
+(per-client output, shutdown behaviour, movement-field validation, the pre-JOIN
+admission gate).
 
     ./build_server.sh && python3 phase7_live_test.py [path/to/edenserver]
 
@@ -34,6 +35,13 @@ Covers:
          moments earlier and exits promptly, instead of the old behaviour of
          dying immediately and only ever persisting up to the last 15 s
          autosave tick.
+  8  7.16 — a `POS` outside the world (`1e38`, `nan`, `inf`) is refused at ingest
+         rather than stored, persisted, relayed, and handed back on the next join
+         as a `SPAWN` line whose formatter over-read its 96-byte stack buffer and
+         sent the spill to the client.
+  9  7.17 — on a passworded server, a peer that never sent `JOIN` cannot edit the
+         world, broadcast chat, or inject a phantom player. `PING` still answers,
+         and the same edit from a joined player still lands.
 
 Group 1 spends ~35 s deliberately reading at ~50 KB/s; the whole pass is ~1 min.
 """
@@ -516,6 +524,190 @@ def group7_sigterm_saves():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# --- group 8: movement floats are validated at ingest (stage 7.16) ------------
+
+SPAWN_RE = re.compile(rb"^SPAWN:(-?\d+\.\d\d):(-?\d+\.\d\d):(-?\d+\.\d\d)$")
+
+def read_for(sock, seconds):
+    """Everything the peer sends us within `seconds` (it never closes on its own)."""
+    buf = bytearray()
+    end = time.time() + seconds
+    while time.time() < end:
+        sock.settimeout(max(0.05, end - time.time()))
+        try:
+            d = sock.recv(1 << 16)
+        except socket.timeout:
+            break
+        except OSError:
+            break
+        if not d:
+            break
+        buf.extend(d)
+    return bytes(buf)
+
+
+def group8_movement_validation():
+    print("\n[8] 7.16 — POS floats are validated at ingest, and SPAWN cannot over-read")
+    d = tempfile.mkdtemp(prefix="ewb7-")
+    try:
+        open(os.path.join(d, "eden_world.model"), "w").close()
+        open(os.path.join(d, "eden_signs.txt"), "w").close()
+        srv = Server(d)
+        try:
+            # An observer stays joined for the whole group: the relay is the other
+            # place a poisoned field used to reach — every peer, verbatim.
+            obs = join("observer")
+            read_for(obs, 0.5)
+
+            victim = join("poisoner")
+            read_for(victim, 0.5)
+            # One good position first, so there is something legitimate to restore
+            # to and the test can tell "refused" from "never stored".
+            victim.sendall(b"POS:65540.00:34.92:65500.00\n")
+            time.sleep(0.2)
+            # The repro: a finite float that formats to 132 bytes in a 96-byte
+            # buffer, plus the non-finite spellings that got there the same way.
+            mark = srv.mark()
+            # `POS:1e38:...` goes *last*: whatever a pre-fix server accepted last is
+            # what it persisted, so anything after it would mask the defect.
+            for bad in (b"POS:nan:nan:nan\n",
+                        b"POS:inf:34:65500\n",
+                        b"POS:-1:34:65500\n",
+                        b"POSVEL:65540:34.92:65500:1e38:0:0\n",
+                        b"VEL:inf:0:0\n",
+                        b"POSVEL:1e38:1e38:1e38:0:0:0\n",
+                        b"POS:1e38:1e38:1e38\n"):
+                victim.sendall(bad)
+                time.sleep(0.05)
+            logged = srv.since(mark)
+            check(any("Invalid POS" in l or "Invalid POSVEL" in l or "Invalid VEL" in l
+                      for l in logged),
+                  "the server logged the refusal (rate-limited, so one line is enough)")
+
+            relayed = read_for(obs, 0.6)
+            check(b"1e38" not in relayed and b"nan" not in relayed and b"inf" not in relayed,
+                  "no poisoned movement field reached another player")
+            check(srv.alive(), "the server survived the poisoned packets")
+
+            victim.close()
+            time.sleep(0.4)          # the disconnect path persists eden_players.txt
+
+            # The over-read fired on the *next* join under the same name.
+            again = join("poisoner")
+            burst = read_for(again, 1.0)
+            spawn = [l for l in burst.split(b"\n") if l.startswith(b"SPAWN:")]
+            check(len(spawn) == 1, "the rejoin got exactly one SPAWN line")
+            if spawn:
+                m = SPAWN_RE.match(spawn[0])
+                check(m is not None, "the SPAWN line is well formed (%r)" % spawn[0][:64])
+                check(len(spawn[0]) < 96,
+                      "the SPAWN line fits the buffer it is formatted in (%d B)" % len(spawn[0]))
+                if m:
+                    x, y, z = (float(g) for g in m.groups())
+                    check((x, y, z) == (65540.00, 34.92, 65500.00),
+                          "it restored the last *valid* position, not the poisoned one")
+            # A 96-byte over-read spills printable junk from recvBuffer/username;
+            # the join burst is all known verbs, so anything else is the leak.
+            for ln in burst.split(b"\n"):
+                if ln and not (ln.split(b":", 1)[0] in KNOWN or ln.startswith(b"[")):
+                    check(False, "unexpected line in the join burst: %r" % ln[:64])
+            again.close()
+            obs.close()
+        finally:
+            srv.stop()
+
+        with open(os.path.join(d, "eden_players.txt"), "rb") as f:
+            rows = f.read()
+        check(b"1e+38" not in rows and b"nan" not in rows and b"inf" not in rows,
+              "nothing out of range was persisted to eden_players.txt (%r)" % rows[:80])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# --- group 9: nothing but JOIN/PING is acted on before the handshake ----------
+
+def group9_prejoin_gate():
+    print("\n[9] 7.17 — ACTION/MSG/POS/VEL/POSVEL are gated on JOIN")
+    d = tempfile.mkdtemp(prefix="ewb7-")
+    try:
+        open(os.path.join(d, "eden_world.model"), "w").close()
+        open(os.path.join(d, "eden_signs.txt"), "w").close()
+        # A passworded server is the case that matters: JOIN is the only
+        # authentication there is, so a verb that skips it skips the password.
+        # `join()` supplies EDEN6 as the password field the retail client sends.
+        srv = Server(d, "--password", "EDEN6")
+        try:
+            obs = join("observer")
+            read_for(obs, 0.5)
+
+            mark = srv.mark()
+            anon = socket.socket()
+            anon.settimeout(5.0)
+            anon.connect(("127.0.0.1", PORT))
+            # PING brackets the batch: it is the one verb allowed through, so two
+            # PONGs and nothing between them is the whole reply budget of an
+            # unauthenticated peer.
+            anon.sendall(b"PING\n"
+                         b"ACTION:65500:34:65500:0:9\n"      # edit the world
+                         b"MSG:hello from nobody\n"          # chat as Player<n>
+                         b"POS:65500.00:34.92:65500.00\n"    # phantom player
+                         b"VEL:1.00:0.00:1.00\n"
+                         b"POSVEL:65501.00:34.92:65501.00:1.00:0.00:1.00\n"
+                         b"REGION:65500:65500\n"             # already gated pre-7.17
+                         b"SIGNQ\n"
+                         b"SIGNP:65500:34:65500:0:0:0:nobody was here\n"
+                         b"PING\n")
+            reply = read_for(anon, 0.8)
+            check(reply == b"PONG\nPONG\n",
+                  "an unauthenticated peer gets PONG and nothing else (%r)" % reply[:120])
+
+            relayed = read_for(obs, 0.6)
+            check(relayed == b"",
+                  "nothing from the unauthenticated peer reached a joined player (%r)" % relayed[:120])
+
+            logged = [l for l in srv.since(mark) if "before JOIN" in l]
+            check(len(logged) == 1,
+                  "the refusal is logged once per connection, not once per line (%d)" % len(logged))
+            check(srv.alive(), "the server survived the pre-JOIN batch")
+            anon.close()
+
+            # Positive control. The same ACTION, from the same kind of peer, after
+            # a JOIN that carries the password — so a gate that simply dropped
+            # everything would fail here rather than pass the checks above.
+            mark = srv.mark()
+            late = join("latecomer")
+            read_for(late, 0.5)
+            late.sendall(b"ACTION:65510:34:65510:0:9\n"
+                         b"POS:65510.00:34.92:65510.00\n")
+            time.sleep(0.3)
+            seen = read_for(obs, 0.6)
+            check(b"ACTION:latecomer:" in seen,
+                  "a joined player's identical edit is still relayed (%r)" % seen[:120])
+            late.close()
+            obs.close()
+            time.sleep(0.4)          # the disconnect path persists the world
+        finally:
+            srv.stop()
+
+        with open(os.path.join(d, "eden_world.model"), "rb") as f:
+            saved = f.read()
+        check(not edmb_has_cell(saved, 65500, 34, 65500, 9, 0),
+              "the pre-JOIN edit never reached the world model")
+        check(edmb_has_cell(saved, 65510, 34, 65510, 9, 0),
+              "...and the post-JOIN one did")
+
+        players = os.path.join(d, "eden_players.txt")
+        rows = open(players, "rb").read() if os.path.exists(players) else b""
+        # Pre-JOIN movement was stored under the auto-assigned `Player<clientId>`;
+        # the joined player's own POS still is, which is what tells the two apart.
+        check(b"Player" not in rows,
+              "no phantom Player<n> row in eden_players.txt (%r)" % rows[:80])
+        check(b"latecomer:" in rows,
+              "...but a joined player's position is still saved (%r)" % rows[:80])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     if not os.path.exists(SERVER):
         print("no %s — run ./build_server.sh first" % SERVER)
@@ -540,6 +732,8 @@ def main():
     group3_write_timeout()
     group6_world_backlog()
     group7_sigterm_saves()
+    group8_movement_validation()
+    group9_prejoin_gate()
 
     print()
     if fails:

@@ -1,0 +1,28 @@
+# edenserver-backup@.service — one-shot world backup for a multi-world instance, driven by
+# the matching .timer.
+#
+# Install (both files, once — covers every instance):
+#     sudo cp ops/edenserver-backup@.service ops/edenserver-backup@.timer /etc/systemd/system/
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now edenserver-backup@<name>.timer
+#
+# It runs `edenserverctl backup <name>` as the service user. That wrapper asks the running
+# instance to `save` first (via its control socket) so the copy is current, then gzips the
+# world files into a timestamped directory under that instance's own backup dir —
+# /var/lib/edenserver/backups/<name>/<stamp>/ — so instances never collide. Sourcing
+# /etc/eden/instances/%i.conf makes it follow that instance's EDEN_WORLD_DIR /
+# EDEN_BACKUP_DIR / EDEN_BACKUP_COMPRESS / EDEN_BACKUP_LEVEL, if set.
+#
+# See ops/edenserver-backup.service for the single-world (non-template) counterpart.
+
+[Unit]
+Description=Eden world backup (one-shot, %i)
+After=edenserver@%i.service
+Wants=edenserver@%i.service
+
+[Service]
+Type=oneshot
+User=edenserver
+Group=edenserver
+EnvironmentFile=-/etc/eden/instances/%i.conf
+ExecStart=/usr/local/bin/edenserverctl backup %i

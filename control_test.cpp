@@ -58,13 +58,28 @@ static void test_table() {
     CHECK(ewb::ctl_find("nonsense") == nullptr, "unknown verb not found");
     const std::string help = ewb::ctl_help_text();
     for (const char* v : {"who", "say", "kick", "ban", "unban", "banlist", "save", "stop",
-                          "op", "deop", "setblock", "fill", "signs", "region-stats"})
+                          "op", "deop", "setblock", "fill", "signs", "motd", "region-stats"})
         CHECK(help.find(std::string("\n  ") + v) != std::string::npos ||
               help.find(std::string(v)) != std::string::npos,
               "help mentions every verb");
     // min/max arg bookkeeping the dispatcher relies on.
     CHECK(ewb::ctl_find("fill")->min_args == 7 && ewb::ctl_find("fill")->max_args == 8, "fill arity");
     CHECK(ewb::ctl_find("signs")->max_args == -1, "signs is free-form");
+
+    // `motd` takes exactly one subcommand field, so the dispatcher's generic
+    // arity check rejects `motd` bare and `motd:reload:extra` before it runs.
+    const ewb::CtlSpec* motd = ewb::ctl_find("motd");
+    CHECK(motd != nullptr, "motd is a known verb");
+    CHECK(motd->min_args == 1 && motd->max_args == 1, "motd arity");
+    {
+        std::string verb, rest;
+        CHECK(ewb::ctl_split("motd:reload", verb, rest) && verb == "motd" && rest == "reload",
+              "motd:reload splits to verb + subcommand");
+        const auto f = ewb::ctl_fields(rest, motd->max_args + 1);
+        CHECK(f.size() == 1 && f[0] == "reload", "one field, the subcommand");
+        CHECK(ewb::ctl_split("motd", verb, rest) && verb == "motd" && rest.empty(),
+              "bare motd has no fields, so the arity check refuses it");
+    }
 }
 
 static void test_ip_heuristic() {

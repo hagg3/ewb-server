@@ -16,9 +16,12 @@ the same commit.**
 ## Transport and framing
 
 - Plain **TCP**, default port **27015**. No TLS, no handshake before the protocol itself.
-- Messages are text lines: fields separated by `:`, each line terminated by `\n`.
-- The first field is the verb. A verb the server does not know is ignored (and logged once per
-  verb under `--verbose`).
+- Messages are text lines: fields separated by `:`, each line terminated by `\n`. Bare `\n`, not
+  CRLF — a `\r` is not stripped, so it becomes part of the last field. Verbs that validate their
+  fields (`POS`, `VEL`, `POSVEL`) reject a field carrying one.
+- The first field is the verb. A verb the server does not know is ignored (and, from a joined
+  player, logged once per verb under `--verbose`; before `JOIN` nothing but `JOIN` and `PING` is
+  looked at all — see [Everything is gated on `JOIN`](#everything-is-gated-on-join)).
 - Lines arrive coalesced or split arbitrarily by TCP; both sides must reassemble on `\n`. The
   server drops a connection that accumulates more than 8192 bytes without a newline.
 - Because `:` is the delimiter, no username may contain one — see [Usernames](#usernames).
@@ -40,6 +43,8 @@ the same commit.**
   the server's cell key packs.
 - **y** is height, valid range `0 .. 255`.
 - Ground standing height is ≈ **33.92** (positions are floats; block coordinates are integers).
+  A *player's* `y` is the avatar's origin, ≈0.92 above the block underfoot, so it can legally
+  sit just above the top of the block range — see [Movement](#movement--pos-vel-posvel).
 - Block **type 0 is air**. In the server's stored model `255` means "a natural block that was
   only painted"; that value is internal and never appears on the wire. `254` is internal too —
   it is how the chunk store encodes "explicitly mined" so a dense array can still tell *mined*
@@ -54,15 +59,28 @@ the same commit.**
 | `JOIN:username:characterType[:password[:clientTag]]` | Once per connection. The retail client sends five fields; the fifth is a constant tag the server neither requires nor interprets. |
 | `MSG:text` | Chat. Everything after `MSG:` is the text, so a `:` inside a message is safe. A text starting with `/` is a **command**, answered on the same connection and never relayed — see [commands.md § Part 2](commands.md#part-2--player-commands). |
 | `ACTION:x:y:z:mode[:typeOrColor]` | Terrain edit. `mode` 0=build 1=mine 2=burn 3=paint. |
-| `POS:x:y:z` | Player position. |
-| `VEL:x:y:z` | Player velocity. |
-| `POSVEL:px:py:pz:vx:vy:vz` | Both at once. |
+| `POS:x:y:z` | Player position. Validated at ingest — see [Movement](#movement--pos-vel-posvel). |
+| `VEL:x:y:z` | Player velocity. Validated at ingest. |
+| `POSVEL:px:py:pz:vx:vy:vz` | Both at once. Validated at ingest. |
 | `REGION:x:z` | "Send me the world around this point." Answered with `SNAPZ`. |
 | `SIGNQ` | Bare line, no arguments. "Send me the signs." Answered with `SIGNP`. |
 | `SIGNP:x:y:z:a:b:c:text` | A player placed or edited a sign. The server's `SIGNP` fields **without** the sender field — see [`SIGNP` from a client](#signp-from-a-client). |
 | `PING` | Bare line. Answered with `PONG`. |
 
-`REGION`, `SIGNQ` and `SIGNP` are refused before a successful `JOIN`.
+### Everything is gated on `JOIN`
+
+**`JOIN` and `PING` are the only two messages a connection may send before its `JOIN` succeeds.**
+Every other line in the table above — including any verb added later, and any verb the server does
+not recognise — is dropped, in silence to the peer; the server logs the first one per connection.
+
+`JOIN` is the only authentication a `--password` server has, so anything acted on ahead of it is
+acted on without the password. `PING` is exempt because its reply is a bare `PONG` that reveals
+nothing a successful TCP connect has not, and a client's ping timer may fire while its own `JOIN`
+is still in flight.
+
+A dropped line is not fatal: the connection stays open and a `JOIN` that arrives later is
+accepted normally. Nothing in any capture sends anything before `JOIN`, so this should be
+invisible to a real client.
 
 ## Server → client
 
@@ -84,8 +102,9 @@ Unicast to one client:
 | Message | Meaning |
 |---|---|
 | `[Server] Welcome, <username>! (Character Type: <n>)` | Join accepted. |
+| `[Server] <motd text>` | The operator's welcome message, if this world has one: one line per non-blank line of `eden_motd.txt` (`--motd-file`), sent straight after the welcome line. An ordinary chat line — a client that renders chat renders it, and a world with no MOTD sends none. Grammar and caps: [configuration.md § `eden_motd.txt`](configuration.md#eden_motdtxt). |
 | `CAPS:region` | Capability advertisement — see below. |
-| `SPAWN:x:y:z` | Restore a saved position. Sent only if this username has one. |
+| `SPAWN:x:y:z` | Restore a saved position (two decimals). Sent only if this username has one, or the world has a default spawn. |
 | `SIGNP:server:x:y:z:a:b:c:text` | One sign; sent as a burst answering `SIGNQ`. |
 | `SNAPZ:count:base64` | One frame of terrain; sent as a burst answering `REGION`. |
 | `PONG` | Answer to `PING`. |
@@ -110,11 +129,16 @@ rather than unsolicited pushes:
 
 ```
 1.  [Server] Welcome, <name>! (Character Type: N)
-2.  CAPS:region
-3.  SPAWN:x:y:z          only if this name has a saved position
-4.  SIGNP:server:...      burst — answers the client's SIGNQ
-5.  SNAPZ:<n>:<b64>       burst — answers the client's REGION
+2.  [Server] <motd line>  0..8 lines, only if the world has an eden_motd.txt
+3.  CAPS:region
+4.  SPAWN:x:y:z          this name's saved position, else the world default spawn
+5.  SIGNP:server:...      burst — answers the client's SIGNQ
+6.  SNAPZ:<n>:<b64>       burst — answers the client's REGION
 ```
+
+Step 2 adds no new message: the MOTD lines are the same `[Server] <text>` chat shape the
+server already sends, so a client written against the pre-MOTD sequence sees ordinary chat and
+nothing changes for a world that has no MOTD.
 
 `CAPS:region` is what tells a client to *ask* for terrain with `REGION` instead of expecting
 the server to push it. A client that has not seen it will not send a `REGION`.
@@ -122,6 +146,35 @@ the server to push it. A client that has not seen it will not send a `REGION`.
 There is deliberately **no chat kill-switch**: the reference server disconnected anyone who
 typed "exit" or "quit" in chat, meaning a player discussing quitting got kicked for it. Closing
 the game is how you disconnect, and nothing here replaces it.
+
+## Movement — `POS`, `VEL`, `POSVEL`
+
+Each field is **validated, not merely parsed**. A field must be a complete, finite decimal
+number — the whole token and nothing else — and must fall in range:
+
+| Field | Range |
+|---|---|
+| position `x`, `z` | `0 .. 16777215` — the same 24-bit range `ACTION` enforces |
+| position `y` | `0 .. 272` — the world is `0..255`; the extra room is because a player's `y` is the avatar's origin, which sits ≈0.92 above the block it stands on, so standing on (and jumping from) the topmost block is still legal |
+| velocity `x`, `y`, `z` | `-4096 .. 4096`, signed — a ceiling far above anything playable, not a physics claim |
+
+A packet with any field out of range, non-finite (`nan`, `inf`), or carrying trailing bytes
+(`1\r`, `1x`) is **dropped whole**: nothing is stored, nothing is relayed, the connection stays
+open, and the server logs at most one notice per 30 s per connection. This matches how `ACTION`
+treats an out-of-range edit.
+
+Consequences worth knowing as a client author:
+
+- A position is only remembered — and only returned as `SPAWN` on a later join — if it passed.
+  A player who leaves the world box (falling out of the bottom, say) keeps their last **valid**
+  position as their respawn point rather than being restored into the void.
+- `eden_players.txt` is re-validated on load, so a row written by an older server (or edited by
+  hand) that is out of range is ignored, and that player gets the world default spawn.
+- The default spawn (`eden_spawn.txt` or `--spawn`) takes the same bound; out of range, it
+  warns and is ignored rather than being sent.
+
+Fields are otherwise relayed as the client wrote them — the server does not currently re-format
+them to a fixed precision.
 
 ## `ACTION` — terrain edits
 
@@ -361,6 +414,7 @@ Movement (`POS`/`VEL`/`POSVEL`) is likewise rate-limited (`--move-rate`/`--move-
 movement rate is ~3-4 Hz, so this bucket exists only to cap a scripted flood, with an order of
 magnitude of headroom above real play plus burst room for a client catching up after a lag spike.
 An over-budget movement update is dropped silently — the same outcome a late packet already has.
+Its *contents* are bounded separately, at ingest: see [Movement](#movement--pos-vel-posvel).
 
 **A `MSG:` whose text begins with `/` is not chat.** It is a player command; the server runs it
 and answers this connection only, with `[Server] …` lines (plus `SPAWN:` for a teleport,

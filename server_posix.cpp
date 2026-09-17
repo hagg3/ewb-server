@@ -80,6 +80,7 @@
 #include "out_queue.h"      // per-client output queue policy            (stage 7.3)
 #include "sign_store.h"     // eden_signs.txt + SIGNQ -> SIGNP           (stage 1.5)
 #include "spawn_store.h"    // eden_spawn.txt: a world's default spawn     (stage 5.3)
+#include "motd_store.h"     // eden_motd.txt: the per-world welcome message
 #include "hardening.h"      // names, token buckets, ACTION validation   (stage 1.7)
 #include "control.h"        // Tier 1 operator control socket             (stage 3.2)
 #include "worldedit.h"      // Tier 2 player command surface              (stage 3.3)
@@ -150,6 +151,7 @@ bool        g_regionSort  = true;                // sort records before deflate 
 bool        g_regionEmptyFrame = true;           // answer an empty region with SNAPZ:0 (--no-region-empty-frame to suppress)
 std::string g_signFile   = "eden_signs.txt";     // sign sidecar (--signs)
 std::string g_spawnFile  = "";                   // world spawn sidecar; empty -> derived from the world dir (--spawn-file)
+std::string g_motdFile   = "";                   // welcome-message sidecar; empty -> derived from the world dir (--motd-file)
 bool        g_haveWorldSpawn = false;            // a default spawn point is configured (file or --spawn)
 ewb::Spawn  g_worldSpawn;                        // the default spawn handed to a player with no saved position
 bool        g_legacySnapshot = false;            // push the ACTION dump on JOIN (--legacy-snapshot)
@@ -385,6 +387,14 @@ static_assert(ewb::SIGN_Y_MAX + 1 == SV_WORLD_HEIGHT, "sign y range must match t
 static_assert(ewb::WS_WORLD_HEIGHT == SV_WORLD_HEIGHT,
               "world_store.h's chunk-store Y bound must match the world height, or a box query "
               "could silently miss chunks above WS_MAX_CY");
+// A validated position must survive `weFeet()`'s lroundf into an int cell without
+// overflowing, and must still be inside the coordinate range `ACTION` enforces
+// (stage 7.16). The vertical bound is deliberately *above* the world height —
+// see ewb::MOVE_Y_MAX for why a legal player y exceeds the topmost block.
+static_assert(ewb::MOVE_XZ_MAX == 16777215.0f && ewb::MOVE_XZ_MAX == (float)0xFFFFFF,
+              "the movement x/z bound must be the same 24-bit key range ACTION checks");
+static_assert(ewb::MOVE_Y_MAX > SV_WORLD_HEIGHT && ewb::MOVE_Y_MAX < 1e6f,
+              "the movement y bound must clear the world height and stay far inside int range");
 
 static inline uint64_t wkey(int x,int y,int z){
     return (((uint64_t)(uint32_t)x & 0xFFFFFFull) << 40)
@@ -584,16 +594,25 @@ void loadPlayerPos() {
     std::ifstream f(g_posFile);
     if (!f) return;
     std::string line;
+    size_t dropped = 0;
     std::lock_guard<std::mutex> lk(g_posMtx);
     while (std::getline(f, line)) {
         size_t p1 = line.find(':');          // username can't contain ':' (protocol delimiter)
         if (p1 == std::string::npos) continue;
         std::string name = line.substr(0, p1);
         float x,y,z;
-        if (sscanf(line.c_str()+p1+1, "%f:%f:%f", &x,&y,&z) == 3)
-            g_playerPos[name] = { x,y,z };
+        if (sscanf(line.c_str()+p1+1, "%f:%f:%f", &x,&y,&z) != 3) continue;
+        // A row is only as trustworthy as whatever wrote it. `%f` reads `inf`,
+        // `nan` and `1e+38` back just as happily as a position, and a server that
+        // ran before stage 7.16 could have persisted exactly that — so the file is
+        // re-validated on load rather than trusted because the server wrote it.
+        if (!ewb::move_pos_valid(x, y, z)) { ++dropped; continue; }
+        g_playerPos[name] = { x,y,z };
     }
     std::cout << "[Server] Loaded " << g_playerPos.size() << " player positions." << std::endl;
+    if (dropped)
+        std::cerr << "[Server] " << g_posFile << ": ignored " << dropped
+                  << " out-of-range player position(s)." << std::endl;
 }
 
 // --- World default spawn (stage 5.3) ----------------------------------------
@@ -610,6 +629,14 @@ void loadSpawn() {
         ewb::Spawn s;
         bool skip = false;
         if (ewb::parse_spawn_line(line, s, skip)) {
+            // `spawn_store.h` owns the grammar, the range is the caller's policy —
+            // and this caller puts the value straight on the wire as `SPAWN`
+            // (stage 7.16), so it takes the same bound a player's own position does.
+            if (!ewb::move_pos_valid(s.x, s.y, s.z)) {
+                std::cerr << "[Server] " << g_spawnFile
+                          << ": spawn out of range; ignoring" << std::endl;
+                return;
+            }
             g_worldSpawn = s;
             g_haveWorldSpawn = true;
             return;
@@ -620,6 +647,40 @@ void loadSpawn() {
             return;
         }
     }
+}
+
+// --- Message of the day -----------------------------------------------------
+// `eden_motd.txt` beside the world (or `--motd-file`) is the operator-settable
+// welcome message every joining player is shown, between the built-in welcome
+// line and `CAPS:region`. Absent or empty is normal and silent, like `--signs`.
+//
+// The wire lines are kept pre-formatted so a join costs a copy, not a parse, and
+// are swapped under g_motdMtx by the control socket's `motd reload` — an
+// operator edits the file and pushes it without restarting the process, exactly
+// as `signs reload` does for the sign sidecar.
+static std::vector<std::string> g_motdLines;   // wire-ready "[Server] ...\n"
+static std::mutex               g_motdMtx;
+
+// Read the sidecar into g_motdLines. Returns how many lines are live afterwards,
+// which is what startup logs and what `motd reload` answers with. A missing file
+// is not an error: it clears the MOTD and reports zero.
+static size_t loadMotd() {
+    std::vector<std::string> lines;
+    size_t dropped = 0;
+    {
+        std::ifstream f(g_motdFile);
+        if (f) lines = ewb::format_motd_burst(
+                   ewb::parse_motd(f, ewb::MOTD_MAX_LINES, ewb::MOTD_MAX_LINE, &dropped));
+    }
+    if (dropped)
+        std::cerr << "[Server] " << g_motdFile << ": MOTD capped at " << ewb::MOTD_MAX_LINES
+                  << " lines; dropped " << dropped << "." << std::endl;
+    const size_t n = lines.size();
+    {
+        std::lock_guard<std::mutex> lk(g_motdMtx);
+        g_motdLines = std::move(lines);
+    }
+    return n;
 }
 
 void savePlayerPos() {
@@ -748,8 +809,13 @@ void saveOps() {
 }
 
 // Record a player's latest position (by username).
+//
+// The bound is re-checked here, not only at ingest (stage 7.16): this map is
+// what `SPAWN` hands a returning player and what `eden_players.txt` persists, so
+// it is the one place every writer — `POS`, `POSVEL`, `/tp` — has to pass.
 static void rememberPos(const std::string& name, float x, float y, float z){
     if(name.empty()) return;
+    if(!ewb::move_pos_valid(x, y, z)) return;
     std::lock_guard<std::mutex> lk(g_posMtx);
     g_playerPos[name] = { x,y,z };
     g_posDirty = true;
@@ -790,6 +856,8 @@ static bool                     g_signBurstStale = false;   // guarded by g_sign
 
 // Who is editing on this thread, for those audit lines: `player:<name>` on a client's
 // thread once it has joined, `control` on a control connection, `server` otherwise.
+// A client thread can no longer edit before it sets this: stage 7.17's gate drops
+// `ACTION` pre-JOIN, so a player's edit is never audited as the server's.
 static thread_local std::string t_editActor = "server";
 
 // Caller holds g_signMtx.
@@ -1211,9 +1279,25 @@ static bool pushRegion(const std::shared_ptr<ClientOut>& o, ewb::RegionJob job) 
 // Socket-addressed convenience wrappers, so the ~30 existing output call sites keep
 // reading the way they did. Each is one g_outsMtx map lookup; a broadcast uses
 // outSnapshot() instead of calling these in a loop.
+//
+// ⚠️ There is deliberately **no `sendLine(SOCKET, const char*, size_t)` overload**
+// (stage 7.16). Every call site passed an `snprintf` return as the length, and
+// `snprintf` returns what it *would* have written — so an over-long line made
+// `std::string(d, n)` read past the stack buffer and put the spill on the wire.
+// Build the line as a std::string; `spawnLine()` below is the safe shape for a
+// printf-style one.
 static void sendLine(SOCKET s, const std::string& line)      { pushHi(outFor(s), line); }
-static void sendLine(SOCKET s, const char* d, size_t n)      { pushHi(outFor(s), std::string(d, n)); }
 static void sendWorldTo(SOCKET s, const std::string& blob)   { pushWorld(outFor(s), blob); }
+
+// The one `SPAWN:x:y:z` formatter (join restore, world spawn, `/tp`). Clamping
+// the `snprintf` return to what the buffer actually holds makes the over-read
+// structurally impossible whatever reaches it; the ingest validation in
+// `parse_move_pos` is what keeps it from ever truncating (stage 7.16).
+static std::string spawnLine(float x, float y, float z) {
+    char sp[96];
+    const int n = std::snprintf(sp, sizeof sp, "SPAWN:%.2f:%.2f:%.2f\n", x, y, z);
+    return std::string(sp, n < 0 ? 0u : std::min(static_cast<size_t>(n), sizeof sp - 1));
+}
 
 // Block until this client's queue is empty, or `ms` elapses. Used where a line has
 // to reach the peer before the socket goes away (the kick notice); everything else
@@ -2150,6 +2234,32 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
         return;
     }
 
+    if (verb == "motd") {
+        const auto f = ewb::ctl_fields(rest, 1);
+        const std::string sub = f.empty() ? "" : f[0];
+        if (sub == "reload") {
+            // Nothing in the server ever writes eden_motd.txt — it is operator
+            // input only — so unlike `signs reload` there is no unsaved in-memory
+            // state to protect and no refusal case. Re-read and swap.
+            const size_t n = loadMotd();
+            auditLog("control", "motd reload (" + std::to_string(n) + " line(s))");
+            reply = n ? "ok: reloaded " + std::to_string(n) + " MOTD line(s) from " + g_motdFile
+                      : "ok: MOTD is now empty (" + g_motdFile + " is missing or has no text)";
+            return;
+        }
+        if (sub == "show") {
+            std::vector<std::string> motd;
+            { std::lock_guard<std::mutex> lk(g_motdMtx); motd = g_motdLines; }
+            if (motd.empty()) { reply = "(no MOTD; " + g_motdFile + " is missing or has no text)"; return; }
+            std::string out;
+            for (const std::string& l : motd) out += l;   // each already ends in '\n'
+            reply = out;
+            return;
+        }
+        reply = "usage: " + std::string(spec->usage);
+        return;
+    }
+
     if (verb == "region-stats") {
         const uint64_t reqs = g_rgnRequests.load(std::memory_order_relaxed);
         const uint64_t us   = g_rgnMicros.load(std::memory_order_relaxed);
@@ -2538,9 +2648,7 @@ static bool weSelection(WeSession& we, SOCKET s, ewb::WeBox& box) {
 // community-attested as a live teleport, not capture-confirmed.
 static void weTeleport(SOCKET s, const std::string& username, float x, float y, float z) {
     rememberPos(username, x, y, z);
-    char sp[96];
-    const int n = snprintf(sp, sizeof(sp), "SPAWN:%.2f:%.2f:%.2f\n", x, y, z);
-    sendLine(s, sp, (size_t)n);
+    sendLine(s, spawnLine(x, y, z));
 }
 
 // One complete Tier 2 command line (the chat text, '/'-prefixed and already
@@ -3046,7 +3154,8 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
     char recvBuffer[BUFFER_SIZE];
     std::string username = "Player" + std::to_string(clientId);
     int characterType = 0;
-    bool joined = false;          // a successful JOIN gates REGION/SIGNQ (see below)
+    bool joined = false;          // a successful JOIN gates every verb but JOIN/PING (stage 7.17)
+    bool preJoinWarned = false;   // log the first pre-JOIN verb per connection, not each one
     BurstLimiter regionLimiter;   // per-connection REGION pacing
     BurstLimiter signLimiter;     // ...and SIGNQ pacing
     ewb::TokenBucket actionBucket(SV_ACTION_BURST, SV_ACTION_RATE);   // stage 1.7
@@ -3119,6 +3228,33 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
 
             const std::string& command = parts[0];
 
+            // --- pre-JOIN admission gate (stage 7.17) ------------------------
+            // One check, here, for every verb. `JOIN` is the only authentication
+            // a --password server has, and five verbs used to skip it: ACTION
+            // (world edits, persisted and relayed), MSG (chat as `Player<n>`),
+            // and POS/VEL/POSVEL (a phantom player that never gets a `has left`
+            // line, plus a row in the player store). The four verbs that *did*
+            // check — REGION, SIGNQ, SIGNP and the `/`-command path — now rely on
+            // this gate instead of repeating it; see ewb::verb_allowed_before_join
+            // for why the rule is an allow-list.
+            //
+            // A pre-JOIN line is dropped, not fatal: a client that races its own
+            // JOIN loses one packet rather than its session. (Nothing observed in
+            // any capture sends anything before JOIN — this is the cautious
+            // reading, not a known case.)
+            if (!joined && !ewb::verb_allowed_before_join(command)) {
+                if (!preJoinWarned) {
+                    // Once per connection: this is an auth-bypass attempt worth
+                    // seeing without --verbose, but a per-line log would be its own
+                    // flood. The verb is untrusted input — sanitise and bound it.
+                    std::cerr << "[Server] client #" << clientId << " (" << clientIP
+                              << ") sent " << ewb::sanitize_text(command, 16)
+                              << " before JOIN; ignored." << std::endl;
+                    preJoinWarned = true;
+                }
+                continue;
+            }
+
             // POSVEL:px:py:pz:vx:vy:vz
             // Dispatch order below is frequency-tuned (stage 7.13: POSVEL is by far
             // the most frequent verb on the wire, then POS/VEL/ACTION/MSG) — do not
@@ -3136,26 +3272,30 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     }
                     continue;
                 }
-                try {
-                    float px = std::stof(parts[1]), py = std::stof(parts[2]), pz = std::stof(parts[3]);
-                    float vx = std::stof(parts[4]), vy = std::stof(parts[5]), vz = std::stof(parts[6]);
-                    {
-                        std::lock_guard<std::mutex> lock(clientsMutex);
-                        if (playerInfoMap.count(clientSocket)) {
-                            auto& info = playerInfoMap[clientSocket];
-                            info.posX = px; info.posY = py; info.posZ = pz;
-                            info.velX = vx; info.velY = vy; info.velZ = vz;
-                        }
-                    }
-                    rememberPos(username, px, py, pz);
-                    std::string broadcastMsg = "POSVEL:" + username + ":" + std::to_string(characterType) + ":" +
-                                               parts[1] + ":" + parts[2] + ":" + parts[3] + ":" +
-                                               parts[4] + ":" + parts[5] + ":" + parts[6] + "\n";
-                    broadcastMessage(broadcastMsg, clientSocket);
-                } catch (...) {
+                // Validate at ingest (stage 7.16). `std::stof` used to be the only
+                // filter, so `nan`/`inf`/`1e38` reached playerInfoMap, g_playerPos,
+                // eden_players.txt and — a restart later — `SPAWN`'s formatter.
+                float px, py, pz, vx, vy, vz;
+                if (!ewb::parse_move_pos(parts[1], parts[2], parts[3], px, py, pz) ||
+                    !ewb::parse_move_vel(parts[4], parts[5], parts[6], vx, vy, vz)) {
                     if (invalidMsgNotice.allow(monoSeconds()))
                         std::cout << "[Server] Invalid POSVEL message from " << username << std::endl;
+                    continue;
                 }
+                {
+                    std::lock_guard<std::mutex> lock(clientsMutex);
+                    auto pit = playerInfoMap.find(clientSocket);
+                    if (pit != playerInfoMap.end()) {
+                        auto& info = pit->second;
+                        info.posX = px; info.posY = py; info.posZ = pz;
+                        info.velX = vx; info.velY = vy; info.velZ = vz;
+                    }
+                }
+                rememberPos(username, px, py, pz);
+                std::string broadcastMsg = "POSVEL:" + username + ":" + std::to_string(characterType) + ":" +
+                                           parts[1] + ":" + parts[2] + ":" + parts[3] + ":" +
+                                           parts[4] + ":" + parts[5] + ":" + parts[6] + "\n";
+                broadcastMessage(broadcastMsg, clientSocket);
             }
             // POS:x:y:z
             else if (command == "POS" && parts.size() >= 4) {
@@ -3168,26 +3308,25 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     }
                     continue;
                 }
-                try {
-                    float px = std::stof(parts[1]);
-                    float py = std::stof(parts[2]);
-                    float pz = std::stof(parts[3]);
-                    {
-                        std::lock_guard<std::mutex> lock(clientsMutex);
-                        if (playerInfoMap.count(clientSocket)) {
-                            playerInfoMap[clientSocket].posX = px;
-                            playerInfoMap[clientSocket].posY = py;
-                            playerInfoMap[clientSocket].posZ = pz;
-                        }
-                    }
-                    rememberPos(username, px, py, pz);
-                    std::string broadcastMsg = "POS:" + username + ":" + std::to_string(characterType) + ":" +
-                                               parts[1] + ":" + parts[2] + ":" + parts[3] + "\n";
-                    broadcastMessage(broadcastMsg, clientSocket);
-                } catch (...) {
+                float px, py, pz;
+                if (!ewb::parse_move_pos(parts[1], parts[2], parts[3], px, py, pz)) {   // stage 7.16
                     if (invalidMsgNotice.allow(monoSeconds()))
                         std::cout << "[Server] Invalid POS message from " << username << std::endl;
+                    continue;
                 }
+                {
+                    std::lock_guard<std::mutex> lock(clientsMutex);
+                    auto pit = playerInfoMap.find(clientSocket);
+                    if (pit != playerInfoMap.end()) {
+                        pit->second.posX = px;
+                        pit->second.posY = py;
+                        pit->second.posZ = pz;
+                    }
+                }
+                rememberPos(username, px, py, pz);
+                std::string broadcastMsg = "POS:" + username + ":" + std::to_string(characterType) + ":" +
+                                           parts[1] + ":" + parts[2] + ":" + parts[3] + "\n";
+                broadcastMessage(broadcastMsg, clientSocket);
             }
             // VEL:x:y:z
             else if (command == "VEL" && parts.size() >= 4) {
@@ -3200,25 +3339,24 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     }
                     continue;
                 }
-                try {
-                    float vx = std::stof(parts[1]);
-                    float vy = std::stof(parts[2]);
-                    float vz = std::stof(parts[3]);
-                    {
-                        std::lock_guard<std::mutex> lock(clientsMutex);
-                        if (playerInfoMap.count(clientSocket)) {
-                            playerInfoMap[clientSocket].velX = vx;
-                            playerInfoMap[clientSocket].velY = vy;
-                            playerInfoMap[clientSocket].velZ = vz;
-                        }
-                    }
-                    std::string broadcastMsg = "VEL:" + username + ":" + std::to_string(characterType) + ":" +
-                                               parts[1] + ":" + parts[2] + ":" + parts[3] + "\n";
-                    broadcastMessage(broadcastMsg, clientSocket);
-                } catch (...) {
+                float vx, vy, vz;
+                if (!ewb::parse_move_vel(parts[1], parts[2], parts[3], vx, vy, vz)) {   // stage 7.16
                     if (invalidMsgNotice.allow(monoSeconds()))
                         std::cout << "[Server] Invalid VEL message from " << username << std::endl;
+                    continue;
                 }
+                {
+                    std::lock_guard<std::mutex> lock(clientsMutex);
+                    auto pit = playerInfoMap.find(clientSocket);
+                    if (pit != playerInfoMap.end()) {
+                        pit->second.velX = vx;
+                        pit->second.velY = vy;
+                        pit->second.velZ = vz;
+                    }
+                }
+                std::string broadcastMsg = "VEL:" + username + ":" + std::to_string(characterType) + ":" +
+                                           parts[1] + ":" + parts[2] + ":" + parts[3] + "\n";
+                broadcastMessage(broadcastMsg, clientSocket);
             }
             // ACTION:x:y:z:mode[:typeOrColor]   mode 0=build 1=mine 2=burn 3=paint
             else if (command == "ACTION" && parts.size() >= 5) {
@@ -3368,8 +3506,8 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                 // history — to the whole server. WorldEdit's own `cells`/`cmds`
                 // buckets (stage 3.3) already pace commands, so the chat budget
                 // below applies only to actual broadcast chat, not commands.
+                // (Reaching here at all means JOIN succeeded — stage 7.17's gate.)
                 if (msgContent[0] == '/') {
-                    if (!joined) continue;
                     if (!g_weEnabled) { weSay(clientSocket, "Commands are disabled on this server."); continue; }
                     handleWorldEditLine(clientSocket, username, msgContent, we, regionLimiter);
                     continue;
@@ -3499,30 +3637,33 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                 std::string welcome = "[Server] Welcome, " + username + "! (Character Type: " + std::to_string(characterType) + ")\n";
                 sendLine(clientSocket, welcome);
 
-                // 2. capability advertisement. This is what tells the client to ask
+                // 2. the operator's welcome message, if this world has one
+                //    (eden_motd.txt / --motd-file). Ordinary `[Server]` chat
+                //    lines, so no client has to learn anything new; a world with
+                //    no MOTD sends nothing and the sequence is unchanged.
+                {
+                    std::vector<std::string> motd;
+                    { std::lock_guard<std::mutex> lk(g_motdMtx); motd = g_motdLines; }
+                    for (const std::string& l : motd) sendLine(clientSocket, l);
+                }
+
+                // 3. capability advertisement. This is what tells the client to ask
                 //    for terrain with REGION instead of expecting a push; VuencLink
                 //    will not send a REGION until it sees this line.
-                static const char* kCaps = "CAPS:region\n";
-                sendLine(clientSocket, kCaps, strlen(kCaps));
+                sendLine(clientSocket, "CAPS:region\n");
 
-                // 3. SPAWN — this name's saved position if it has one, otherwise
+                // 4. SPAWN — this name's saved position if it has one, otherwise
                 //    the world's default spawn (eden_spawn.txt / --spawn, stage
                 //    5.3). A returning player's own row always wins.
                 {
                     std::lock_guard<std::mutex> lk(g_posMtx);
                     auto it = g_playerPos.find(username);
                     if (it != g_playerPos.end()) {
-                        char sp[96];
-                        int n = snprintf(sp, sizeof(sp), "SPAWN:%.2f:%.2f:%.2f\n",
-                                         it->second.x, it->second.y, it->second.z);
-                        sendLine(clientSocket, sp, (size_t)n);
+                        sendLine(clientSocket, spawnLine(it->second.x, it->second.y, it->second.z));
                         std::cout << "[Server] Restored " << username << " to ("
                                   << it->second.x << "," << it->second.y << "," << it->second.z << ")\n";
                     } else if (g_haveWorldSpawn) {
-                        char sp[96];
-                        int n = snprintf(sp, sizeof(sp), "SPAWN:%.2f:%.2f:%.2f\n",
-                                         g_worldSpawn.x, g_worldSpawn.y, g_worldSpawn.z);
-                        sendLine(clientSocket, sp, (size_t)n);
+                        sendLine(clientSocket, spawnLine(g_worldSpawn.x, g_worldSpawn.y, g_worldSpawn.z));
                         std::cout << "[Server] Spawned " << username << " at world spawn ("
                                   << g_worldSpawn.x << "," << g_worldSpawn.y << "," << g_worldSpawn.z << ")\n";
                     }
@@ -3540,15 +3681,10 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
             // REGION:x:z — the client asks for the world around a point; we answer
             // with a SNAPZ burst. See serveRegion().
             else if (command == "REGION" && parts.size() >= 3) {
-                // ⚠️ Gated on JOIN. Without this, an unauthenticated peer on a
+                // ⚠️ Gated on JOIN — by the stage 7.17 gate at the top of the
+                // dispatch, not here. Without it an unauthenticated peer on a
                 // passworded server could pull the entire world without ever
-                // supplying the password — and REGION is the amplification vector,
-                // so the cheapest place to require a handshake is here.
-                if (!joined) {
-                    if (g_verbose) std::cout << "[Server] REGION before JOIN from client "
-                                             << clientId << "; ignored." << std::endl;
-                    continue;
-                }
+                // supplying the password, and REGION is the amplification vector.
                 try {
                     serveRegion(clientSocket, username,
                                 std::stoi(parts[1]), std::stoi(parts[2]), regionLimiter);
@@ -3561,27 +3697,18 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
             // SIGNQ — the client asks for the world's signs; we answer with a burst
             // of SIGNP lines and no terminator. See serveSigns() / sign_store.h.
             else if (command == "SIGNQ") {
-                // Gated on JOIN for the same reason REGION is: a 6-byte request
-                // answered with the entire sign file is an amplification vector, and
-                // on a passworded server it would leak world content to a peer that
-                // never supplied the password.
-                if (!joined) {
-                    if (g_verbose) std::cout << "[Server] SIGNQ before JOIN from client "
-                                             << clientId << "; ignored." << std::endl;
-                    continue;
-                }
+                // Gated on JOIN (stage 7.17's gate) for the same reason REGION is:
+                // a 6-byte request answered with the entire sign file is an
+                // amplification vector, and on a passworded server it would leak
+                // world content to a peer that never supplied the password.
                 serveSigns(clientSocket, username, signLimiter);
             }
             // SIGNP:x:y:z:a:b:c:text — a player placed or edited a sign. Gated on JOIN
-            // (a sign is world content, and a passworded server must not take it
-            // from a peer that never authenticated) and paced per connection, since
-            // each write rebuilds the burst every SIGNQ is answered from.
+            // by stage 7.17's gate (a sign is world content, and a passworded server
+            // must not take it from a peer that never authenticated) and paced per
+            // connection, since each write rebuilds the burst every SIGNQ is
+            // answered from.
             else if (command == "SIGNP") {
-                if (!joined) {
-                    if (g_verbose) std::cout << "[Server] SIGNP before JOIN from client "
-                                             << clientId << "; ignored." << std::endl;
-                    continue;
-                }
                 if (!signWriteBucket.allow(monoSeconds())) {
                     if (!signWarned) {
                         std::cerr << "[Server] " << username
@@ -3600,19 +3727,24 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
             // --verbose: it is per-client and frequent (VuencLink sends one every
             // 10 s), and a log line per ping drowns everything else.
             else if (command == "PING") {
-                static const char* kPong = "PONG\n";
-                sendLine(clientSocket, kPong, strlen(kPong));
+                // Short enough to live in the std::string's own storage, so the
+                // per-ping cost is the same as the deleted (SOCKET, char*, size_t)
+                // overload's was.
+                sendLine(clientSocket, "PONG\n");
             }
             // Anything else — log it once per verb so a real client's un-modelled
             // messages surface instead of being silently swallowed by this else-if
             // chain. (This is how the client's `SIGNP` sign write was found.)
+            // Only reachable from a joined player since stage 7.17: an unknown verb
+            // from a peer that never handshook is dropped by the gate above, which
+            // takes `seen` — an unbounded set keyed on untrusted bytes, stage 7.24 —
+            // out of an anonymous peer's reach.
             else if (g_verbose && !command.empty()) {
                 static std::mutex seenMtx;
                 static std::set<std::string> seen;
                 std::lock_guard<std::mutex> lk(seenMtx);
                 if (seen.insert(command).second) {
-                    std::cout << "[Server] unrecognised line from "
-                              << (joined ? username : ("client #" + std::to_string(clientId)))
+                    std::cout << "[Server] unrecognised line from " << username
                               << ": " << message.substr(0, 64)
                               << (message.size() > 64 ? "..." : "") << std::endl;
                 }
@@ -3650,7 +3782,8 @@ int main(int argc, char* argv[]) {
     // Args: [port] and/or flags:
     //   --port N  --name "My World"  --password PASS  --world FILE  --signs FILE
     //   --world-format edmb|text   (what a save writes; loading accepts both)
-    //   --spawn x:y:z  --spawn-file FILE  --players-file FILE  --max-world-cells N
+    //   --spawn x:y:z  --spawn-file FILE  --motd-file FILE  --players-file FILE
+    //   --max-world-cells N
     //   --matchmaker HOST[:PORT]
     //   --region-radius N  --no-region-sort  --no-region-empty-frame
     //   --action-rate N  --action-burst N   (0 = unlimited)
@@ -3674,13 +3807,17 @@ int main(int argc, char* argv[]) {
         }
         else if (a == "--signs")      g_signFile   = next("eden_signs.txt");
         else if (a == "--spawn-file") g_spawnFile  = next("eden_spawn.txt");
+        else if (a == "--motd-file")  g_motdFile   = next("eden_motd.txt");
         else if (a == "--players-file") g_posFile  = next("eden_players.txt");
         else if (a == "--spawn") {
             // Inline default spawn; overrides (and skips) eden_spawn.txt.
             const std::string v = next("x:y:z");
             ewb::Spawn s;
-            if (ewb::parse_spawn_line(v, s)) { g_worldSpawn = s; g_haveWorldSpawn = true; }
-            else std::cerr << "[Server] --spawn " << v << " is not x:y:z; ignored." << std::endl;
+            if (!ewb::parse_spawn_line(v, s))
+                std::cerr << "[Server] --spawn " << v << " is not x:y:z; ignored." << std::endl;
+            else if (!ewb::move_pos_valid(s.x, s.y, s.z))   // same bound as a player's own position (7.16)
+                std::cerr << "[Server] --spawn " << v << " is outside the world; ignored." << std::endl;
+            else { g_worldSpawn = s; g_haveWorldSpawn = true; }
         }
         else if (a == "--max-world-cells") {
             const long long v = std::atoll(next("4000000").c_str());
@@ -3875,6 +4012,16 @@ int main(int argc, char* argv[]) {
                           : g_worldFile.substr(0, slash + 1) + "eden_spawn.txt";
     }
 
+    // Default the welcome message to <worlddir>/eden_motd.txt, so a world in its
+    // own directory picks up its own MOTD with no extra flag (the same rule the
+    // spawn sidecar above follows). --motd-file overrides the path.
+    if (g_motdFile.empty()) {
+        const size_t slash = g_worldFile.find_last_of('/');
+        g_motdFile = (slash == std::string::npos)
+                         ? std::string("eden_motd.txt")
+                         : g_worldFile.substr(0, slash + 1) + "eden_motd.txt";
+    }
+
     // Default the player-position file to <worlddir>/eden_players.txt, the same
     // directory the world/spawn files live in. 5.3 did this for the spawn sidecar
     // and missed this one, so every world hosted from one cwd shared a single
@@ -3957,6 +4104,14 @@ int main(int argc, char* argv[]) {
     pruneOrphanSigns();   // after both loads: drop signs on blocks stored as air (stage 7.2)
     loadBans();
     loadOps();
+    {
+        // eden_motd.txt: the welcome message shown on join. Absent is normal and
+        // silent (the `--signs` convention); a present one is worth a line,
+        // because "why don't players see my MOTD" is otherwise unanswerable.
+        const size_t n = loadMotd();
+        if (n) std::cout << "[Server] Loaded MOTD (" << n << " line(s)) from "
+                         << g_motdFile << "." << std::endl;
+    }
 
     if (g_haveWorldSpawn)
         std::cout << "[Server] World spawn " << g_worldSpawn.x << ":" << g_worldSpawn.y << ":"

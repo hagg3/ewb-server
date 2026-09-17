@@ -78,13 +78,13 @@ echo "Built ./world_store_test  —  chunk store / mined sentinel / EDMB / legac
 ./out_queue_test
 echo "Built ./out_queue_test  —  output queue priority / overflow / frame integrity"
 
-# Offline sign + spawn + hardening checks: eden_signs.txt / eden_spawn.txt
-# parsing, SIGNP formatting, username/ACTION validation, token bucket, connect
-# limiter, constant-time password compare + failed-auth limiter
+# Offline sign + spawn + MOTD + hardening checks: eden_signs.txt / eden_spawn.txt
+# / eden_motd.txt parsing, SIGNP formatting, username/ACTION validation, token
+# bucket, connect limiter, constant-time password compare + failed-auth limiter
 # (ROADMAP-SERVER stages 1.5 + 1.7 + 1.10 + 5.3). No zlib needed.
 "$CXX" -std=c++17 -O2 -Wall protocol_test.cpp -o protocol_test
 ./protocol_test
-echo "Built ./protocol_test  —  signs / spawn / names / rate limits"
+echo "Built ./protocol_test  —  signs / spawn / MOTD / names / rate limits"
 
 # Offline control-surface checks: line grammar, the command table, the persisted
 # ban list + op-level files, fill volume arithmetic (ROADMAP-SERVER stage 3.2),

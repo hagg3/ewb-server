@@ -42,6 +42,7 @@ shell words:
 edenctl say "server restarting in 5 minutes"
 edenctl kick Griefer "spamming chat"
 edenctl fill 65530 33 65530 65542 33 65542 3 14
+edenctl motd reload
 ```
 
 Socket path: `-S`, else `$EDENSERVER_CONTROL_SOCKET`, else `./edenserver.sock`, else
@@ -70,6 +71,8 @@ A raw client works too — `printf 'who\n' | nc -U ./edenserver.sock`.
 | `signs reload` | Re-read the sign sidecar from disk, then drop any sign on a block the world stores as air and rewrite the file (the reply says how many). Refused while players have placed or removed signs that are not saved yet — run `save` first. A running server's saves rewrite the file, so hand-edit it only while the server is stopped. |
 | `signs add <x> <y> <z> <a> <b> <c> <text>` | Append a sign and rewrite the sidecar. `a`/`b`/`c` are of unknown meaning — `0 0 0` is a fine default. New `SIGNQ`s get the updated burst. |
 | `signs rm <x> <y> <z>` | Remove every sign on that block, whatever its face, and rewrite the sidecar. You rarely need it for a sign whose block is gone: any edit that turns a block to air removes its signs. |
+| `motd reload` | Re-read the welcome-message sidecar (`eden_motd.txt` / `--motd-file`) from disk. Takes effect on the next player to join; nobody is disconnected and nothing else is touched. Unlike `signs reload` it can never refuse: the server never writes this file, so there is no unsaved state to protect. |
+| `motd show` | Print the MOTD that is live right now, as the wire lines a joining player is sent. |
 | `region-stats` | `REGION` service counters since start: requests, cells scanned, records emitted, bytes out, and total/mean time (scan and sort only — encoding and sending happen on each client's writer thread and are reported per reply in the `REGION drain` log line). Then backpressure: requests refused because a client's queue or the server's record backlog was full, records queued right now against `--region-pending-records`, and clients disconnected for falling too far behind on world updates. |
 
 ### Notes
@@ -82,6 +85,12 @@ A raw client works too — `printf 'who\n' | nc -U ./edenserver.sock`.
   to see them.
 - **`ban` enforcement:** IP bans are checked at `accept()` before a connection thread starts;
   name bans are checked at `JOIN`. Both are read from `eden_bans.txt` at startup.
+- **Changing the welcome message** is edit-then-reload: write the lines into the world's
+  `eden_motd.txt` (grammar in
+  [configuration.md § `eden_motd.txt`](configuration.md#eden_motdtxt)) and run `motd reload`.
+  The file is operator input only — the server never rewrites it — so editing it on a running
+  server is safe, unlike `eden_signs.txt`. [`ops/motd-edit.sh`](../ops/motd-edit.sh) does both
+  steps interactively over ssh for a remote host.
 - Every command that changes state is written to the audit channel — one `[Audit]` line with a
   UTC timestamp, on stdout and in `--audit-file`. See
   [configuration.md § The audit channel](configuration.md#the-audit-channel).

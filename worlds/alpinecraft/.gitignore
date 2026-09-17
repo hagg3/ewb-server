@@ -1,0 +1,4 @@
+# Written by eden_import. worlds/ is tracked in this repository, so an
+# imported world would otherwise be committed by `git add -A`.
+*
+!.gitignore

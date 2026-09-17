@@ -1,6 +1,7 @@
 // hardening.h — the pure, testable half of ROADMAP-SERVER stage 1.7: username
 // validation, per-connection token buckets, a per-IP connect limiter, `ACTION`
-// payload validation and text sanitisation.
+// payload validation and text sanitisation — plus (stage 7.16) movement-field
+// validation and (stage 7.17) the pre-`JOIN` verb gate.
 //
 // Everything here is a pure function or a small self-contained struct with an
 // explicit `now` parameter (seconds, monotonic — the caller supplies the clock),
@@ -20,11 +21,20 @@
 //                  the cell cap *and* fanning out to every peer.
 //   * connects   — `SV_MAX_CLIENTS` bounds concurrency but not churn: a connect
 //                  flood still spawns a thread per attempt.
+//   * movement   — (stage 7.16) `std::stof` was the only filter on `POS`/`VEL`/
+//                  `POSVEL`, so `nan`, `inf` and `1e38` reached the server's
+//                  state, the relay, and `SPAWN`'s fixed-size formatter — where
+//                  `1e38` over-read the buffer and put stack bytes on the wire.
+//   * pre-JOIN   — (stage 7.17) five verbs skipped the handshake check the other
+//                  four had, so on a `--password` server the world and the chat
+//                  channel were writable by a peer that never sent the password.
 
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <iterator>
 #include <string>
 #include <unordered_map>
@@ -97,6 +107,31 @@ inline NameVerdict validate_username(const std::string& name) {
     return NameVerdict::Ok;
 }
 
+// --- pre-JOIN admission gate (stage 7.17) ------------------------------------
+
+/// May this verb be acted on by a connection that has not completed its `JOIN`?
+///
+/// `JOIN` is the *only* authentication a `--password` server has, so every verb
+/// that touches the world, the roster, the player store or another player's
+/// screen has to sit behind it. Until stage 7.17 only `REGION`, `SIGNQ`, `SIGNP`
+/// and the `/`-command path checked; `ACTION`, `MSG`, `POS`, `VEL` and `POSVEL`
+/// did not — so an unauthenticated peer could edit and persist the world,
+/// broadcast chat as `Player<n>`, and inject a phantom player that never gets a
+/// `has left` line.
+///
+/// Written as one allow-list rather than five per-verb checks so that a verb
+/// added later is gated *by default* — the same structural argument
+/// `worldedit.h`'s permission table makes. An unknown verb is refused too,
+/// which also keeps `--verbose`'s unrecognised-verb set out of a stranger's
+/// reach.
+///
+/// `PING` is allowed through. Its reply is a bare `PONG` that reveals nothing a
+/// successful TCP connect has not already revealed, and a real client's 10 s
+/// ping timer can fire while its own `JOIN` is still in flight.
+inline bool verb_allowed_before_join(const std::string& command) {
+    return command == "JOIN" || command == "PING";
+}
+
 // --- ACTION payload ----------------------------------------------------------
 
 /// Highest block id the server will accept in an `ACTION:...:0:<type>`.
@@ -120,6 +155,76 @@ inline bool action_extra_valid(int mode, int extra) {
     if (mode == 0) return extra >= 0 && extra <= MAX_BLOCK_TYPE;
     if (mode == 3) return extra >= 0 && extra <= MAX_PAINT_INDEX;
     return true;
+}
+
+// --- movement floats (stage 7.16) --------------------------------------------
+
+/// Horizontal bound: the 24-bit key range `ACTION` already enforces. x/z are
+/// centred on 65536, so a playable position is nowhere near either end.
+constexpr float MOVE_XZ_MAX = 16777215.0f;   // 0xFFFFFF
+
+/// Vertical bound: the world is 0..255, but a *player's* y is the origin of the
+/// avatar, which sits ~0.92 above the block it stands on (ground standing height
+/// 33.92 over block 33), and a jump adds a couple more. 272 is the world height
+/// plus enough headroom that standing on and jumping from the topmost block is
+/// still a legal position; anything past it is not a game state.
+constexpr float MOVE_Y_MAX = 272.0f;
+
+/// Velocity bound. Not a physics claim — no capture pins the real terminal
+/// speed — just a ceiling far above anything playable, so a relayed velocity
+/// stays a bounded number instead of `1e38`.
+constexpr float MOVE_VEL_MAX = 4096.0f;
+
+/// Parse one movement field strictly: the whole token must be a finite float.
+///
+/// `std::stof` is not enough. It skips leading whitespace, stops at the first
+/// byte it cannot use and returns without throwing, so `"1\r"`, `"1x"` and
+/// `"  1"` all "parse" — and it accepts `nan`, `inf` and `1e38`. Every one of
+/// those then reaches the server's state, the relay, and `SPAWN`'s formatter.
+inline bool parse_move_float(const std::string& in, float& out) {
+    if (in.empty()) return false;
+    switch (in[0]) {   // strtof would skip these; the wire grammar has no padding
+        case ' ': case '\t': case '\v': case '\f': case '\r': case '\n': return false;
+        default: break;
+    }
+    char* end = nullptr;
+    const float v = std::strtof(in.c_str(), &end);
+    // Rejects trailing junk, and an embedded NUL (strtof stops short of size()).
+    if (end != in.c_str() + in.size()) return false;
+    // nan/inf as written, and the HUGE_VALF an out-of-float-range literal returns.
+    if (!std::isfinite(v)) return false;
+    out = v;
+    return true;
+}
+
+/// A position the server will store, relay and later hand back as a `SPAWN`.
+/// NaN fails every comparison, so it is refused here too even if it somehow
+/// reached this without going through `parse_move_float`.
+inline bool move_pos_valid(float x, float y, float z) {
+    return x >= 0.0f && x <= MOVE_XZ_MAX &&
+           z >= 0.0f && z <= MOVE_XZ_MAX &&
+           y >= 0.0f && y <= MOVE_Y_MAX;
+}
+
+inline bool move_vel_valid(float vx, float vy, float vz) {
+    return vx >= -MOVE_VEL_MAX && vx <= MOVE_VEL_MAX &&
+           vy >= -MOVE_VEL_MAX && vy <= MOVE_VEL_MAX &&
+           vz >= -MOVE_VEL_MAX && vz <= MOVE_VEL_MAX;
+}
+
+/// `POS:x:y:z` (and the position half of `POSVEL`): parse all three fields and
+/// bound them together, so a caller cannot forget half of the rule.
+inline bool parse_move_pos(const std::string& sx, const std::string& sy, const std::string& sz,
+                           float& x, float& y, float& z) {
+    return parse_move_float(sx, x) && parse_move_float(sy, y) && parse_move_float(sz, z) &&
+           move_pos_valid(x, y, z);
+}
+
+/// `VEL:x:y:z` (and the velocity half of `POSVEL`).
+inline bool parse_move_vel(const std::string& sx, const std::string& sy, const std::string& sz,
+                           float& x, float& y, float& z) {
+    return parse_move_float(sx, x) && parse_move_float(sy, y) && parse_move_float(sz, z) &&
+           move_vel_valid(x, y, z);
 }
 
 // --- world cell cap ----------------------------------------------------------

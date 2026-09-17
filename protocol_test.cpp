@@ -4,7 +4,9 @@
 // payload validation, the world cell cap headroom, token bucket, per-IP connect
 // limiter, constant-time password compare, per-IP failed-auth limiter, text
 // sanitisation) — plus the explode.h TNT/paint chain worklist and its
-// EXPLODE_MAX_CHAIN fan-out bound (stage 7.7).
+// EXPLODE_MAX_CHAIN fan-out bound (stage 7.7), the movement-field validator
+// and spawn formatter of stage 7.16, and the `eden_motd.txt` welcome-message
+// sidecar (motd_store.h).
 //
 //   clang++ -std=c++17 -O2 -Wall protocol_test.cpp -o protocol_test
 //   ./protocol_test
@@ -14,6 +16,7 @@
 // chat kill-switch removal (1.6) are wire-order properties of handleClient and are
 // covered by the live socket test in the stage 1.8 ladder, not here.
 
+#include <cmath>
 #include <cstdio>
 #include <map>
 #include <random>
@@ -27,6 +30,7 @@
 
 #include "explode.h"
 #include "hardening.h"
+#include "motd_store.h"
 #include "sign_store.h"
 #include "spawn_store.h"
 
@@ -286,6 +290,63 @@ static void test_explode_chain_capped() {
 
 // --- world spawn sidecar (stage 5.3) ---------------------------------------
 
+// --- eden_motd.txt (the per-world welcome message) --------------------------
+
+static void test_motd_parse() {
+    {
+        std::istringstream in("# the rules\n"
+                              "Welcome! This server is moderated.\n"
+                              "\n"
+                              "   Griefing results in a ban.   \n");
+        const auto lines = ewb::parse_motd(in);
+        CHECK(lines.size() == 2, "comments and blank lines are skipped");
+        CHECK(lines[0] == "Welcome! This server is moderated.", "first line kept verbatim");
+        CHECK(lines[1] == "Griefing results in a ban.", "surrounding whitespace trimmed");
+    }
+    {
+        std::istringstream in("");
+        CHECK(ewb::parse_motd(in).empty(), "an empty file is an empty MOTD");
+    }
+    {
+        std::istringstream in("#only a comment\n   \n");
+        CHECK(ewb::parse_motd(in).empty(), "comments-and-blanks only is an empty MOTD");
+    }
+    {
+        // A hand-edited file is operator input but becomes wire output: a line
+        // carrying a newline must not be able to smuggle a second wire line in.
+        std::istringstream in("hi\x01there\nSIGNP:1:2:3");
+        const auto lines = ewb::parse_motd(in);
+        CHECK(lines.size() == 2, "two lines");
+        CHECK(lines[0] == "hithere", "control characters stripped");
+        const std::string wire = ewb::format_motd_line(lines[1]);
+        CHECK(wire == "[Server] SIGNP:1:2:3\n",
+              "a line that looks like a verb is still a [Server] chat line");
+        CHECK(wire.find('\n') == wire.size() - 1, "exactly one newline, at the end");
+    }
+    {
+        std::istringstream in(std::string(ewb::MOTD_MAX_LINE + 50, 'x') + "\n");
+        const auto lines = ewb::parse_motd(in);
+        CHECK(lines.size() == 1 && lines[0].size() == ewb::MOTD_MAX_LINE,
+              "an over-long line is truncated to the chat cap");
+    }
+    {
+        std::string many;
+        for (size_t i = 0; i < ewb::MOTD_MAX_LINES + 3; ++i) many += "line\n";
+        std::istringstream in(many);
+        size_t dropped = 0;
+        const auto lines = ewb::parse_motd(in, ewb::MOTD_MAX_LINES, ewb::MOTD_MAX_LINE, &dropped);
+        CHECK(lines.size() == ewb::MOTD_MAX_LINES, "line count capped");
+        CHECK(dropped == 3, "the dropped lines are counted, not silently lost");
+    }
+    {
+        std::istringstream in("one\ntwo\n");
+        const auto burst = ewb::format_motd_burst(ewb::parse_motd(in));
+        CHECK(burst.size() == 2, "one wire line per MOTD line");
+        CHECK(burst[0] == "[Server] one\n" && burst[1] == "[Server] two\n",
+              "wire lines are [Server] chat lines in file order");
+    }
+}
+
 static void test_spawn_parse() {
     ewb::Spawn s;
     bool skip = true;
@@ -365,6 +426,146 @@ static void test_action_extra_validation() {
     // fatal — a client that sends one is odd, not hostile.
     CHECK(action_extra_valid(1, 9999), "mine ignores extra");
     CHECK(action_extra_valid(2, -5), "burn ignores extra");
+}
+
+// --- pre-JOIN admission gate (stage 7.17) ------------------------------------
+//
+// Five verbs used to skip the handshake check the other four had, so on a
+// `--password` server an anonymous peer could edit the world, broadcast chat and
+// inject a phantom player. The rule is an allow-list, so the interesting half of
+// this test is everything it *refuses* — including a verb nobody has written yet.
+
+static void test_verb_allowed_before_join() {
+    using ewb::verb_allowed_before_join;
+
+    CHECK(verb_allowed_before_join("JOIN"), "JOIN is how a connection stops being anonymous");
+    CHECK(verb_allowed_before_join("PING"), "PING answers a bare PONG and leaks nothing");
+
+    // The five the finding named.
+    CHECK(!verb_allowed_before_join("ACTION"), "ACTION pre-JOIN edits and persists the world");
+    CHECK(!verb_allowed_before_join("MSG"), "MSG pre-JOIN broadcasts chat as Player<n>");
+    CHECK(!verb_allowed_before_join("POS"), "POS pre-JOIN injects a phantom player");
+    CHECK(!verb_allowed_before_join("VEL"), "VEL pre-JOIN is relayed too");
+    CHECK(!verb_allowed_before_join("POSVEL"), "POSVEL pre-JOIN is relayed too");
+
+    // The four that already checked, now relying on this gate instead.
+    CHECK(!verb_allowed_before_join("REGION"), "REGION pre-JOIN is the amplification vector");
+    CHECK(!verb_allowed_before_join("SIGNQ"), "SIGNQ pre-JOIN dumps the sign file");
+    CHECK(!verb_allowed_before_join("SIGNP"), "SIGNP pre-JOIN writes world content");
+
+    // Default-deny is the point: an unknown verb, the empty line, and a
+    // case-shifted or whitespace-padded spelling of an allowed one all fail. The
+    // dispatch below the gate compares verbs exactly, so the gate must too — a
+    // looser match here would be a way past it.
+    CHECK(!verb_allowed_before_join("FUTUREVERB"), "a verb added later is gated by default");
+    CHECK(!verb_allowed_before_join(""), "the empty verb");
+    CHECK(!verb_allowed_before_join("join"), "lowercase is not the wire spelling");
+    CHECK(!verb_allowed_before_join("JOIN "), "trailing space is not JOIN");
+    CHECK(!verb_allowed_before_join("PING\r"), "a CRLF-framed PING is not PING");
+    CHECK(!verb_allowed_before_join("JOINX"), "a prefix match is not a match");
+}
+
+// --- movement fields (stage 7.16) --------------------------------------------
+//
+// What `std::stof` let through before this existed: `1e38` reached `SPAWN`'s
+// 96-byte formatter, where snprintf's "would have written" return (132) made the
+// server read 36 bytes past the buffer and send that stack to the client.
+
+static void test_parse_move_float() {
+    using ewb::parse_move_float;
+    float v = -1.0f;
+
+    CHECK(parse_move_float("33.92", v) && v == 33.92f, "the ground standing height");
+    CHECK(parse_move_float("65536", v) && v == 65536.0f, "an integer field");
+    CHECK(parse_move_float("-0.5", v) && v == -0.5f, "a negative (a velocity field)");
+    CHECK(parse_move_float("65536.00", v) && v == 65536.0f, "the precision the server itself writes");
+    CHECK(parse_move_float("1e2", v) && v == 100.0f, "exponent notation");
+    CHECK(parse_move_float("0", v) && v == 0.0f, "zero");
+
+    // The whole token, or nothing: stof stopped at the first unusable byte and
+    // returned without throwing, so all of these used to "parse".
+    CHECK(!parse_move_float("1\r", v), "a bare CR is not a float (it was relayed verbatim)");
+    CHECK(!parse_move_float("1x", v), "trailing junk");
+    CHECK(!parse_move_float("1 ", v), "trailing space");
+    CHECK(!parse_move_float(" 1", v), "leading space (strtof would skip it)");
+    CHECK(!parse_move_float("\t1", v), "leading tab");
+    CHECK(!parse_move_float("", v), "empty field");
+    CHECK(!parse_move_float("abc", v), "not a number at all");
+    CHECK(!parse_move_float(std::string("1\0" "2", 3), v), "an embedded NUL cannot hide a tail");
+
+    // Non-finite, however spelled.
+    CHECK(!parse_move_float("nan", v), "nan");
+    CHECK(!parse_move_float("NaN", v), "nan, any case");
+    CHECK(!parse_move_float("inf", v), "inf");
+    CHECK(!parse_move_float("-inf", v), "-inf");
+    CHECK(!parse_move_float("infinity", v), "infinity");
+    CHECK(!parse_move_float("1e40", v), "past float range -> HUGE_VALF, not a number");
+
+    // 1e38 *is* a finite float — it is the range check, not the finiteness
+    // check, that stops the one that reached the SPAWN buffer.
+    CHECK(parse_move_float("1e38", v) && v == 1e38f, "1e38 parses; the bound is what refuses it");
+    CHECK(!ewb::move_pos_valid(1e38f, 1e38f, 1e38f), "...and the bound refuses it");
+}
+
+static void test_move_bounds() {
+    using ewb::move_pos_valid;
+    using ewb::move_vel_valid;
+
+    // x/z are centred on 65536; a real position is nowhere near either edge.
+    CHECK(move_pos_valid(65536.0f, 33.92f, 65536.0f), "a player standing on the ground");
+    CHECK(move_pos_valid(0.0f, 0.0f, 0.0f), "the corner of the box is inclusive");
+    CHECK(move_pos_valid(ewb::MOVE_XZ_MAX, ewb::MOVE_Y_MAX, ewb::MOVE_XZ_MAX), "the far corner too");
+    CHECK(move_pos_valid(65536.0f, 256.92f, 65536.0f), "standing on the topmost block clears 255");
+
+    CHECK(!move_pos_valid(-0.5f, 33.92f, 65536.0f), "x below the box");
+    CHECK(!move_pos_valid(65536.0f, 33.92f, -1.0f), "z below the box");
+    CHECK(!move_pos_valid(ewb::MOVE_XZ_MAX + 1024.0f, 33.92f, 65536.0f), "x past the 24-bit range");
+    CHECK(!move_pos_valid(65536.0f, -1.0f, 65536.0f), "y below the world (fallen out of it)");
+    CHECK(!move_pos_valid(65536.0f, ewb::MOVE_Y_MAX + 1.0f, 65536.0f), "y above the headroom");
+
+    const float nan_ = std::nanf("");
+    CHECK(!move_pos_valid(nan_, 33.92f, 65536.0f), "nan fails every comparison, so it is refused");
+    CHECK(!move_vel_valid(nan_, 0.0f, 0.0f), "nan velocity too");
+
+    // Velocity is signed and symmetric — the bound is a ceiling, not a box.
+    CHECK(move_vel_valid(0.0f, -9.8f, 0.0f), "falling");
+    CHECK(move_vel_valid(-ewb::MOVE_VEL_MAX, ewb::MOVE_VEL_MAX, 0.0f), "the ceiling is inclusive");
+    CHECK(!move_vel_valid(0.0f, -(ewb::MOVE_VEL_MAX + 1.0f), 0.0f), "past the ceiling");
+    CHECK(!move_vel_valid(1e38f, 0.0f, 0.0f), "the SPAWN-buffer value as a velocity");
+}
+
+static void test_parse_move_triples() {
+    float x, y, z;
+
+    CHECK(ewb::parse_move_pos("65536.00", "33.92", "65540.50", x, y, z) &&
+              x == 65536.0f && y == 33.92f && z == 65540.5f,
+          "a POS the retail client would send");
+    // The reported repro: POS:1e38:1e38:1e38, stored and handed back as SPAWN.
+    CHECK(!ewb::parse_move_pos("1e38", "1e38", "1e38", x, y, z), "the 7.16 repro is refused");
+    CHECK(!ewb::parse_move_pos("65536", "nan", "65536", x, y, z), "one bad field fails the triple");
+    CHECK(!ewb::parse_move_pos("65536", "33.92", "65536\r", x, y, z), "a CRLF-framed line is refused");
+
+    // The 7.18 amplifier's shape: long, but it does parse — the length rule is a
+    // separate stage; what matters here is that the *value* is in range.
+    CHECK(ewb::parse_move_pos(std::string(1300, '0') + "1", "33.92", "65536", x, y, z) && x == 1.0f,
+          "leading zeros still parse to an in-range value");
+
+    CHECK(ewb::parse_move_vel("0.00", "-9.81", "0.00", x, y, z) && y == -9.81f, "a VEL triple");
+    CHECK(!ewb::parse_move_vel("0", "-inf", "0", x, y, z), "a non-finite velocity field");
+}
+
+// The defect itself: a string built from snprintf's return over-reads the buffer.
+// `format_spawn_line` is the shared formatter; the server's own `spawnLine` is in
+// the single TU, so this stands in for both — same 96 bytes, same %.2f grammar.
+static void test_spawn_format_cannot_over_read() {
+    const std::string ok = ewb::format_spawn_line({65536.0f, 33.92f, 65540.5f});
+    CHECK(ok == "65536.00:33.92:65540.50\n", "an in-range spawn formats exactly");
+
+    // 1e38 at %.2f needs 132 bytes. The result must be clamped to the buffer, not
+    // 132 bytes read from a 96-byte array.
+    const std::string huge = ewb::format_spawn_line({1e38f, 1e38f, 1e38f});
+    CHECK(huge.size() < 96, "an out-of-range spawn is truncated, not over-read");
+    CHECK(huge.compare(0, 8, "99999996") == 0, "...and what it does hold is the formatted value");
 }
 
 // --- token bucket (stage 1.7) ------------------------------------------------
@@ -653,8 +854,14 @@ int main() {
     test_explode_single_tnt_golden();
     test_explode_chain_capped();
     test_spawn_parse();
+    test_motd_parse();
     test_username_validation();
     test_action_extra_validation();
+    test_verb_allowed_before_join();
+    test_parse_move_float();
+    test_move_bounds();
+    test_parse_move_triples();
+    test_spawn_format_cannot_over_read();
     test_token_bucket();
     test_connect_limiter();
     test_const_time_eq();

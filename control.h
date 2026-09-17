@@ -64,6 +64,7 @@ inline const std::vector<CtlSpec>& ctl_specs() {
         {"setblock",     4,  5, "setblock:<x>:<y>:<z>:<type>[:<color>] — place one block"},
         {"fill",         7,  8, "fill:<x0>:<y0>:<z0>:<x1>:<y1>:<z1>:<type>[:<color>] — fill a box"},
         {"signs",        1, -1, "signs:reload | signs:add:<x>:<y>:<z>:<a>:<b>:<c>:<text> | signs:rm:<x>:<y>:<z>"},
+        {"motd",         1,  1, "motd:reload | motd:show          — re-read / print the welcome message"},
         {"region-stats", 0,  0, "region-stats                     — REGION counters since start"},
     };
     return specs;

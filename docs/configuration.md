@@ -27,7 +27,7 @@ server. Unknown flags are ignored.
 |---|---|---|
 | `--port N` | `27015` | TCP port to listen on. Binds all interfaces. |
 | `--name "Text"` | `Eden Server` | Server name sent to a matchmaker. Has no effect without `--matchmaker`. |
-| `--password PASS` | *(empty)* | If set, `JOIN` must supply a matching password; empty means an open server. |
+| `--password PASS` | *(empty)* | If set, `JOIN` must supply a matching password; empty means an open server. Only `JOIN` and `PING` are acted on before that — see [protocol.md](protocol.md#everything-is-gated-on-join). |
 | `--matchmaker HOST[:PORT]` | *(none)* | Register with a matchmaker at this address and hold the registration open (`REGISTER` → `REGISTERED`, then a bare `PING` keep-alive every 20 s). Port defaults to `27020`. Reconnects every ~5 s if the matchmaker is down. See [matchmaker.md](matchmaker.md). |
 | `--advertise IP` | auto-detected | The address clients should use to reach this server, as told to the matchmaker. When omitted and a matchmaker is configured, the server picks this machine's primary non-loopback LAN IPv4 (preferring `192.168.*`, `10.*`, `172.*`) so remote devices do not get handed `127.0.0.1`. |
 | `--tcp-nodelay 0\|1` | `1` | Disables Nagle's algorithm (`TCP_NODELAY`) on every accepted client socket. The writer sends one `send()` per queued line and the hottest line is a ~60-byte `POSVEL` broadcast — exactly what Nagle coalesces — so with Nagle enabled other players' movement arrives in RTT-quantised jerks instead of as each update is sent. `0` restores Nagle if an operator ever wants it back. |
@@ -41,6 +41,7 @@ server. Unknown flags are ignored.
 | `--signs FILE` | `eden_signs.txt` | Sign sidecar. Read at startup, when signs on blocks the world stores as air are dropped (see [`eden_signs.txt`](#eden_signstxt)); the control socket's `signs add`/`rm`/`reload` also edit it. Absent is normal and silent. |
 | `--spawn-file FILE` | `eden_spawn.txt` beside `--world` | World default-spawn sidecar (one line `x:y:z`), as written by [`eden_import`](import.md). Read once at startup. Absent is normal and silent; a malformed line warns and is ignored. |
 | `--spawn x:y:z` | *(none)* | Set the world default spawn inline; overrides `--spawn-file` and skips reading it. |
+| `--motd-file FILE` | `eden_motd.txt` beside `--world` | Welcome-message sidecar (see [`eden_motd.txt`](#eden_motdtxt)). Read at startup and sent to every joining player; re-read live with the control socket's `motd reload` ([commands.md](commands.md)). Absent or empty is normal and silent. |
 | `--players-file FILE` | `eden_players.txt` beside `--world` | Player-position store. Defaults to the same directory as `--world`, not the process cwd, so two differently-named worlds hosted from one directory no longer share (and silently teleport players between) one file. If a legacy `./eden_players.txt` already exists and the derived path is a different file, it is read instead, so nobody's saved position vanishes on upgrade. |
 
 All paths are resolved **relative to the process working directory** unless noted otherwise, so
@@ -142,12 +143,13 @@ that tells you whether region serving is keeping up.
 ```
 
 - `control …` — the operator socket: `say`, `kick`, `ban`, `unban`, `op`, `deop`, `save`,
-  `stop`, `setblock`, `fill`, `signs add|rm|reload`.
+  `stop`, `setblock`, `fill`, `signs add|rm|reload`, `motd reload`.
 - `player:<name> …` — an in-chat command that **changed cells**, with the count it actually
   changed, at every permission level. Plus any command that reaches across players (today only
   `/tp <player>`, which is audited on the way in because it edits nothing).
 
-Read-only commands (`who`, `banlist`, `region-stats`, `//pos1`, `/help`) are not audited: the
+Read-only commands (`who`, `banlist`, `region-stats`, `motd show`, `//pos1`, `/help`) are not
+audited: the
 channel is only useful if everything in it is a change. Refused commands are logged only under
 `--verbose` — a player can trigger a refusal far faster than they can trigger an edit, so
 auditing them would let anyone who can chat fill your disk.
@@ -297,7 +299,7 @@ expand to empty and the server exits with a flag error in the journal, so create
 |---|---|---|---|
 | `EDEN_PORT` | `--port ${EDEN_PORT}` | `27015` | `--port` |
 | `EDEN_NAME` | `--name ${EDEN_NAME}` | `Eden Server` | `--name` |
-| `EDEN_WORLD_DIR` | `--world ${EDEN_WORLD_DIR}/eden_world.model` and the sign / spawn / ban / ops / control-socket paths | `/var/lib/edenserver/world` | the active world directory |
+| `EDEN_WORLD_DIR` | `--world ${EDEN_WORLD_DIR}/eden_world.model` and the sign / spawn / MOTD / ban / ops / control-socket paths | `/var/lib/edenserver/world` | the active world directory |
 | `EDEN_MAX_WORLD_CELLS` | `--max-world-cells ${EDEN_MAX_WORLD_CELLS}` | `4000000` | `--max-world-cells` |
 | `EDEN_PASSWORD` | `--password ${EDEN_PASSWORD}` | *(empty)* | `--password`; empty is identical to omitting it (open server) |
 | `EDEN_EXTRA_ARGS` | a bare `$EDEN_EXTRA_ARGS` tail | *(absent)* | any spaceless optional flags: `--matchmaker HOST:PORT`, `--spawn x:y:z`, `--audit-file PATH`, `--default-level N`, … |
@@ -470,8 +472,8 @@ arguments. It does **not** launch `edenserver`, which is the POSIX build. On Win
 | Variable | Default |
 |---|---|
 | `EDENSERVER_SERVICE` | `edenserver` |
-| `EDENSERVER_WORLD_DIR` | `$EDEN_WORLD_DIR`, else `/var/lib/edenserver/world` |
-| `EDENSERVER_BACKUP_DIR` | `$EDEN_BACKUP_DIR`, else `/var/lib/edenserver/backups` |
+| `EDENSERVER_WORLD_DIR` | `$EDEN_WORLD_DIR`, else `/var/lib/edenserver/world` (`/var/lib/edenserver/worlds/<instance>` when an instance argument is given) |
+| `EDENSERVER_BACKUP_DIR` | `$EDEN_BACKUP_DIR`, else `/var/lib/edenserver/backups` (`/var/lib/edenserver/backups/<instance>` when an instance argument is given) |
 | `EDENSERVER_BACKUP_COMPRESS` | `$EDEN_BACKUP_COMPRESS`, else `1` (gzip backups; `0` = plain copies) |
 | `EDENSERVER_BACKUP_LEVEL` | `$EDEN_BACKUP_LEVEL`, else `6` (gzip level, 1–9) |
 
@@ -509,7 +511,9 @@ unset it afterwards.
 
 ## File formats
 
-The sidecars are plain text, LF-terminated, and safe to hand-edit while the server is stopped.
+The sidecars are plain text, LF-terminated, and safe to hand-edit while the server is stopped
+(`eden_motd.txt` is the one the server never writes, so it is safe to edit while it is running
+too — see below).
 `eden_world.model` is the exception: since stage 7.6 a save writes the **binary `EDMB`** format
 described below (the text form is still read, and still written with `--world-format text`).
 `eden_world.model` and `eden_players.txt` are rewritten by the server via a temp file plus
@@ -594,7 +598,11 @@ username:x:y:z
 
 Coordinates are floats. `username` cannot contain `:` (the protocol forbids it), so the first
 `:` always ends the name. A line without a `:`, or whose three coordinates do not all parse, is
-skipped.
+skipped. A row whose position is **outside the world** — see
+[protocol.md § Movement](protocol.md#movement--pos-vel-posvel) — is skipped too, with a count
+printed at startup; that player gets the world default spawn instead of being restored somewhere
+no client can render. (A server built before this check could persist such a row; `%f` reads
+`inf` and `1e+38` back as happily as a position.)
 
 ```
 Player6835:65535.2:33.92:65545.2
@@ -681,6 +689,37 @@ with a `SPAWN` unicast; a returning player keeps their saved position. A missing
 a malformed line prints one warning and is ignored (never fatal). Hand-edit friendly: `#`
 comments and blank lines are skipped, the first valid line wins.
 
+A spawn **outside the world** — see the ranges under
+[protocol.md § Movement](protocol.md#movement--pos-vel-posvel) — warns and is ignored too,
+whether it came from the file or from `--spawn`, rather than being sent to a joining player.
+
+### `eden_motd.txt`
+
+The world's **welcome message** — what every joining player is shown, right after the built-in
+`[Server] Welcome, <name>!` line and before `CAPS:region` (see
+[protocol.md § Join sequence](protocol.md#join-sequence)). Read from `eden_motd.txt` beside the
+world file, or from `--motd-file`. A missing or empty file is normal and silent: the server
+simply sends nothing extra.
+
+```
+# eden_motd.txt — shown to every joining player. '#' lines and blanks are ignored.
+Welcome! This server is moderated.
+Griefing results in a ban.
+Join the Eden Discord using code rjYXwBC
+```
+
+- **One wire line per non-blank file line**, in file order, each sent as an ordinary
+  `[Server] <text>` chat line — the same shape the control socket's `say` broadcasts, so no
+  client has to learn a new message.
+- Blank lines and lines whose first non-space character is `#` are skipped, so the file can
+  carry comments. Leading and trailing whitespace is trimmed.
+- At most **8 lines**; the rest are dropped with a warning. Each line is capped at 256 bytes and
+  stripped of ASCII control characters, exactly like a chat line — a hand-edited file cannot
+  smuggle a second wire line or a fake `SIGNP` into the join sequence.
+- **Nothing in the server ever writes this file.** Unlike `eden_signs.txt` it is operator input
+  only, so it is safe to hand-edit *while the server is running*; the edit takes effect on the
+  next `edenctl motd reload` (no restart, no lost state) or at the next start.
+
 ### `worlds/<name>/`
 
 The layout `eden_import` writes, and the one the server expects when a world lives in its own
@@ -691,6 +730,7 @@ worlds/<name>/
   eden_world.model   the world            (--world)
   eden_signs.txt     signs                (--signs; host_world.sh derives it)
   eden_spawn.txt     default spawn        (--spawn-file; served on join)
+  eden_motd.txt      welcome message      (--motd-file; sent on join, if present)
   .gitignore         `*` plus `!.gitignore`
   edenserver.sock    the control socket, created at run time
 ```

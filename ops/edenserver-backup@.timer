@@ -1,0 +1,23 @@
+# edenserver-backup@.timer — periodic world backups for a multi-world instance.
+#
+# One pair of installed unit files (this + edenserver-backup@.service) covers every instance;
+# enable one timer per world:
+#     sudo systemctl enable --now edenserver-backup@<name>.timer
+#
+# OnCalendar=hourly matches the single-world timer (ops/edenserver-backup.timer). Change the
+# cadence with `sudoedit` + `systemctl daemon-reload`, or disable one instance's backups with
+#     sudo systemctl disable --now edenserver-backup@<name>.timer
+#
+# Persistent=true runs a missed backup once after downtime. Prune old backups separately (see
+# ops/INSTALL.md § Multi-world hosting) — this timer only creates them.
+
+[Unit]
+Description=Periodic Eden world backup (%i)
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

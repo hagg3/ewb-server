@@ -71,7 +71,7 @@ EnvironmentFile=-/etc/edenserver.conf
 # Braced ${VAR} for the always-set keys; bare $EDEN_EXTRA_ARGS for the optional
 # spaceless tail. Edit /etc/edenserver.conf, not this line. See the conf header
 # and the note block above for why the split matters.
-ExecStart=/usr/local/bin/edenserver --port ${EDEN_PORT} --name ${EDEN_NAME} --world ${EDEN_WORLD_DIR}/eden_world.model --signs ${EDEN_WORLD_DIR}/eden_signs.txt --spawn-file ${EDEN_WORLD_DIR}/eden_spawn.txt --ban-file ${EDEN_WORLD_DIR}/eden_bans.txt --ops-file ${EDEN_WORLD_DIR}/eden_ops.txt --control-socket ${EDEN_WORLD_DIR}/edenserver.sock --max-world-cells ${EDEN_MAX_WORLD_CELLS} --password ${EDEN_PASSWORD} $EDEN_EXTRA_ARGS
+ExecStart=/usr/local/bin/edenserver --port ${EDEN_PORT} --name ${EDEN_NAME} --world ${EDEN_WORLD_DIR}/eden_world.model --signs ${EDEN_WORLD_DIR}/eden_signs.txt --spawn-file ${EDEN_WORLD_DIR}/eden_spawn.txt --motd-file ${EDEN_WORLD_DIR}/eden_motd.txt --ban-file ${EDEN_WORLD_DIR}/eden_bans.txt --ops-file ${EDEN_WORLD_DIR}/eden_ops.txt --control-socket ${EDEN_WORLD_DIR}/edenserver.sock --max-world-cells ${EDEN_MAX_WORLD_CELLS} --password ${EDEN_PASSWORD} $EDEN_EXTRA_ARGS
 
 Restart=on-failure
 RestartSec=2s

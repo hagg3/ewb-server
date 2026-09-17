@@ -77,13 +77,17 @@ fi
 # EDENSERVER_* is the documented interface. EDEN_WORLD_DIR / EDEN_BACKUP_DIR are
 # the keys used in /etc/edenserver.conf; honouring them as a fallback lets the
 # systemd backup timer point at the active world by sourcing that one file.
-# When an instance is given, default WORLD_DIR to that instance's directory.
+# When an instance is given, default WORLD_DIR *and* BACKUP_DIR to that
+# instance's own subtree — otherwise every instance's backups would land in
+# the same timestamp-keyed directory and could collide.
 default_world_dir="/var/lib/edenserver/world"
+default_backup_dir="/var/lib/edenserver/backups"
 if [ -n "$instance" ]; then
     default_world_dir="/var/lib/edenserver/worlds/$instance"
+    default_backup_dir="/var/lib/edenserver/backups/$instance"
 fi
 WORLD_DIR="${EDENSERVER_WORLD_DIR:-${EDEN_WORLD_DIR:-$default_world_dir}}"
-BACKUP_DIR="${EDENSERVER_BACKUP_DIR:-${EDEN_BACKUP_DIR:-/var/lib/edenserver/backups}}"
+BACKUP_DIR="${EDENSERVER_BACKUP_DIR:-${EDEN_BACKUP_DIR:-$default_backup_dir}}"
 
 # Backups are gzipped by default. eden_world.model deflates to roughly a sixth of
 # its size as text (a 40 MB world -> ~7 MB); since stage 7.6 a save writes the

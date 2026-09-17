@@ -24,10 +24,18 @@ struct Spawn {
 };
 
 /// One `eden_spawn.txt` line, terminating '\n' included.
+///
+/// The length is clamped to the buffer, not taken from `snprintf`'s return —
+/// that return is what the line *would* have needed, so an out-of-range float
+/// (`1e38` formats to 132 bytes) would otherwise make the `std::string` read
+/// past `buf`. Callers range-check first (`eden_spawn_in_range`), so this only
+/// ever truncates in the case that used to over-read. Stage 7.16.
 inline std::string format_spawn_line(const Spawn& s) {
     char buf[96];
     const int n = std::snprintf(buf, sizeof buf, "%.2f:%.2f:%.2f\n", s.x, s.y, s.z);
-    return std::string(buf, n > 0 ? static_cast<size_t>(n) : 0);
+    if (n <= 0) return std::string();
+    const size_t len = static_cast<size_t>(n);
+    return std::string(buf, len < sizeof buf ? len : sizeof buf - 1);
 }
 
 /// Parse one `x:y:z` line into `out`. Leading/trailing whitespace and a trailing

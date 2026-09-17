@@ -113,6 +113,12 @@ half-served, and a client too far behind on world state being dropped — with e
 carrying on — rather than quietly missing edits. Run it after touching anything in the output
 path.
 
+It has since picked up three groups that need a live socket for a different reason — the defect
+only exists across a connection's *lifecycle*: `SIGTERM` persisting an edit made seconds earlier,
+a poisoned `POS` refused at ingest and still absent from the `SPAWN` of a later join under the
+same name, and a peer that never sent `JOIN` reaching neither the world, the chat channel, the
+roster nor the player file on a passworded server. Run it after touching the admission path too.
+
 `server.cpp` is the original Winsock server this was ported from — reference only, a strict
 subset with no world model, persistence or validation. `server_posix_modded.cpp` is a
 community in-chat-command patch, not built by default; its command surface is unauthenticated.
@@ -173,7 +179,7 @@ avoid — it cannot be expressed.
 Each client has two queues ([out_queue.h](../out_queue.h) has the full rationale):
 
 - **latency-sensitive**: `POS`/`VEL`/`POSVEL`, `PONG`, chat, `[Server]` notices, the welcome,
-  `CAPS`, `SPAWN`. Drained first. Order-insensitive, so when the backlog passes
+  the MOTD lines, `CAPS`, `SPAWN`. Drained first. Order-insensitive, so when the backlog passes
   `--client-outbox-max` the *oldest* lines are dropped — a four-second-old position is worthless,
   and disconnecting instead would punish exactly the weak-link players this exists for.
 - **world state**: `ACTION` relays (single and batch), `SIGNP` writes and bursts, `SNAPZ` region
@@ -361,6 +367,7 @@ magic bytes and falls back to the legacy `x:y:z:type:color` reader, so every wor
 | `eden_players.txt` | same | last known position per username |
 | `eden_signs.txt` | autosave, disconnect and control `save`/`stop` after a player's sign write or an edit that removed signs with their block; at once on control `signs add`/`rm`, and at startup or `signs reload` when signs on blocks stored as air were dropped | only when the sign list changed |
 | `eden_spawn.txt` | never | read-only; the default spawn for a player with no `eden_players.txt` row. `--spawn`/`--spawn-file` override. Malformed → one warning, ignored |
+| `eden_motd.txt` | never | read-only; the welcome message sent on join (`--motd-file`). Re-read on control `motd reload`, so it is the one sidecar an operator can safely hand-edit while the server runs |
 
 Writes are **atomic and serialised**: the snapshot is taken under the data lock, written to a
 `.tmp` file, flushed, and `rename()`d over the real file while holding `g_saveMtx`. For the world
@@ -382,7 +389,8 @@ or an edit that removed signs with their block).
 ## Startup and shutdown
 
 `main()` parses arguments, clamps out-of-range values, ignores `SIGPIPE`, loads the world,
-player positions and signs (then drops signs on blocks the world stores as air), starts the autosave thread (and the matchmaker thread if
+player positions, signs (then drops signs on blocks the world stores as air) and the MOTD
+sidecar, starts the autosave thread (and the matchmaker thread if
 configured), then binds, listens and accepts. `SO_REUSEADDR` is set on the listener and
 `SO_KEEPALIVE` on each accepted socket so peers that vanish without a FIN eventually free their
 thread. Because that keepalive reap takes ~2 h on a default Linux, the client handler also sets
