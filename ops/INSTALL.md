@@ -12,7 +12,6 @@ Artifacts in this directory:
 | `edenserver-writeconf` | validating, atomic writer for `/etc/edenserver.conf` (used by `edenadmin`) |
 | `edenserverctl` | `start`/`stop`/`restart`/`status`/`logs`/`logs-tail`/`backup` wrapper |
 | `edenserver-backup.{service,timer}` | scheduled `edenserverctl backup` (hourly) |
-| `motd-edit.sh` | interactive editor for a world's welcome message, run from your own machine over ssh |
 | `sudoers.d/edenadmin` | optional NOPASSWD drop-in so the `edenadmin` GUI drives this box over ssh |
 | `fail2ban/` | optional filter + jail for OS-level banning of password guessers |
 | `INSTALL.md` | this document |
@@ -361,35 +360,7 @@ For the GUI to work without hitting an interactive `sudo` password prompt, the V
 
 The Connection panel probes every one of these and tells you which is missing.
 
-## 10. The welcome message (MOTD)
-
-Each world can greet joining players with its own message: the lines of
-`${EDEN_WORLD_DIR}/eden_motd.txt`, sent right after the built-in
-`[Server] Welcome, <name>!` line. The file format and its caps are in
-[`docs/configuration.md`](../docs/configuration.md#eden_motdtxt).
-
-Nothing on the server ever writes that file, so it is safe to edit while the world is
-running — the change goes live on a control-socket `motd reload`, with no restart and
-nobody disconnected:
-
-```sh
-sudoedit /var/lib/edenserver/world/eden_motd.txt        # or worlds/<name>/ for an instance
-sudo chown edenserver:edenserver /var/lib/edenserver/world/eden_motd.txt
-sudo -u edenserver edenctl -S /var/lib/edenserver/world/edenserver.sock motd reload
-sudo -u edenserver edenctl -S /var/lib/edenserver/world/edenserver.sock motd show
-```
-
-`ops/motd-edit.sh` does exactly that from your own machine instead — it lists the worlds on
-the box, and shows / edits / clears the one you pick, reloading it for you:
-
-```sh
-./ops/motd-edit.sh              # EDEN_VPS_HOST=<ssh alias>, default `eden-vps`
-```
-
-It needs `edenctl` installed on the server (step 1) and sudo rights for your login user; it
-never restarts a service and never touches the world, player or sign files.
-
-## 11. Optional: fail2ban for password guessers
+## 10. Optional: fail2ban for password guessers
 
 Only relevant if you run with `--password`. `edenserver` already throttles a
 single-IP brute force itself (`--auth-fail-limit`: 5 wrong `JOIN` passwords in
