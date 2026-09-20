@@ -130,6 +130,23 @@ echo "Built ./eden_import  —  run with: ./eden_import <world.eden> [--help]"
 ./eden_import_test
 echo "Built ./eden_import_test  —  base profile / emitter / budgets / golden model"
 
+# The server-world -> .eden writer (ROADMAP-SERVER stage 5.5), the inverse of
+# eden_import. Offline tool; run it against a stopped world directory. Links -lz
+# for the optional ZIP wrapper.
+"$CXX" -std=c++17 -O2 -Wall eden_export.cpp -lz -o eden_export
+echo "Built ./eden_export  —  run with: ./eden_export <world-dir> --out <file.eden> [--help]"
+
+# Offline export-core checks: the round-trip property (import(export(import(f)))
+# keeps the cell set; export(import(export(S))) is byte-identical), the two cell
+# sentinels, chunk selection, fill-then-overlay, the axis rename backwards for
+# blocks and signs, 64z vs 256z, the dropped-and-counted cases (height ceiling,
+# chunk-coordinate gate, inexpressible signs), sidecar vs inline signs, the ZIP
+# wrapper and the byte ceiling. The CLI half shells out to ./eden_export, built
+# just above (stage 5.5).
+"$CXX" -std=c++17 -O2 -Wall eden_export_test.cpp -lz -o eden_export_test
+./eden_export_test
+echo "Built ./eden_export_test  —  .eden writer / round-trip property / drops / signs"
+
 # Offline matchmaker checks: name sanitising, REGISTER parsing, SERVER: row /
 # LIST formatting, the TTL registry (ROADMAP-SERVER Phase 2). No zlib needed.
 "$CXX" -std=c++17 -O2 -Wall matchmaker_test.cpp -o matchmaker_test

@@ -262,6 +262,9 @@ eden_import <world.eden> [options]
 
 ## What is not converted
 
-Export (writing a `.eden` back out), live world switching, sky colours (the wire protocol has no
-world-metadata or sky message — the summary prints them for information only), creature/entity
-data, and any invented meaning for the sign `a`/`b`/`c` fields.
+Live world switching, sky colours (the wire protocol has no world-metadata or sky message — the
+summary prints them for information only), creature/entity data, and any invented meaning for the
+sign `a`/`b`/`c` fields.
+
+The other direction — writing a `.eden` back out from a world this server hosts — is
+[`eden_export`](export.md).

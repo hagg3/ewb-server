@@ -12,6 +12,7 @@ retail client can connect to a world you host yourself.
 |---|---|
 | **Hosting a server** | [quickstart.md](quickstart.md) → [configuration.md](configuration.md) → [commands.md](commands.md) |
 | **Hosting a world you already have** | [import.md](import.md) → [quickstart.md](quickstart.md) |
+| **Taking a hosted world back offline to edit** | [export.md](export.md) → [import.md](import.md) |
 | **Debugging a connection** | [protocol.md](protocol.md) → [configuration.md](configuration.md) |
 | **Changing the code (human or agent)** | [architecture.md](architecture.md) → [protocol.md](protocol.md) → [configuration.md](configuration.md) |
 
@@ -28,6 +29,9 @@ retail client can connect to a world you host yourself.
 - [import.md](import.md) — converting a saved `.eden` world into one this server can host:
   the `eden_import` tool, the base terrain profile, the three fill strategies, and the two
   budget numbers that decide whether an imported world can actually be played.
+- [export.md](export.md) — the other direction: converting a world this server hosts back into a
+  `.eden` with the `eden_export` tool, what the round trip preserves, what it loses, and the
+  summary and exit codes a script can rely on.
 - [commands.md](commands.md) — both command surfaces: the operator control socket and `edenctl`
   (kick/ban, live world edits, save/stop, sign editing, `region-stats`), and the player commands
   typed into game chat (`//set`, `//sphere`, `/tp`, …) with their permission levels and bounds.
@@ -68,9 +72,9 @@ Practically, when you touch a source file, move the doc in the same row:
 | `host_world.sh`, `run_server.bat` — launcher arguments | [configuration.md](configuration.md), [quickstart.md](quickstart.md) |
 | `ops/edenserver.service`, `ops/edenserver@.service`, `ops/edenserver.conf.example`, `ops/edenserver-writeconf` — the systemd `EnvironmentFile` layer (`EDEN_*` keys, `${VAR}` vs `$VAR`) | [configuration.md](configuration.md) § The systemd EnvironmentFile; `ops/INSTALL.md` (template unit in § Multi-world hosting) |
 | `ops/edenserverctl` verbs, `ops/edenserver-backup.{service,timer}` | [configuration.md](configuration.md) § Ops wrapper; `ops/INSTALL.md` |
-| `ops/motd-edit.sh` — the interactive welcome-message editor | `ops/INSTALL.md` § The welcome message; [configuration.md](configuration.md) § `eden_motd.txt`; [commands.md](commands.md) for the `motd` verbs |
 | `eden_file.h` — `.eden` world-format parsing (header, chunks, spans, signs, ZIP wrapper) | [import.md](import.md) § What it reads; [architecture.md](architecture.md) (file map) |
 | `eden_import.h` / `eden_import.cpp` — the converter: base profile, fill strategies, axis rename, budget projections, flags | [import.md](import.md); [configuration.md](configuration.md) for the files it writes |
+| `eden_export.h` / `eden_export.cpp` — the `.eden` **writer**: chunk selection, fill-then-overlay, the cell sentinels, the axis rename backwards, height format, signs sidecar vs inline, flags | [export.md](export.md); [import.md](import.md) if the round trip's shape changes |
 | A new header + `*_test.cpp` pair | [architecture.md](architecture.md) (the file map) and whichever doc above owns its behaviour |
 | On-disk format: `eden_world.model`, `eden_players.txt`, `eden_signs.txt`, `eden_spawn.txt`, `eden_bans.txt`, `eden_ops.txt` | [configuration.md](configuration.md) |
 

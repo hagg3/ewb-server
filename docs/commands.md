@@ -89,8 +89,7 @@ A raw client works too — `printf 'who\n' | nc -U ./edenserver.sock`.
   `eden_motd.txt` (grammar in
   [configuration.md § `eden_motd.txt`](configuration.md#eden_motdtxt)) and run `motd reload`.
   The file is operator input only — the server never rewrites it — so editing it on a running
-  server is safe, unlike `eden_signs.txt`. [`ops/motd-edit.sh`](../ops/motd-edit.sh) does both
-  steps interactively over ssh for a remote host.
+  server is safe, unlike `eden_signs.txt`.
 - Every command that changes state is written to the audit channel — one `[Audit]` line with a
   UTC timestamp, on stdout and in `--audit-file`. See
   [configuration.md § The audit channel](configuration.md#the-audit-channel).
