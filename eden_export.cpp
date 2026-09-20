@@ -113,7 +113,8 @@ static void usage() {
 "  eden_export <world-dir> --out <file.eden> [options]\n"
 "\n"
 "<world-dir> holds eden_world.model (EDMB or the legacy text form) and, if they\n"
-"exist, eden_signs.txt and eden_spawn.txt. eden_players.txt is never read.\n"
+"exist, eden_signs.txt, eden_spawn.txt and eden_origin.txt. eden_players.txt is\n"
+"never read.\n"
 "Export the world while the server is stopped, or export a copy.\n"
 "\n"
 "Output\n"
@@ -138,8 +139,11 @@ static void usage() {
 "  --sidecar FILE           write the sidecar here instead\n"
 "\n"
 "Header fields the server does not store (see docs/export.md § What is lost)\n"
-"  --seed N                 world seed (default: 0)\n"
-"  --yaw F                  spawn facing (default: 0)\n"
+"  --origin FILE|none       replay these from an eden_origin.txt (default:\n"
+"                           <world-dir>/eden_origin.txt if it exists — eden_import\n"
+"                           writes it). 'none' ignores it and writes defaults.\n"
+"  --seed N                 world seed (default: 0, or the origin file's)\n"
+"  --yaw F                  spawn facing (default: 0, or the origin file's)\n"
 "\n"
 "Limits\n"
 "  --max-bytes N            refuse to write a file larger than this\n"
@@ -168,9 +172,10 @@ bool parse_size(const std::string& s, size_t& out) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string dir, out_path, sidecar_path, base_profile = "default", z_arg = "auto";
+    std::string dir, out_path, sidecar_path, origin_arg, base_profile = "default", z_arg = "auto";
     ExportOptions opt;
     bool force = false, dry_run = false, help = false, name_set = false;
+    bool seed_set = false, yaw_set = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string f = argv[i];
@@ -197,8 +202,9 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
-        else if (f == "--seed")           opt.seed = int32_t(std::strtol(next("a seed").c_str(), nullptr, 10));
-        else if (f == "--yaw")            opt.yaw  = float(std::atof(next("an angle").c_str()));
+        else if (f == "--origin")         origin_arg = next("a file or 'none'");
+        else if (f == "--seed")         { opt.seed = int32_t(std::strtol(next("a seed").c_str(), nullptr, 10)); seed_set = true; }
+        else if (f == "--yaw")          { opt.yaw  = float(std::atof(next("an angle").c_str())); yaw_set = true; }
         else if (f == "--max-bytes") {
             if (!parse_size(next("a byte count"), opt.max_bytes) || opt.max_bytes == 0) {
                 std::cerr << "eden_export: --max-bytes needs a positive integer\n";
@@ -323,6 +329,30 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ── origin ──────────────────────────────────────────────────────────────
+    // An explicit --origin FILE must exist; the default <dir>/eden_origin.txt is
+    // optional (a world that never came from a .eden has none).
+    std::string origin_path = origin_arg == "none" ? std::string() : origin_arg;
+    if (origin_arg.empty() && path_exists(dir + "/eden_origin.txt"))
+        origin_path = dir + "/eden_origin.txt";
+    if (!origin_path.empty()) {
+        std::string text;
+        if (!read_file(origin_path, text, err)) {
+            std::cerr << "eden_export: " << err << "\n";
+            return 1;
+        }
+        EdenOrigin origin;
+        std::vector<std::string> bad;
+        eden_parse_origin(text, origin, bad);
+        for (const std::string& line : bad)
+            std::cerr << "eden_export: warning: ignored malformed line in " << origin_path
+                      << ": " << line << "\n";
+        const bool had_spawn = opt.have_spawn;
+        if (eden_apply_origin(origin, opt, seed_set, yaw_set))
+            spawn_source = had_spawn ? "eden_spawn.txt, exact pos from eden_origin.txt"
+                                     : "eden_origin.txt";
+    }
+
     // ── build ───────────────────────────────────────────────────────────────
     ExportResult r;
     if (!eden_export_world(store, signs, opt, r, err)) {
@@ -353,6 +383,7 @@ int main(int argc, char** argv) {
         std::snprintf(b, sizeof b, "%.2f:%.2f:%.2f", opt.spawn.x, opt.spawn.y, opt.spawn.z);
         std::cout << "spawn: " << b << " (" << spawn_source << ")\n";
     }
+    std::cout << "origin: " << (origin_path.empty() ? "none" : origin_path) << "\n";
     std::cout << "bytes: " << r.bytes.size() << (opt.zip ? " (zipped)" : "") << "\n"
               << "file: " << out_path << "\n";
 

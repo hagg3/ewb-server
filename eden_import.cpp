@@ -7,8 +7,9 @@
 //
 // Reads a `.eden` (ZIP-wrapped or raw), projects the two budgets that decide
 // whether the result can be hosted, and — if they pass — writes
-// `worlds/<name>/` with `eden_world.model`, `eden_signs.txt`, `eden_spawn.txt`
-// and a `.gitignore`. See `docs/import.md`.
+// `worlds/<name>/` with `eden_world.model`, `eden_signs.txt`, `eden_spawn.txt`,
+// `eden_origin.txt` (inert; `eden_export` replays it) and a `.gitignore`. See
+// `docs/import.md`.
 //
 // This file owns argument parsing, file I/O, the summary and (stage 5.2) the
 // interactive prompt flow. Every conversion decision lives in `eden_import.h`,
@@ -577,11 +578,18 @@ int main(int argc, char** argv) {
         std::cerr << "eden_import: " << err << "\n";
         return 1;
     }
+    // Inert beside the world — the server never reads it; eden_export replays it.
+    if (!write_atomic(outdir + "/eden_origin.txt",
+                      eden_format_origin(world.hdr, world.z_ceiling), err)) {
+        std::cerr << "eden_import: " << err << "\n";
+        return 1;
+    }
 
     std::cout << "\nwrote " << outdir << "/eden_world.model   " << commas(p.cells) << " cells\n"
               << "wrote " << outdir << "/eden_signs.txt     " << signs.size() << " signs\n";
     if (have_spawn)
         std::cout << "wrote " << outdir << "/eden_spawn.txt     " << eden_format_spawn(spawn);
+    std::cout << "wrote " << outdir << "/eden_origin.txt    (source header fields, for eden_export)\n";
     std::cout << "wrote " << outdir << "/.gitignore         (worlds/ is tracked — this keeps "
                  "the world out of commits)\n";
     std::cout << "\nrun it:  ./host_world.sh " << shq(outdir + "/eden_world.model") << " "

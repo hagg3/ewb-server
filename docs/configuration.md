@@ -689,6 +689,37 @@ A spawn **outside the world** — see the ranges under
 [protocol.md § Movement](protocol.md#movement--pos-vel-posvel) — warns and is ignored too,
 whether it came from the file or from `--spawn`, rather than being sent to a joining player.
 
+### `eden_origin.txt`
+
+The source `.eden` header's fields that the server has nowhere to keep, written by
+[`eden_import`](import.md) and replayed by [`eden_export`](export.md#the-origin-sidecar). **The
+server never reads it.** One `key: value` per line:
+
+```
+seed: -77
+yaw: -176.793716
+pos: 65605.0469:33.9250011:64117.457
+home: 65476.168:34.9250011:64377.1523
+version: 4
+z: 64
+sky: 14 14 14 14 14 14 14 14 14 14 14 14 14 14 14 14
+```
+
+| Key | Value | Notes |
+|---|---|---|
+| `seed` | integer | |
+| `yaw` | float | |
+| `pos` | `x:y:z` floats, server order | the header's player position, exact; `eden_spawn.txt` keeps only two decimals |
+| `home` | `x:y:z` floats, server order | |
+| `version` | integer | replayed only while it agrees with the height format written |
+| `z` | `64` or `256` | the source's height format; a tie-breaker, never lowers the ceiling |
+| `sky` | 16 integers, 0–255 | the sky palette |
+
+Floats are written with nine significant digits, which reads back any `float` bit-for-bit. `#`
+comments and blank lines are skipped, unknown keys are ignored, a later duplicate wins, and every
+key is optional — delete a line to fall back to the default for it. A known key with a malformed
+value is skipped and named in a warning, never applied half-way.
+
 ### `worlds/<name>/`
 
 The layout `eden_import` writes, and the one the server expects when a world lives in its own
@@ -699,6 +730,7 @@ worlds/<name>/
   eden_world.model   the world            (--world)
   eden_signs.txt     signs                (--signs; host_world.sh derives it)
   eden_spawn.txt     default spawn        (--spawn-file; served on join)
+  eden_origin.txt    source header fields (never read by the server; eden_export replays it)
   .gitignore         `*` plus `!.gitignore`
   edenserver.sock    the control socket, created at run time
 ```

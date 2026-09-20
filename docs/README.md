@@ -76,7 +76,7 @@ Practically, when you touch a source file, move the doc in the same row:
 | `eden_import.h` / `eden_import.cpp` — the converter: base profile, fill strategies, axis rename, budget projections, flags | [import.md](import.md); [configuration.md](configuration.md) for the files it writes |
 | `eden_export.h` / `eden_export.cpp` — the `.eden` **writer**: chunk selection, fill-then-overlay, the cell sentinels, the axis rename backwards, height format, signs sidecar vs inline, flags | [export.md](export.md); [import.md](import.md) if the round trip's shape changes |
 | A new header + `*_test.cpp` pair | [architecture.md](architecture.md) (the file map) and whichever doc above owns its behaviour |
-| On-disk format: `eden_world.model`, `eden_players.txt`, `eden_signs.txt`, `eden_spawn.txt`, `eden_bans.txt`, `eden_ops.txt` | [configuration.md](configuration.md) |
+| On-disk format: `eden_world.model`, `eden_players.txt`, `eden_signs.txt`, `eden_spawn.txt`, `eden_origin.txt`, `eden_bans.txt`, `eden_ops.txt` | [configuration.md](configuration.md) |
 
 Two more rules for anything written here:
 

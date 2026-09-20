@@ -44,8 +44,13 @@ worlds/<name>/
   eden_world.model   x:y:z:type:color, one cell per line   (docs/configuration.md)
   eden_signs.txt     x:y:z:a:b:c:text, one sign per line
   eden_spawn.txt     x:y:z — the server sends a spawnless joiner here
+  eden_origin.txt    the source header's seed, yaw, home, sky, version and height format
   .gitignore         keeps the above out of commits
 ```
+
+`eden_origin.txt` is inert: the server never reads it. It exists so that
+[`eden_export`](export.md#the-origin-sidecar) can write the world back out as the same world
+rather than as defaults. Grammar: [configuration.md § `eden_origin.txt`](configuration.md#eden_origintxt).
 
 Everything is written with a temp file and a `rename()`, the same discipline the server's own
 saves use: a crash or a full disk mid-write cannot leave a truncated world.

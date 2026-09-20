@@ -643,6 +643,256 @@ static void test_cli() {
     run("rm -rf " + dir + " " + out, o);
 }
 
+// ── 11. header fidelity: the origin sidecar (stage 5.6) ─────────────────────
+
+static bool same_f3(const float* a, const float* b) { return std::memcmp(a, b, 12) == 0; }
+
+/// A world whose header carries values no default would reproduce: negative
+/// seed, awkward floats, a `home` unlike `pos`, and a non-zero sky palette.
+static std::vector<uint8_t> fixture_headered(int32_t version, bool tall) {
+    WorldSpec w;
+    w.name = "Headered";
+    w.version = version;
+    w.seed = -77;
+    w.yaw = -176.79372f;
+    w.pos[0] = 65605.046875f; w.pos[1] = 33.925f; w.pos[2] = 64117.457f;
+    w.home[0] = 65476.168f;   w.home[1] = 34.925f; w.home[2] = 64377.152f;
+    if (tall) {
+        w.chunks.push_back({4096, 4096, build_chunk(16, [](int lx, int ly, int z) -> Voxel {
+                                if (lx == 2 && ly == 2 && z == 200) return {12, 0};
+                                return base_profile(z);
+                            }), 0});
+    } else {
+        w.chunks.push_back({4096, 4096, build_chunk(4, [](int lx, int ly, int z) -> Voxel {
+                                if (lx == 8 && ly == 8 && z == 40) return {12, 3};
+                                return base_profile(z);
+                            }), 0});
+    }
+    std::vector<uint8_t> b = build_world(w);
+    for (int i = 0; i < 16; ++i) b[size_t(132 + i)] = uint8_t(10 + i);   // sky @132..148
+    return b;
+}
+
+static void check_header_equal(const char* what, const EdenHeader& a, const EdenHeader& b) {
+    const std::string w(what);
+    CHECK(a.seed == b.seed, (w + ": seed").c_str());
+    CHECK(same_f3(a.pos, b.pos), (w + ": pos is bit-identical").c_str());
+    CHECK(same_f3(a.home, b.home), (w + ": home is bit-identical").c_str());
+    CHECK(std::memcmp(&a.yaw, &b.yaw, 4) == 0, (w + ": yaw is bit-identical").c_str());
+    CHECK(a.version == b.version, (w + ": version").c_str());
+    CHECK(a.name == b.name, (w + ": name").c_str());
+    CHECK(std::memcmp(a.skycolors, b.skycolors, 16) == 0, (w + ": sky palette").c_str());
+}
+
+static void test_origin_grammar() {
+    const EdenWorld src = eden_load(fixture_headered(4, false));
+    const std::string text = eden_format_origin(src.hdr, src.z_ceiling);
+
+    EdenOrigin o;
+    std::vector<std::string> bad;
+    eden_parse_origin(text, o, bad);
+    CHECK(bad.empty(), "the file the writer produces parses without a complaint");
+    CHECK(o.seed && *o.seed == -77, "seed round-trips");
+    CHECK(o.yaw && std::memcmp(&*o.yaw, &src.hdr.yaw, 4) == 0, "yaw round-trips bit-for-bit");
+    CHECK(o.pos && same_f3(o.pos->data(), src.hdr.pos), "pos round-trips bit-for-bit");
+    CHECK(o.home && same_f3(o.home->data(), src.hdr.home), "home round-trips bit-for-bit");
+    CHECK(o.version && *o.version == 4, "version round-trips");
+    CHECK(o.z && *o.z == 64, "the height format is recorded as 64");
+    CHECK(o.sky && std::memcmp(o.sky->data(), src.hdr.skycolors, 16) == 0, "sky round-trips");
+    CHECK(eden_format_origin(src.hdr, 255).find("z: 256\n") != std::string::npos,
+          "a 256z source records 256");
+
+    // Hand-edited: comments, blanks, CRLF, an unknown key, a later duplicate.
+    EdenOrigin h;
+    bad.clear();
+    eden_parse_origin("# note\r\n\r\nseed: 5\r\nseed: 9\r\nfuture-key: whatever\r\nz: 256\r\n", h, bad);
+    CHECK(bad.empty(), "comments, blanks, CRLF and unknown keys are not errors");
+    CHECK(h.seed && *h.seed == 9, "a later duplicate wins");
+    CHECK(h.z && *h.z == 256, "z: 256 parses");
+    CHECK(!h.yaw && !h.pos && !h.home && !h.sky && !h.version, "absent keys stay absent");
+
+    // Malformed known keys are named and skipped; their neighbours still apply.
+    EdenOrigin m;
+    bad.clear();
+    eden_parse_origin("seed: 4x\nyaw: nan\npos: 1:2\nhome: 1:2:3:4\nz: 128\nversion: 4.5\n"
+                      "sky: 1 2 3\nsky: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 300\nno colon here\n"
+                      "yaw: 2.5\n", m, bad);
+    CHECK(bad.size() == 9, "every malformed line is reported");
+    CHECK(!m.seed && !m.pos && !m.home && !m.z && !m.version && !m.sky,
+          "and none is applied half-way");
+    CHECK(m.yaw && *m.yaw == 2.5f, "a good line after bad ones still applies");
+}
+
+static void test_origin_round_trip() {
+    // The exit criterion for the header: every parsed field survives
+    // import -> origin -> export bit-for-bit, for 64z and 256z sources.
+    struct Case { const char* what; int32_t version; bool tall; };
+    const Case cases[] = {{"64z", 4, false}, {"256z", 5, true}, {"256z, odd version", 7, true}};
+    for (const Case& c : cases) {
+        const std::vector<uint8_t> raw = fixture_headered(c.version, c.tall);
+        const EdenWorld src = eden_load(raw);
+        const WorldStore s = import_to_store(raw);
+
+        EdenOrigin o;
+        std::vector<std::string> bad;
+        eden_parse_origin(eden_format_origin(src.hdr, src.z_ceiling), o, bad);
+
+        // import wrote eden_spawn.txt from `pos` at two decimals; export reads it back.
+        ExportOptions opt = named("Headered");
+        opt.spawn = eden_spawn_from(src.hdr, false);
+        std::string line = format_spawn_line(opt.spawn);
+        Spawn from_file;
+        CHECK(parse_spawn_line(line, from_file), "the spawn line parses");
+        opt.spawn = from_file;
+        opt.have_spawn = true;
+        CHECK(!same_f3(&opt.spawn.x, src.hdr.pos), "the two-decimal spawn file alone is lossy");
+
+        CHECK(eden_apply_origin(o, opt, false, false), "the exact pos supplies the spawn");
+        ExportResult r;
+        const std::vector<uint8_t> out = export_bytes(s, {}, opt, r);
+        check_header_equal(c.what, src.hdr, eden_load(out).hdr);
+        CHECK(eden_load(out).chunk_size == src.chunk_size, "and the height format matches");
+    }
+
+    // No origin at all is exactly the 5.5 behaviour: defaults, home mirrors pos.
+    const std::vector<uint8_t> raw = fixture_headered(4, false);
+    ExportResult r;
+    ExportOptions opt = named("Headered");
+    opt.spawn = {65540.0f, 33.92f, 65545.0f};
+    opt.have_spawn = true;
+    const EdenHeader h = eden_load(export_bytes(import_to_store(raw), {}, opt, r)).hdr;
+    CHECK(h.seed == 0 && h.yaw == 0.0f, "no origin: seed and yaw are the defaults");
+    CHECK(same_f3(h.home, h.pos), "no origin: home mirrors pos");
+    CHECK(h.version == 4, "no origin: version is derived");
+}
+
+static void test_origin_precedence() {
+    const EdenWorld src = eden_load(fixture_headered(4, false));
+    EdenOrigin o;
+    std::vector<std::string> bad;
+    eden_parse_origin(eden_format_origin(src.hdr, src.z_ceiling), o, bad);
+
+    // Explicit flags beat the file.
+    ExportOptions opt;
+    opt.seed = 1234;
+    opt.yaw = 0.5f;
+    eden_apply_origin(o, opt, true, true);
+    CHECK(opt.seed == 1234 && opt.yaw == 0.5f, "--seed / --yaw win over the origin");
+
+    // A spawn file the operator has moved beats the origin's pos.
+    ExportOptions moved;
+    moved.spawn = {70000.0f, 33.92f, 70000.0f};
+    moved.have_spawn = true;
+    CHECK(!eden_apply_origin(o, moved, false, false), "a moved spawn is not overridden");
+    CHECK(moved.spawn.x == 70000.0f, "and stays where the operator put it");
+    CHECK(moved.have_home && same_f3(moved.home, src.hdr.home),
+          "though home still replays from the origin");
+
+    // No spawn file at all: the origin supplies one (import ran with --spawn none).
+    ExportOptions bare;
+    CHECK(eden_apply_origin(o, bare, false, false) && bare.have_spawn &&
+              same_f3(&bare.spawn.x, src.hdr.pos),
+          "with no spawn file, the origin's pos is the spawn");
+
+    // A world with an empty origin is untouched.
+    ExportOptions untouched;
+    EdenOrigin none;
+    CHECK(!eden_apply_origin(none, untouched, false, false) && !untouched.have_spawn &&
+              !untouched.have_home && untouched.version == 0 && untouched.z_hint == 0,
+          "an empty origin changes nothing");
+}
+
+static void test_origin_height_format() {
+    // A world that was 256z but has had everything above 63 mined away.
+    WorldStore low;
+    low.set(65540, 40, 65540, 12, 0);
+    ExportOptions opt = named("Was tall");
+    opt.z_hint = 256;
+    opt.version = 7;
+    ExportResult r;
+    const std::vector<uint8_t> b = export_bytes(low, {}, opt, r);
+    CHECK(r.z_ceiling == 255, "z_hint 256 keeps a now-low world 256z");
+    CHECK(eden_load(b).hdr.version == 7, "and its recorded version is replayed");
+
+    // --z 64 wins over the hint, and a version that would lie is not replayed.
+    opt.force_z = 64;
+    ExportResult r2;
+    const std::vector<uint8_t> b2 = export_bytes(low, {}, opt, r2);
+    CHECK(r2.z_ceiling == 63, "--z 64 beats the hint");
+    CHECK(eden_load(b2).hdr.version == 4, "a 256z version is not written into a 64z file");
+
+    // The hint never lowers the ceiling.
+    WorldStore tall;
+    tall.set(65540, 200, 65540, 12, 0);
+    ExportOptions opt64 = named("Grew");
+    opt64.z_hint = 64;
+    opt64.version = 4;
+    ExportResult r3;
+    export_bytes(tall, {}, opt64, r3);
+    CHECK(r3.z_ceiling == 255, "a 64z hint does not stop a world that has grown tall");
+}
+
+static void test_origin_cli() {
+    if (!file_exists("./eden_export") || !file_exists("./eden_import")) {
+        std::fprintf(stderr, "SKIP: ./eden_export / ./eden_import not built; run build_server.sh\n");
+        return;
+    }
+    const std::string root = "/tmp/eden_export_test_origin";
+    std::string o;
+    run("rm -rf " + root + " && mkdir -p " + root, o);
+
+    const std::vector<uint8_t> raw = fixture_headered(4, false);
+    {
+        std::ofstream f(root + "/src.eden", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(raw.data()), std::streamsize(raw.size()));
+    }
+    const EdenHeader src = eden_load(raw).hdr;
+
+    // The real path: eden_import writes the world dir, eden_export reads it back.
+    CHECK(run("./eden_import " + root + "/src.eden --out " + root + "/world --force -y", o) == 0,
+          "eden_import succeeds");
+    CHECK(file_exists(root + "/world/eden_origin.txt"), "eden_import writes eden_origin.txt");
+    CHECK(o.find("eden_origin.txt") != std::string::npos, "and says so in its summary");
+
+    CHECK(run("./eden_export " + root + "/world --out " + root + "/back.eden --name Headered", o) == 0,
+          "eden_export succeeds");
+    CHECK(o.find("origin: " + root + "/world/eden_origin.txt") != std::string::npos,
+          "the summary names the origin file it used");
+    const std::string back = slurp(root + "/back.eden");
+    check_header_equal("CLI round trip", src,
+                       eden_parse_header(reinterpret_cast<const uint8_t*>(back.data()), back.size()));
+
+    // --origin none writes defaults.
+    CHECK(run("./eden_export " + root + "/world --out " + root + "/plain.eden --name Headered "
+              "--origin none", o) == 0, "--origin none succeeds");
+    CHECK(o.find("origin: none") != std::string::npos, "and the summary says none");
+    const std::string plain = slurp(root + "/plain.eden");
+    const EdenHeader ph = eden_parse_header(reinterpret_cast<const uint8_t*>(plain.data()), plain.size());
+    CHECK(ph.seed == 0 && ph.yaw == 0.0f && ph.skycolors[0] == 0, "and the header carries defaults");
+
+    // --seed beats the file; a named origin that is missing is a refusal.
+    CHECK(run("./eden_export " + root + "/world --out " + root + "/seed.eden --seed 42", o) == 0,
+          "--seed with an origin succeeds");
+    const std::string sd = slurp(root + "/seed.eden");
+    CHECK(eden_parse_header(reinterpret_cast<const uint8_t*>(sd.data()), sd.size()).seed == 42,
+          "--seed wins over the origin");
+    CHECK(run("./eden_export " + root + "/world --out " + root + "/x.eden --origin /nope", o) == 1,
+          "a named origin file that is missing is a refusal (exit 1)");
+    CHECK(!file_exists(root + "/x.eden"), "and writes nothing");
+
+    // A malformed line warns on stderr and does not stop the export.
+    {
+        std::ofstream f(root + "/world/eden_origin.txt", std::ios::app);
+        f << "yaw: banana\n";
+    }
+    CHECK(run("./eden_export " + root + "/world --out " + root + "/warn.eden", o) == 0,
+          "a malformed origin line does not fail the export");
+    CHECK(slurp("/tmp/eden_export_test.err").find("banana") != std::string::npos,
+          "but it is named on stderr");
+
+    run("rm -rf " + root, o);
+}
+
 int main() {
     test_sentinels();
     test_chunk_selection();
@@ -654,6 +904,11 @@ int main() {
     test_round_trip_property();
     test_zip_and_limits();
     test_cli();
+    test_origin_grammar();
+    test_origin_round_trip();
+    test_origin_precedence();
+    test_origin_height_format();
+    test_origin_cli();
 
     if (g_fail) {
         std::fprintf(stderr, "eden_export_test: %d check(s) failed\n", g_fail);

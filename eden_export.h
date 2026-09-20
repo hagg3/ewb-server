@@ -110,17 +110,53 @@ struct ExportOptions {
     Spawn       spawn{EDEN_PLANE_CENTRE, EDEN_STAND_HEIGHT, EDEN_PLANE_CENTRE};
     bool        have_spawn = false;         ///< false: `spawn` is the default above
 
-    // Header fields the server does not store. Defaults today; stage 5.6 replays
-    // the source world's own values from an `eden_origin.txt` sidecar.
+    // Header fields the server does not store. Defaults, unless
+    // `eden_apply_origin` has folded in the source world's own values from an
+    // `eden_origin.txt` sidecar (stage 5.6).
     int32_t seed = 0;
     float   yaw  = 0.0f;
     uint8_t skycolors[16] = {0};
+    bool    have_home = false;              ///< false: `home` mirrors `spawn`
+    float   home[3] = {0, 0, 0};
+    int32_t version = 0;                    ///< 0 = derive from the z format
+    int     z_hint = 0;                     ///< 64 / 256: the source's format, a tie-breaker
 
     SignMode signs = SignMode::Sidecar;
     int      force_z = 0;                   ///< 0 = auto, or 64 / 256
     bool     zip = false;                   ///< wrap the file in a ZIP container
     size_t   max_bytes = EDEN_EXPORT_MAX_BYTES;
 };
+
+/// Fold an `eden_origin.txt` into `opt`. Precedence, most specific first:
+///   - `--seed` / `--yaw` on the command line (`seed_set` / `yaw_set`) beat the file;
+///   - an `eden_spawn.txt` that has been *changed* since import beats `pos` — the
+///     operator moved the spawn on purpose. One that still says what import wrote
+///     (equal at its own two decimals) is the same spawn, so the origin's exact
+///     `pos` is used and the header's float comes back bit-for-bit.
+/// Returns true when the origin's `pos` supplied the spawn.
+inline bool eden_apply_origin(const EdenOrigin& o, ExportOptions& opt,
+                              bool seed_set, bool yaw_set) {
+    if (o.seed && !seed_set) opt.seed = *o.seed;
+    if (o.yaw && !yaw_set)   opt.yaw  = *o.yaw;
+    if (o.sky) std::copy(o.sky->begin(), o.sky->end(), opt.skycolors);
+    if (o.home) {
+        opt.have_home = true;
+        std::copy(o.home->begin(), o.home->end(), opt.home);
+    }
+    if (o.version) opt.version = *o.version;
+    if (o.z)       opt.z_hint  = *o.z;
+
+    bool pos_used = false;
+    if (o.pos) {
+        const Spawn exact{(*o.pos)[0], (*o.pos)[1], (*o.pos)[2]};
+        if (!opt.have_spawn || format_spawn_line(opt.spawn) == format_spawn_line(exact)) {
+            opt.spawn = exact;
+            opt.have_spawn = true;
+            pos_used = true;
+        }
+    }
+    return pos_used;
+}
 
 // ── result ──────────────────────────────────────────────────────────────────
 
@@ -220,11 +256,15 @@ inline bool eden_sign_to_file(const Sign& s, int z_ceiling, EdenSign& out) {
 /// only tall thing is a sign still needs the taller format to keep it.
 /// `force_z` (64 or 256) overrides, and anything above the resulting ceiling is
 /// dropped by the writer and counted.
+///
+/// `z_hint` (from `eden_origin.txt`) only breaks the tie for a world with
+/// nothing tall in it: a source that *was* 256z stays 256z after everything
+/// above 63 has been mined away. It never lowers the ceiling.
 inline int eden_choose_z_ceiling(const WorldStore& store, const std::vector<Sign>& signs,
-                                 int force_z) {
+                                 int force_z, int z_hint = 0) {
     if (force_z == 64)  return 63;
     if (force_z == 256) return 255;
-    bool tall = false;
+    bool tall = z_hint == 256;
     store.for_each([&](int, int y, int, unsigned char, unsigned char) {
         if (y > 63) tall = true;
     });
@@ -387,7 +427,7 @@ inline bool eden_export_world(const WorldStore& store, const std::vector<Sign>& 
     out = ExportResult{};
     err.clear();
 
-    out.z_ceiling  = eden_choose_z_ceiling(store, signs, opt.force_z);
+    out.z_ceiling  = eden_choose_z_ceiling(store, signs, opt.force_z, opt.z_hint);
     out.bands      = (out.z_ceiling + 1) / 16;
     out.chunk_size = size_t(out.bands) * 8192;
 
@@ -460,10 +500,12 @@ inline bool eden_export_world(const WorldStore& store, const std::vector<Sign>& 
     wr_i32(f, opt.seed);
     const Spawn sp = opt.spawn;
     // The header's `pos` is already in server order (x, height, z) — the one
-    // field that needs no rename. `home` has no server equivalent; it mirrors
-    // `pos` so an editor opening the file has a sane set point (stage 5.6).
+    // field that needs no rename. `home` has no server equivalent: it replays
+    // the origin sidecar's value, else mirrors `pos` so an editor opening the
+    // file has a sane set point.
     wr_f32(f, sp.x); wr_f32(f, sp.y); wr_f32(f, sp.z);
-    wr_f32(f, sp.x); wr_f32(f, sp.y); wr_f32(f, sp.z);
+    if (opt.have_home) { wr_f32(f, opt.home[0]); wr_f32(f, opt.home[1]); wr_f32(f, opt.home[2]); }
+    else               { wr_f32(f, sp.x); wr_f32(f, sp.y); wr_f32(f, sp.z); }
     wr_f32(f, opt.yaw);
     wr_u64(f, dir_offset);
     {
@@ -475,8 +517,15 @@ inline bool eden_export_world(const WorldStore& store, const std::vector<Sign>& 
     f.push_back(0); f.push_back(0);            // pad @90..92
     // `eden_detect_chunk_size` treats version >= 5 as authoritative 256z; 4 is
     // what every 64z specimen carries. Saying it in the header means the
-    // detector never has to fall back to measuring gaps on our own files.
-    wr_i32(f, out.z_ceiling == 255 ? 5 : 4);
+    // detector never has to fall back to measuring gaps on our own files. A
+    // recorded source version is replayed only while it still agrees with the
+    // format actually written — an edit that grew or shrank the world past 63
+    // must not leave a version that lies about it.
+    {
+        const bool tall = out.z_ceiling == 255;
+        const bool keep = opt.version != 0 && (opt.version >= 5) == tall;
+        wr_i32(f, keep ? opt.version : (tall ? 5 : 4));
+    }
     f.resize(132, 0);                          // hash[36] @96..132 — unused
     f.insert(f.end(), opt.skycolors, opt.skycolors + 16);
     f.resize(EDEN_HEADER_BYTES, 0);
