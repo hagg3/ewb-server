@@ -6,6 +6,9 @@ WORKING/
 latestREF/
 LatestREF/
 
+# --- Operator shell scripts (ssh admin helpers; local-only for now) ---
+/scripts/
+
 # --- Compiled server + offline test binaries (rebuilt by build_server.sh) ---
 /edenserver
 /edenmatch
@@ -20,6 +23,8 @@ LatestREF/
 /eden_file_test
 /eden_import
 /eden_import_test
+/eden_export
+/eden_export_test
 *.o
 *.obj
 

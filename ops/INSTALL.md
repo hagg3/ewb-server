@@ -376,6 +376,14 @@ sudo systemctl reload fail2ban
 sudo fail2ban-client status edenserver
 ```
 
+The password itself stays off the command line: `EDEN_PASSWORD` in the conf file (mode `0600`)
+reaches `edenserver` through the unit's `EnvironmentFile`, and the server reads it from its
+environment, so `ps` and `/proc/<pid>/cmdline` never show it. **Upgrading an existing install:**
+the unit files no longer pass `--password ${EDEN_PASSWORD}`. Install the new `edenserver` binary
+first — an older one ignores the variable and would start an open server — then the unit files,
+`systemctl daemon-reload`, restart, and check the journal for `Password: from EDEN_PASSWORD.`
+(an old unit with a new binary keeps working: `--password ""` counts as not given).
+
 Neither layer stops a *distributed* guesser (many IPs, few tries each). If a
 password is your only gate against strangers, keep it long, or move to the ban
 list / a future allow-list instead of a shared secret.

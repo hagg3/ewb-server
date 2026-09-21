@@ -139,7 +139,8 @@ std::string g_worldFile  = "eden_world.model";  // world model (block deltas)
 // holds the world lock for the whole serialise; EDMB is the default for a reason.
 bool        g_saveText   = false;               // --world-format text
 std::string g_serverName = "Eden Server";       // shown in the matchmaker list
-std::string g_password   = "";                  // empty = open server
+std::string g_password   = "";                  // empty = open server (resolved in main: --password / --password-file / EDEN_PASSWORD)
+std::string g_passwordFile;                     // --password-file: first line is the password (stage 7.28)
 std::string g_matchHost  = "";                  // matchmaker host; empty = don't register
 int         g_matchPort  = 27020;
 int         g_port       = 27015;               // our own listen port (set in main)
@@ -162,6 +163,7 @@ bool        g_tcpNodelay = true;                 // disable Nagle on client sock
 int         g_authFailLimit    = 5;   // wrong-password attempts per IP per minute before an escalating lockout; 0 = off (--auth-fail-limit)
 int         g_handshakeTimeout = 15;  // seconds a fresh connection has to send JOIN before it is dropped; 0 = off (--handshake-timeout)
 int         g_idleConnTimeout  = 300; // seconds of post-JOIN socket silence tolerated; 0 = off (--idle-timeout-conn)
+int         g_staleSessionSecs = 15;  // a same-address JOIN evicts a duplicate name silent this long; 0 = never (--stale-session-secs)
 
 // --- Tier 1 operator control socket (stage 3.2) ---
 bool        g_controlEnabled = true;             // --no-control-socket disables it
@@ -370,7 +372,6 @@ std::atomic<bool> editsDirty{false};
 
 // Block constants mirrored from the game's Constants.h.
 enum { SV_AIR=0, SV_BEDROCK=1, SV_TNT=9, SV_FIREWORK=65, SV_STEEL=74, SV_PAINTED_BASE=255 };
-static const int SV_EXPLOSION_RADIUS = 6;
 
 // region_query.h re-declares these two sentinels so the Cell -> wire-record table
 // is unit-testable without pulling in the server; keep the two definitions honest.
@@ -583,7 +584,13 @@ void saveWorld() {
 // --- Player position persistence ----------------------------------------------
 // Remember where each player was (by username) so they respawn there on rejoin.
 struct SavedPos { float x, y, z; };
-static std::map<std::string, SavedPos> g_playerPos;
+// Bounded (stage 7.23): keyed on a username, which is untrusted input, so an
+// unbounded map here let a client that JOINs under a fresh name every few seconds grow
+// the process and the whole-file rewrite in savePlayerPos() forever. Least-recently-
+// updated rows are evicted past --max-saved-positions.
+static const size_t SV_MAX_SAVED_POS_DEFAULT = 10000;
+static size_t g_maxSavedPos = SV_MAX_SAVED_POS_DEFAULT;
+static ewb::LruTable<SavedPos> g_playerPos(SV_MAX_SAVED_POS_DEFAULT);
 static std::mutex g_posMtx;
 // Empty means "derive from --world's directory" (stage 7.15); --players-file
 // overrides outright. Resolved once in main() before loadPlayerPos() runs.
@@ -594,7 +601,7 @@ void loadPlayerPos() {
     std::ifstream f(g_posFile);
     if (!f) return;
     std::string line;
-    size_t dropped = 0;
+    size_t dropped = 0, rows = 0;
     std::lock_guard<std::mutex> lk(g_posMtx);
     while (std::getline(f, line)) {
         size_t p1 = line.find(':');          // username can't contain ':' (protocol delimiter)
@@ -607,9 +614,13 @@ void loadPlayerPos() {
         // ran before stage 7.16 could have persisted exactly that — so the file is
         // re-validated on load rather than trusted because the server wrote it.
         if (!ewb::move_pos_valid(x, y, z)) { ++dropped; continue; }
-        g_playerPos[name] = { x,y,z };
+        g_playerPos.put(name, { x,y,z });   // file order is oldest -> newest (savePlayerPos)
+        ++rows;
     }
     std::cout << "[Server] Loaded " << g_playerPos.size() << " player positions." << std::endl;
+    if (rows > g_playerPos.size())
+        std::cerr << "[Server] " << g_posFile << ": kept the newest " << g_playerPos.size()
+                  << " of " << rows << " rows (--max-saved-positions " << g_maxSavedPos << ")." << std::endl;
     if (dropped)
         std::cerr << "[Server] " << g_posFile << ": ignored " << dropped
                   << " out-of-range player position(s)." << std::endl;
@@ -684,11 +695,12 @@ static size_t loadMotd() {
 }
 
 void savePlayerPos() {
-    std::map<std::string,SavedPos> snap;
+    std::vector<std::pair<std::string, SavedPos>> snap;   // oldest -> newest: reload restores recency
     {
         std::lock_guard<std::mutex> lk(g_posMtx);
         if (!g_posDirty.exchange(false)) return;
-        snap = g_playerPos;
+        snap.reserve(g_playerPos.size());
+        g_playerPos.for_each([&](const std::string& k, const SavedPos& v) { snap.emplace_back(k, v); });
     }
     std::lock_guard<std::mutex> save(g_saveMtx);   // atomic temp+rename, serialized
     std::string tmp = g_posFile + ".tmp";
@@ -817,7 +829,7 @@ static void rememberPos(const std::string& name, float x, float y, float z){
     if(name.empty()) return;
     if(!ewb::move_pos_valid(x, y, z)) return;
     std::lock_guard<std::mutex> lk(g_posMtx);
-    g_playerPos[name] = { x,y,z };
+    g_playerPos.put(name, { x,y,z });
     g_posDirty = true;
 }
 
@@ -1133,6 +1145,10 @@ struct ClientOut {
     bool dead       = false;           // the writer gave up (peer gone / write timeout)
     bool writing    = false;           // an item is in the writer's hand, not the queue
     bool dropWarned = false;           // "not keeping up" logged once per client
+    // Written by the reader thread on every recv, read by a JOIN that wants this
+    // client's name (stage 7.5) — hence atomic rather than under `m`.
+    std::atomic<double> lastRecv{0.0};      // monoSeconds() of the last byte received
+    std::atomic<bool>   evicted{false};     // a same-address rejoin took our name; stand down
     uint64_t sentBytes = 0;
 
     std::thread th;                    // the writer; joined by the reader in closeOut()
@@ -1515,6 +1531,7 @@ static std::shared_ptr<ClientOut> openOut(SOCKET fd, int id) {
     o->fd   = fd;
     o->id   = id;
     o->name = "client #" + std::to_string(id);
+    o->lastRecv.store(monoSeconds(), std::memory_order_relaxed);
     o->q.set_limits(ewb::OutQueue::Limits{g_outboxMax, g_worldboxMax, g_regionQueue});
     // Without this a writer blocked on a peer that stopped reading is unkillable
     // short of shutdown(); with it, --client-write-timeout is enforceable.
@@ -1951,11 +1968,14 @@ static std::string emitEditBatch(const std::vector<ewb::WeEdit>& batch) {
 // Fill an inclusive box. The volume is capped and validated by the caller; here
 // we take the world lock once for the whole box (the plan §3.4 rule: never
 // iterate a box under g_worldMtx unbounded — the cap is what bounds it), build
-// the wire burst, release the lock, then broadcast once.
-static long long ctlFillBox(int x0, int y0, int z0, int x1, int y1, int z1, int type, int color) {
+// the wire burst, release the lock, then broadcast once. Only cells `worldSet`
+// accepted are relayed (stage 7.26): a cell the world cap refused is counted in
+// `refused` and never reaches a player's screen, exactly as weCommit does.
+static ewb::CtlFillResult ctlFillBox(int x0, int y0, int z0, int x1, int y1, int z1, int type, int color) {
     if (x0 > x1) std::swap(x0, x1);
     if (y0 > y1) std::swap(y0, y1);
     if (z0 > z1) std::swap(z0, z1);
+    ewb::CtlFillResult res;
     std::vector<ewb::WeEdit> batch;
     batch.reserve((size_t)ewb::ctl_fill_volume(x0, y0, z0, x1, y1, z1));
     {
@@ -1963,13 +1983,19 @@ static long long ctlFillBox(int x0, int y0, int z0, int x1, int y1, int z1, int 
         for (int x = x0; x <= x1; ++x)
             for (int z = z0; z <= z1; ++z)
                 for (int y = y0; y <= y1; ++y) {
-                    worldSet(x, y, z, type == SV_AIR ? SV_AIR : type, color);
+                    if (!worldSet(x, y, z, type == SV_AIR ? SV_AIR : type, color)) { ++res.refused; continue; }
                     batch.push_back({x, y, z, 0, 0, (unsigned char)type, (unsigned char)color});
                 }
     }
     const std::string wire = emitEditBatch(batch);   // formatting, outside the lock
     if (!wire.empty()) broadcastWorld(wire, INVALID_SOCKET);
-    return (long long)batch.size();
+    res.applied = (long long)batch.size();
+    return res;
+}
+
+// " (refused N at the world cell cap)" for an audit line, or "" when nothing was.
+static std::string ctlRefusedNote(const ewb::CtlFillResult& r) {
+    return r.refused ? " (refused " + std::to_string(r.refused) + " at the world cell cap)" : "";
 }
 
 // Handle one complete control line. `reply` is sent back (a trailing '\n' is
@@ -2128,12 +2154,12 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
         }
         if (!ewb::action_extra_valid(0, type) && type != SV_AIR) { reply = "error: block type out of range (0..127)"; return; }
         if (color != 0 && !ewb::action_extra_valid(3, color)) { reply = "error: color out of range (0..54)"; return; }
-        ctlFillBox(x, y, z, x, y, z, type, color);
+        const ewb::CtlFillResult res = ctlFillBox(x, y, z, x, y, z, type, color);
         auditLog("control", "setblock " + std::to_string(x) + "," + std::to_string(y) + "," +
                             std::to_string(z) + " = " + std::to_string(type) +
-                            (color ? " color " + std::to_string(color) : ""));
+                            (color ? " color " + std::to_string(color) : "") + ctlRefusedNote(res));
         drainSignRemovals();   // after the edit's own audit line
-        reply = "ok: set 1 block";
+        reply = ewb::ctl_setblock_reply(res);
         return;
     }
 
@@ -2158,13 +2184,14 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
                     std::to_string(ewb::CTL_FILL_CAP_MULTIPLE) + "x --we-max-cells)";
             return;
         }
-        const long long changed = ctlFillBox(v[0], v[1], v[2], v[3], v[4], v[5], type, color);
-        auditLog("control", "fill " + std::to_string(changed) + " cells = " + std::to_string(type) +
+        const ewb::CtlFillResult res = ctlFillBox(v[0], v[1], v[2], v[3], v[4], v[5], type, color);
+        auditLog("control", "fill " + std::to_string(res.applied) + " cells = " + std::to_string(type) +
                             (color ? " color " + std::to_string(color) : "") + " @ " +
                             std::to_string(v[0]) + "," + std::to_string(v[1]) + "," + std::to_string(v[2]) +
-                            ".." + std::to_string(v[3]) + "," + std::to_string(v[4]) + "," + std::to_string(v[5]));
+                            ".." + std::to_string(v[3]) + "," + std::to_string(v[4]) + "," + std::to_string(v[5]) +
+                            ctlRefusedNote(res));
         drainSignRemovals();   // after the edit's own audit line
-        reply = "ok: filled " + std::to_string(changed) + " cells";
+        reply = ewb::ctl_fill_reply(res);
         return;
     }
 
@@ -2411,9 +2438,28 @@ static void controlThread() {
     else                     std::cout << g_ctlCmdRate << " cmd/s (burst " << g_ctlCmdBurst << ")";
     std::cout << ", fill \u2264 " << g_ctlFillCap << " cells." << std::endl;
 
+    double lastCtlAcceptFailLog = 0.0;
     while (serverRunning) {
         const int c = accept(s, nullptr, nullptr);
-        if (c < 0) { if (!serverRunning) break; continue; }
+        if (c < 0) {
+            if (!serverRunning) break;
+            // Same policy as the client listener (stage 7.10; missed here until 7.25):
+            // a persistent EMFILE/ENFILE — which the client loop's own exhaustion
+            // produces — must not become a tight 100%-CPU spin on the one socket an
+            // operator needs working at that moment.
+            const int err = errno;
+            const auto act = ewb::classify_accept_error(err);
+            if (act != ewb::AcceptErrorAction::Retry) {
+                const double now = monoSeconds();
+                if (now - lastCtlAcceptFailLog >= 1.0) {
+                    std::cerr << "[Server] Control accept failed: " << strerror(err) << std::endl;
+                    lastCtlAcceptFailLog = now;
+                }
+                if (act == ewb::AcceptErrorAction::BackoffSleep)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            continue;
+        }
         // Bound the thread count as well as the command rate: accepting is the
         // cheap half, spawning a thread per connection is not.
         if (g_ctlConns.fetch_add(1, std::memory_order_relaxed) >= g_ctlMaxConns) {
@@ -3178,6 +3224,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
     // TCP coalescing (e.g. a POSVEL and an ACTION arriving in one recv()).
     std::string acc;
     bool disconnect = false;
+    const std::shared_ptr<ClientOut> myOut = outFor(clientSocket);   // lastRecv / evicted (stage 7.5)
 
     // Connection-lifecycle timeout (stage 1.10). Without this a peer can open a
     // TCP connection, send nothing, and hold one of SV_MAX_CLIENTS slots until
@@ -3209,6 +3256,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
             break;
         }
         if (bytesReceived == 0) break;   // peer closed
+        if (myOut) myOut->lastRecv.store(monoSeconds(), std::memory_order_relaxed);
         acc.append(recvBuffer, bytesReceived);
 
         // Guard against a client flooding without a newline (unbounded memory).
@@ -3219,6 +3267,10 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
 
         size_t nlpos;
         while (!disconnect && (nlpos = acc.find('\n')) != std::string::npos) {
+            // A rejoin from this address took our name (stage 7.5). Whatever is
+            // still buffered belongs to a session that no longer exists; acting on
+            // it would relay and remember positions under the new session's name.
+            if (myOut && myOut->evicted.load(std::memory_order_relaxed)) { disconnect = true; break; }
             std::string message = acc.substr(0, nlpos);
             acc.erase(0, nlpos + 1);
             if (message.empty()) continue;
@@ -3292,9 +3344,11 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     }
                 }
                 rememberPos(username, px, py, pz);
+                // Re-formatted from the parsed floats, not echoed (stage 7.18): the
+                // relay's size must not be the sender's to choose.
                 std::string broadcastMsg = "POSVEL:" + username + ":" + std::to_string(characterType) + ":" +
-                                           parts[1] + ":" + parts[2] + ":" + parts[3] + ":" +
-                                           parts[4] + ":" + parts[5] + ":" + parts[6] + "\n";
+                                           ewb::format_move_triplet(px, py, pz) + ":" +
+                                           ewb::format_move_triplet(vx, vy, vz) + "\n";
                 broadcastMessage(broadcastMsg, clientSocket);
             }
             // POS:x:y:z
@@ -3325,7 +3379,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                 }
                 rememberPos(username, px, py, pz);
                 std::string broadcastMsg = "POS:" + username + ":" + std::to_string(characterType) + ":" +
-                                           parts[1] + ":" + parts[2] + ":" + parts[3] + "\n";
+                                           ewb::format_move_triplet(px, py, pz) + "\n";   // stage 7.18
                 broadcastMessage(broadcastMsg, clientSocket);
             }
             // VEL:x:y:z
@@ -3355,7 +3409,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     }
                 }
                 std::string broadcastMsg = "VEL:" + username + ":" + std::to_string(characterType) + ":" +
-                                           parts[1] + ":" + parts[2] + ":" + parts[3] + "\n";
+                                           ewb::format_move_triplet(vx, vy, vz) + "\n";   // stage 7.18
                 broadcastMessage(broadcastMsg, clientSocket);
             }
             // ACTION:x:y:z:mode[:typeOrColor]   mode 0=build 1=mine 2=burn 3=paint
@@ -3600,28 +3654,55 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     continue;
                 }
 
-                // Reject a name already connected. g_playerPos is keyed by username,
-                // so two players sharing one would also share (and clobber) a single
-                // saved-position slot. Comparison is exact, matching that key.
+                // A name already connected. g_playerPos is keyed by username, so two
+                // players sharing one would share (and clobber) one saved-position
+                // slot; comparison is exact, matching that key. Stage 7.5 — two ways
+                // out instead of a refusal:
+                //   * the same address, its old socket silent past --stale-session-secs:
+                //     that is this player's own dead session (a dropped mobile link the
+                //     server has not noticed yet). Evict it; they keep the name and the
+                //     saved position.
+                //   * anyone else: the next free `name-2`, `name-3`, ...; the welcome
+                //     line already echoes the assigned name.
+                std::string assigned;
                 {
                     std::lock_guard<std::mutex> lock(clientsMutex);
-                    bool taken = false;
-                    for (const auto& kv : playerInfoMap)
-                        if (kv.second.username == wanted) { taken = true; break; }
-                    if (taken) {
-                        // ⚠️ Our wording, not captured evidence — no real server has
-                        // been observed refusing a duplicate name.
-                        std::string deny = "[Server] Name already in use.\n";
-                        sendLine(clientSocket, deny);
-                        std::cout << "[Server] Rejected " << wanted << " (name in use)." << std::endl;
-                        disconnect = true;
-                        continue;
+                    std::set<std::string> taken;
+                    SOCKET dupSock = INVALID_SOCKET;
+                    std::string dupIp;
+                    for (const auto& kv : playerInfoMap) {
+                        taken.insert(kv.second.username);
+                        if (kv.second.username == wanted) { dupSock = kv.first; dupIp = kv.second.ip; }
                     }
-                    username = wanted;
-                    PlayerInfo pi{clientSocket, username, characterType};
-                    pi.ip = clientIP;
-                    playerInfoMap[clientSocket] = pi;
+                    if (dupSock != INVALID_SOCKET) {
+                        const auto old = outFor(dupSock);
+                        const double silent = old ? monoSeconds() - old->lastRecv.load(std::memory_order_relaxed)
+                                                  : 1e9;   // no writer left: nothing is listening
+                        if (ewb::dup_name_action(dupIp == clientIP, silent, g_staleSessionSecs) ==
+                            ewb::DupNameAction::Evict) {
+                            // Taken out of the roster here rather than waiting for the old
+                            // thread to get there: its disconnect path saves the whole world
+                            // first, which on a big world is seconds. The fd stays open until
+                            // that thread closes it — it cannot be recycled under us — and
+                            // shutdown() is what wakes its recv().
+                            if (old) old->evicted.store(true, std::memory_order_relaxed);
+                            playerInfoMap.erase(dupSock);
+                            taken.erase(wanted);
+                            shutdown(dupSock, SHUT_RDWR);
+                            std::cout << "[Server] Evicted the stale session of " << wanted << " ("
+                                      << clientIP << ", silent " << static_cast<int>(silent)
+                                      << "s); the rejoin keeps the name." << std::endl;
+                        }
+                    }
+                    assigned = ewb::next_free_username(wanted, taken);
+                    username = assigned;
+                    playerInfoMap[clientSocket] =
+                        PlayerInfo{clientSocket, username, characterType, 0, 0, 0, 0, 0, 0, clientIP};
                 }
+                const bool renamed = (assigned != wanted);
+                if (renamed)
+                    std::cout << "[Server] " << wanted << " is in use; admitted " << clientIP
+                              << " as " << assigned << "." << std::endl;
                 joined = true;
                 t_editActor = "player:" + username;   // who the audit names when this player's edit removes a sign
 
@@ -3636,6 +3717,9 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                 nameOut(clientSocket, username);   // the writer's log lines get a name
                 std::string welcome = "[Server] Welcome, " + username + "! (Character Type: " + std::to_string(characterType) + ")\n";
                 sendLine(clientSocket, welcome);
+                if (renamed)   // ordinary chat, so the player learns why their name changed
+                    sendLine(clientSocket, "[Server] The name " + wanted + " is already in use; you are " +
+                                           username + ".\n");
 
                 // 2. the operator's welcome message, if this world has one
                 //    (eden_motd.txt / --motd-file). Ordinary `[Server]` chat
@@ -3657,11 +3741,11 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                 //    5.3). A returning player's own row always wins.
                 {
                     std::lock_guard<std::mutex> lk(g_posMtx);
-                    auto it = g_playerPos.find(username);
-                    if (it != g_playerPos.end()) {
-                        sendLine(clientSocket, spawnLine(it->second.x, it->second.y, it->second.z));
+                    const SavedPos* sp = g_playerPos.find(username);
+                    if (sp) {
+                        sendLine(clientSocket, spawnLine(sp->x, sp->y, sp->z));
                         std::cout << "[Server] Restored " << username << " to ("
-                                  << it->second.x << "," << it->second.y << "," << it->second.z << ")\n";
+                                  << sp->x << "," << sp->y << "," << sp->z << ")\n";
                     } else if (g_haveWorldSpawn) {
                         sendLine(clientSocket, spawnLine(g_worldSpawn.x, g_worldSpawn.y, g_worldSpawn.z));
                         std::cout << "[Server] Spawned " << username << " at world spawn ("
@@ -3737,13 +3821,17 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
             // chain. (This is how the client's `SIGNP` sign write was found.)
             // Only reachable from a joined player since stage 7.17: an unknown verb
             // from a peer that never handshook is dropped by the gate above, which
-            // takes `seen` — an unbounded set keyed on untrusted bytes, stage 7.24 —
-            // out of an anonymous peer's reach.
+            // keeps `seen` (a set keyed on untrusted bytes, capped by stage 7.24) out
+            // of an anonymous peer's reach.
             else if (g_verbose && !command.empty()) {
                 static std::mutex seenMtx;
                 static std::set<std::string> seen;
                 std::lock_guard<std::mutex> lk(seenMtx);
-                if (seen.insert(command).second) {
+                // Both ends bounded (stage 7.24): the key is attacker-chosen bytes and
+                // a diagnostic needs only a verb's prefix, and a few hundred distinct
+                // verbs is well past its usefulness. Past the cap it goes quiet.
+                static const size_t SEEN_MAX = 256, SEEN_KEY_MAX = 16;
+                if (seen.size() < SEEN_MAX && seen.insert(command.substr(0, SEEN_KEY_MAX)).second) {
                     std::cout << "[Server] unrecognised line from " << username
                               << ": " << message.substr(0, 64)
                               << (message.size() > 64 ? "..." : "") << std::endl;
@@ -3756,8 +3844,17 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
     // refused at JOIN (bad password, bad or duplicate name) or one that never sent a
     // JOIN at all never appeared in anyone's roster, and broadcasting a leave line
     // for it both confuses clients and leaks the attempted name to every player.
-    if (joined) {
+    // An evicted session (stage 7.5) is silent: the same player is already back under
+    // this name, and a "has left" now would tell every client they had gone.
+    const bool evicted = myOut && myOut->evicted.load(std::memory_order_relaxed);
+    if (joined && evicted) {
+        std::cout << "[Server] " << username << " (stale session) closed." << std::endl;
+    } else if (joined) {
         std::cout << "[Server] " << username << " disconnected." << std::endl;
+        {   // /r state is keyed by the recipient: drop it with them (stage 7.23)
+            std::lock_guard<std::mutex> lk(g_whisperMtx);
+            g_lastWhisper.erase(username);
+        }
         std::string leaveMsg = "[Server] " + username + " has left.\n";
         broadcastMessage(leaveMsg, clientSocket);
     } else if (g_verbose) {
@@ -3780,16 +3877,17 @@ int main(int argc, char* argv[]) {
     int port = DEFAULT_PORT;
 
     // Args: [port] and/or flags:
-    //   --port N  --name "My World"  --password PASS  --world FILE  --signs FILE
+    //   --port N  --name "My World"  --password PASS | --password-file FILE  --world FILE  --signs FILE
     //   --world-format edmb|text   (what a save writes; loading accepts both)
     //   --spawn x:y:z  --spawn-file FILE  --motd-file FILE  --players-file FILE
-    //   --max-world-cells N
+    //   --max-world-cells N  --max-saved-positions N
     //   --matchmaker HOST[:PORT]
     //   --region-radius N  --no-region-sort  --no-region-empty-frame
     //   --action-rate N  --action-burst N   (0 = unlimited)
     //   --move-rate N  --move-burst N   --chat-rate N  --chat-burst N   (0 = unlimited)
     //   --legacy-snapshot  --connect-limit N  --tcp-nodelay 0|1  (1 = default, disables Nagle)
     //   --auth-fail-limit N  --handshake-timeout N  --idle-timeout-conn N  (0 = off)
+    //   --stale-session-secs N  (0 = never evict a same-address duplicate name)
     //   --control-rate N  --control-burst N  --control-max-conns N  --audit-file FILE
     // A bare leading number is still accepted as the port (back-compat).
     for (int i = 1; i < argc; ++i) {
@@ -3797,7 +3895,16 @@ int main(int argc, char* argv[]) {
         auto next = [&](const char* def)->std::string{ return (i+1<argc) ? std::string(argv[++i]) : std::string(def); };
         if      (a == "--port")       port = std::atoi(next("27015").c_str());
         else if (a == "--name")       g_serverName = next("Eden Server");
-        else if (a == "--password")   g_password   = next("");
+        else if (a == "--password") {
+            const bool hasValue = i + 1 < argc;
+            g_password = next("");
+            // Blank the secret in argv so /proc/<pid>/cmdline and `ps` stop showing it. This
+            // narrows the window (the process was already exec'd with it) but does not close it:
+            // prefer --password-file or EDEN_PASSWORD (stage 7.28). The length of the argv slot
+            // is unchanged, so a same-length blank leaks only how long the password was.
+            if (hasValue) std::memset(argv[i], ' ', std::strlen(argv[i]));
+        }
+        else if (a == "--password-file") g_passwordFile = next("");
         else if (a == "--world")      g_worldFile  = next("eden_world.model");
         else if (a == "--world-format") {        // stage 7.6: edmb (default) | text
             const std::string v = next("edmb");
@@ -3819,6 +3926,10 @@ int main(int argc, char* argv[]) {
                 std::cerr << "[Server] --spawn " << v << " is outside the world; ignored." << std::endl;
             else { g_worldSpawn = s; g_haveWorldSpawn = true; }
         }
+        else if (a == "--max-saved-positions") {
+            const long long v = std::atoll(next("10000").c_str());
+            g_maxSavedPos = v >= 1 ? (size_t)v : 0;   // 0 -> reset with a warning below
+        }
         else if (a == "--max-world-cells") {
             const long long v = std::atoll(next("4000000").c_str());
             g_maxWorldCells = v >= 1 ? (size_t)v : 0;   // 0 -> reset with a warning below
@@ -3835,6 +3946,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--auth-fail-limit")   g_authFailLimit    = std::atoi(next("5").c_str());
         else if (a == "--handshake-timeout") g_handshakeTimeout = std::atoi(next("15").c_str());
         else if (a == "--idle-timeout-conn") g_idleConnTimeout  = std::atoi(next("300").c_str());
+        else if (a == "--stale-session-secs") g_staleSessionSecs = std::atoi(next("15").c_str());
         else if (a == "--idle-timeout") g_idleTimeout = std::atoi(next("0").c_str());
         // Tier 1 operator control socket (stage 3.2). Defaults on, at
         // <worlddir>/edenserver.sock; --control-socket overrides the path,
@@ -3896,6 +4008,49 @@ int main(int argc, char* argv[]) {
     }
     g_port = port;
 
+    // Resolve the world password (stage 7.28): --password, then --password-file, then the
+    // EDEN_PASSWORD environment variable. A file the operator asked for that cannot be read,
+    // or holds nothing, is a hard error: carrying on would silently start an OPEN server.
+    {
+        std::string filePw;
+        const bool wantFile = !g_passwordFile.empty();
+        if (wantFile) {
+            struct stat st{};
+            std::ifstream pf(g_passwordFile, std::ios::binary);
+            if (!pf || stat(g_passwordFile.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+                std::cerr << "[Server] --password-file " << g_passwordFile
+                          << ": cannot read it (or it is not a regular file). Refusing to start an open server."
+                          << std::endl;
+                return 2;
+            }
+            if (st.st_mode & (S_IRWXG | S_IRWXO))
+                std::cerr << "[Server] warning: --password-file " << g_passwordFile
+                          << " is readable by other users; chmod 600 it." << std::endl;
+            char pwbuf[4096];                            // only the first line is used; bound the read
+            pf.read(pwbuf, sizeof pwbuf);
+            filePw = ewb::password_from_file_text(std::string(pwbuf, (size_t)pf.gcount()));
+            if (filePw.empty()) {
+                std::cerr << "[Server] --password-file " << g_passwordFile
+                          << " is empty. Refusing to start an open server (omit the flag for one)."
+                          << std::endl;
+                return 2;
+            }
+        }
+        const ewb::PasswordChoice pc =
+            ewb::choose_password(g_password, wantFile ? &filePw : nullptr, std::getenv("EDEN_PASSWORD"));
+        g_password = pc.value;
+        switch (pc.source) {
+            case ewb::PasswordSource::Argv:
+                std::cout << "[Server] Password: from --password (visible in the process list; "
+                             "prefer --password-file or EDEN_PASSWORD)." << std::endl; break;
+            case ewb::PasswordSource::File:
+                std::cout << "[Server] Password: from --password-file." << std::endl; break;
+            case ewb::PasswordSource::Env:
+                std::cout << "[Server] Password: from EDEN_PASSWORD." << std::endl; break;
+            case ewb::PasswordSource::None: break;
+        }
+    }
+
     // Clamp an operator typo before it becomes a wrapped box or a whole-world scan.
     if (g_regionRadius < 16 || g_regionRadius > 4096) {
         std::cerr << "[Server] --region-radius " << g_regionRadius
@@ -3916,6 +4071,17 @@ int main(int argc, char* argv[]) {
                   << SV_MAX_WORLD_CELLS_DEFAULT << "." << std::endl;
         g_maxWorldCells = SV_MAX_WORLD_CELLS_DEFAULT;
     }
+    // Saved-position table (stage 7.23): same shape — below 1 is a typo. Applied before
+    // loadPlayerPos() so an oversized file is trimmed to the newest rows on load.
+    if (g_maxSavedPos < 1) {
+        std::cerr << "[Server] --max-saved-positions must be >= 1; using "
+                  << SV_MAX_SAVED_POS_DEFAULT << "." << std::endl;
+        g_maxSavedPos = SV_MAX_SAVED_POS_DEFAULT;
+    }
+    g_playerPos.set_capacity(g_maxSavedPos);
+    if (g_maxSavedPos != SV_MAX_SAVED_POS_DEFAULT)
+        std::cout << "[Server] Saved-position cap " << g_maxSavedPos
+                  << " (default " << SV_MAX_SAVED_POS_DEFAULT << ")" << std::endl;
     if (g_maxWorldCells != SV_MAX_WORLD_CELLS_DEFAULT)
         std::cout << "[Server] Edited-cell cap " << g_maxWorldCells
                   << " (default " << SV_MAX_WORLD_CELLS_DEFAULT << ")" << std::endl;
@@ -4275,15 +4441,16 @@ int main(int argc, char* argv[]) {
             // are resource exhaustion: without a sleep, poll() keeps reporting the
             // listen socket readable and this becomes a tight 100%-CPU loop that also
             // floods the log with one line per iteration.
-            if (serverRunning && errno != EINTR && errno != ECONNABORTED) {
+            const int err = errno;
+            const auto act = ewb::classify_accept_error(err);
+            if (serverRunning && act != ewb::AcceptErrorAction::Retry) {
                 const double now = monoSeconds();
                 if (now - lastAcceptFailLog >= 1.0) {
-                    std::cerr << "[Server] Accept failed: " << strerror(errno) << std::endl;
+                    std::cerr << "[Server] Accept failed: " << strerror(err) << std::endl;
                     lastAcceptFailLog = now;
                 }
-                if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+                if (act == ewb::AcceptErrorAction::BackoffSleep)
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
             }
             continue;
         }

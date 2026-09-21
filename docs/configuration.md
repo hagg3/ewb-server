@@ -27,7 +27,10 @@ server. Unknown flags are ignored.
 |---|---|---|
 | `--port N` | `27015` | TCP port to listen on. Binds all interfaces. |
 | `--name "Text"` | `Eden Server` | Server name sent to a matchmaker. Has no effect without `--matchmaker`. |
-| `--password PASS` | *(empty)* | If set, `JOIN` must supply a matching password; empty means an open server. Only `JOIN` and `PING` are acted on before that — see [protocol.md](protocol.md#everything-is-gated-on-join). |
+| `--password PASS` | *(empty)* | If set, `JOIN` must supply a matching password; empty means an open server. Only `JOIN` and `PING` are acted on before that — see [protocol.md](protocol.md#everything-is-gated-on-join). ⚠️ The value is visible to every local user in `/proc/<pid>/cmdline` and `ps`; the server blanks its own copy after parsing, which shortens but does not close that window. Fine for a quick local run; for anything shared use `--password-file` or `EDEN_PASSWORD` (below). |
+| `--password-file FILE` | *(none)* | Read the password from the first line of `FILE` (trailing CR/LF dropped, spaces kept, first 4 KiB read). Keep it mode `0600`; the server warns if group/other can read it. A file that cannot be read or holds nothing is a **hard error** (exit 2) — the server never falls back to an open world because a path was wrong. |
+
+**Where the password comes from.** In order: a non-empty `--password`, then `--password-file`, then the `EDEN_PASSWORD` environment variable (`--password ""` counts as "not given"). The startup log names the source (`Password: from --password-file.`, never the value). The environment is visible to the process's owner and root only, which is why the shipped systemd units use it: `EDEN_PASSWORD` in `/etc/edenserver.conf` reaches the server through the unit's `EnvironmentFile` and never touches the command line. ⚠️ A server older than this feature ignores the variable and starts **open**: upgrade the binary before installing a unit file that has dropped `--password ${EDEN_PASSWORD}`.
 | `--matchmaker HOST[:PORT]` | *(none)* | Register with a matchmaker at this address and hold the registration open (`REGISTER` → `REGISTERED`, then a bare `PING` keep-alive every 20 s). Port defaults to `27020`. Reconnects every ~5 s if the matchmaker is down. See [matchmaker.md](matchmaker.md). |
 | `--advertise IP` | auto-detected | The address clients should use to reach this server, as told to the matchmaker. When omitted and a matchmaker is configured, the server picks this machine's primary non-loopback LAN IPv4 (preferring `192.168.*`, `10.*`, `172.*`) so remote devices do not get handed `127.0.0.1`. |
 | `--tcp-nodelay 0\|1` | `1` | Disables Nagle's algorithm (`TCP_NODELAY`) on every accepted client socket. The writer sends one `send()` per queued line and the hottest line is a ~60-byte `POSVEL` broadcast — exactly what Nagle coalesces — so with Nagle enabled other players' movement arrives in RTT-quantised jerks instead of as each update is sent. `0` restores Nagle if an operator ever wants it back. |
@@ -56,6 +59,7 @@ the client decides.
 |---|---|---|
 | `--idle-timeout N` | `0` (off) | Exit cleanly after `N` seconds with zero connected clients. Checked on the 15 s autosave tick, so the real granularity is 15 s. ⚠️ Do not combine with a service supervisor set to restart unconditionally — the idle exit is a normal `exit(0)` and would become a start/idle/exit loop. |
 | `--handshake-timeout N` | `15` | Seconds a freshly accepted connection has to send its `JOIN` before the server drops it. Stops a peer from opening TCP connections that send nothing and holding client slots until the ~2 h TCP keepalive reaps them. `0` disables (not recommended on an internet-facing port). |
+| `--stale-session-secs N` | `15` | A `JOIN` for a name that is already connected **evicts** the old session — keeping the name and its saved position — only if it comes from the **same IP** and the old socket has been silent this many seconds. Anything else is renamed `name-2`, `name-3`, …. Sized above the retail client's 10 s `PING`, so a live player can't look stale. `0` never evicts. See [protocol.md § Duplicate names](protocol.md#duplicate-names). |
 | `--idle-timeout-conn N` | `300` | Seconds of total silence tolerated on a socket *after* `JOIN` before it is dropped. The retail client sends `PING` every 10 s and `POS` while moving, so a genuinely silent joined socket is dead. `0` disables. Distinct from the world-level `--idle-timeout` above. |
 
 #### Shutdown
@@ -123,7 +127,7 @@ scan before any of it runs — one `//sphere 40 2` is a single chat line and rou
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--verbose` | off | Log every terrain edit, every throttled or rejected request, and the first sighting of each unrecognised verb. Chatty on a busy server. |
+| `--verbose` | off | Log every terrain edit, every throttled or rejected request, and the first sighting of each unrecognised verb (capped at 256 distinct verbs). Chatty on a busy server. |
 | `--audit-file FILE` | none | Keep a second copy of the audit channel in `FILE`, appended to. stdout always gets it; this survives independently of the journal. |
 
 One line per served `REGION` is logged regardless of `--verbose` (cells scanned, records,
@@ -159,7 +163,8 @@ keeping a copy that outlives `journalctl --vacuum`.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--max-world-cells N` | `4000000` | Ceiling on distinct edited world cells held in memory (and written to `eden_world.model`). At the cap, edits to cells the world already holds still apply but **every new cell is refused** — a block placed in open air, a natural block mined or painted — so from a player's seat some builds save and others vanish. **Size it above the world, never equal to it:** [`eden_import`](import.md)'s summary prints the value to use (the cell count plus a quarter, at least 1,000,000 more, rounded up to 100,000). The server warns at startup when the loaded world is at the cap or within a tenth of it, logs refusals at most once a minute (`world cell cap reached`), and tells the player whose edit was refused; every `Saved world` log line shows the cap. Also the upper clamp for `--we-max-cells` and the derived `fill` cap. Your RAM is the real limit. A value below `1` falls back to the default with a warning; a non-default value is logged at startup. |
+| `--max-saved-positions N` | `10000` | Ceiling on remembered player positions (the rows in `eden_players.txt`). Past it, the **least recently updated** row is evicted, so a client that joins under a fresh name over and over cannot grow the process — or the file, which is rewritten in full every 15 s — without bound. A returning name is refreshed, not duplicated. The file is written oldest-to-newest, so recency survives a restart, and a file with more rows than the cap is trimmed to the newest on load (logged). Size it above the number of distinct players you expect to *return*; an evicted player simply respawns at the world spawn. A value below `1` falls back to the default with a warning; a non-default value is logged at startup. |
+| `--max-world-cells N` | `4000000` | Ceiling on distinct edited world cells held in memory (and written to `eden_world.model`). At the cap, edits to cells the world already holds still apply but **every new cell is refused** — a block placed in open air, a natural block mined or painted — so from a player's seat some builds save and others vanish. **Size it above the world, never equal to it:** [`eden_import`](import.md)'s summary prints the value to use (the cell count plus a quarter, at least 1,000,000 more, rounded up to 100,000). The server warns at startup when the loaded world is at the cap or within a tenth of it, logs refusals at most once a minute (`world cell cap reached`), and tells the player whose edit was refused; every `Saved world` log line shows the cap. The operator `fill` / `setblock` verbs honour it too: a refused cell is not relayed, and the reply and audit line count it ([commands.md](commands.md)). Also the upper clamp for `--we-max-cells` and the derived `fill` cap. Your RAM is the real limit. A value below `1` falls back to the default with a warning; a non-default value is logged at startup. |
 | `--action-rate N` | `512` | Sustained terrain edits per second per connection. `0` disables the limit entirely. |
 | `--action-burst N` | `1024` | Edits a connection may spend at once before the sustained rate applies. |
 | `--move-rate N` | `40` | Sustained `POS`/`VEL`/`POSVEL` updates per second per connection. `0` disables the limit entirely. |
@@ -299,7 +304,7 @@ expand to empty and the server exits with a flag error in the journal, so create
 | `EDEN_NAME` | `--name ${EDEN_NAME}` | `Eden Server` | `--name` |
 | `EDEN_WORLD_DIR` | `--world ${EDEN_WORLD_DIR}/eden_world.model` and the sign / spawn / ban / ops / control-socket paths | `/var/lib/edenserver/world` | the active world directory |
 | `EDEN_MAX_WORLD_CELLS` | `--max-world-cells ${EDEN_MAX_WORLD_CELLS}` | `4000000` | `--max-world-cells` |
-| `EDEN_PASSWORD` | `--password ${EDEN_PASSWORD}` | *(empty)* | `--password`; empty is identical to omitting it (open server) |
+| `EDEN_PASSWORD` | *(none — read by the server from its environment)* | *(empty)* | the world password; empty is an open server. Not on the command line, so `ps` does not show it |
 | `EDEN_EXTRA_ARGS` | a bare `$EDEN_EXTRA_ARGS` tail | *(absent)* | any spaceless optional flags: `--matchmaker HOST:PORT`, `--spawn x:y:z`, `--audit-file PATH`, `--default-level N`, … |
 
 ### The `${VAR}` vs `$VAR` rule
@@ -341,7 +346,7 @@ A convenience launcher. It builds `edenserver` first if it is missing, then exec
 | 1 `worldFile` | `eden_world.edits` | `--world` |
 | 2 `name` | `Eden Server` | `--name` |
 | 3 `port` | `27015` | `--port` |
-| 4 `password` | *(none)* | `--password`, omitted if empty |
+| 4 `password` | `$EDEN_PASSWORD` | passed to the server as `EDEN_PASSWORD`, not `--password`; omitted if empty |
 | 5 `matchmakerHost` | `127.0.0.1` | `--matchmaker` |
 
 If an `eden_signs.txt` sits in the same directory as `worldFile`, it is passed as `--signs`.
@@ -375,7 +380,7 @@ numbers are in [import.md](import.md); the flags:
 | `--dry-run` | off | Project and print the summary; write nothing. |
 | `-y`, `--yes` | off | Take every prompt's default; no interactive questions. Implies `--force`. This plus the flags below is the scripting path. |
 | `--air-fill diff\|solid\|full` | `diff` | Which voxels become cells. `diff` emits only what differs from the client's base terrain; `solid` drops air (sub-surface voids fill in); `full` emits every voxel. |
-| `--base-profile default\|none\|FILE` | `default` | The terrain `diff` compares against. Ignored by the other two strategies. |
+| `--base-profile default\|none\|FILE` | `default` | The terrain `diff` compares against. Ignored by the other two strategies. Recorded in `eden_origin.txt` (`FILE` as `custom`). |
 | `--signs FILE` | `signs_<input>.dat` beside the input | The sign sidecar. Takes precedence over the world's inline sign trailer. |
 | `--no-signs` | off | Ignore signs entirely. |
 | `--spawn header\|home\|X,Y,Z\|none` | `header` | What goes into `eden_spawn.txt`. |
@@ -461,6 +466,7 @@ arguments. It does **not** launch `edenserver`, which is the POSIX build. On Win
 | Variable | Used by | Meaning |
 |---|---|---|
 | `CXX` | `build_server.sh` | Compiler to use. If unset the script prefers `clang++`, then `g++`, and errors out with the package names to install if neither exists. |
+| `EDEN_HARDEN` | `build_server.sh` | Set to `0` to build `edenserver` and `edenmatch` without the exploit-mitigation flags (`-D_FORTIFY_SOURCE=2`, `-fstack-protector-strong`, `-fPIE`, and on Linux `-pie -Wl,-z,relro,-z,now`) — only for a toolchain that rejects them. `-Wall -Wextra` is always on for both, and the build is expected to stay warning-free. |
 
 ### Ops wrapper
 
@@ -689,6 +695,14 @@ A spawn **outside the world** — see the ranges under
 [protocol.md § Movement](protocol.md#movement--pos-vel-posvel) — warns and is ignored too,
 whether it came from the file or from `--spawn`, rather than being sent to a joining player.
 
+### `eden_origin.txt`
+
+The `.eden` header fields the server cannot store — seed, yaw, `home`, sky palette, version —
+written by [`eden_import`](import.md#eden_origintxt) and replayed by
+[`eden_export`](export.md#the-origin-sidecar). **The server never reads it**, so it has no flag
+and a missing or malformed file cannot affect a running world. One `key: value` per line, every
+key optional; the grammar is in export.md.
+
 ### `worlds/<name>/`
 
 The layout `eden_import` writes, and the one the server expects when a world lives in its own
@@ -699,6 +713,7 @@ worlds/<name>/
   eden_world.model   the world            (--world)
   eden_signs.txt     signs                (--signs; host_world.sh derives it)
   eden_spawn.txt     default spawn        (--spawn-file; served on join)
+  eden_origin.txt    source .eden header  (never read by the server; eden_export replays it)
   .gitignore         `*` plus `!.gitignore`
   edenserver.sock    the control socket, created at run time
 ```

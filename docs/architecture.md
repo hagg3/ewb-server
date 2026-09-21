@@ -285,8 +285,8 @@ handled correctly. A client that floods without ever sending a newline is droppe
 buffer passes the line cap.
 
 Each line is split on `:` and dispatched by its first field. Unrecognised verbs are logged once
-per verb under `--verbose`, so a real client's un-modelled messages surface instead of being
-swallowed. See [protocol.md](protocol.md) for the message set.
+per verb under `--verbose` (keyed on the first 16 bytes, at most 256 distinct verbs, then quiet),
+so a real client's un-modelled messages surface instead of being swallowed. See [protocol.md](protocol.md) for the message set.
 
 `REGION` and `SIGNQ` are both gated on a successful `JOIN`: each is a tiny request answered
 with a large reply, so requiring the handshake first is both the cheapest anti-amplification

@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <random>
 #include <sstream>
 #include <string>
@@ -405,6 +406,76 @@ static void test_username_validation() {
     CHECK(validate_username("server2") == NameVerdict::Ok, "only the exact token is reserved");
 }
 
+static void test_duplicate_names() {
+    using ewb::DupNameAction;
+    using ewb::dup_name_action;
+    using ewb::next_free_username;
+    using Names = std::set<std::string>;
+
+    CHECK(next_free_username("td0", Names{}) == "td0", "a free name is returned untouched");
+    CHECK(next_free_username("td0", Names{"other"}) == "td0", "unrelated names do not matter");
+    CHECK(next_free_username("td0", Names{"td0"}) == "td0-2", "first collision -> -2");
+    CHECK(next_free_username("td0", Names{"td0", "td0-2"}) == "td0-3", "lowest free suffix");
+    CHECK(next_free_username("td0", Names{"td0", "td0-3"}) == "td0-2", "a gap is filled, not skipped");
+    CHECK(next_free_username("td0", Names{"TD0"}) == "td0", "comparison is exact, like the g_playerPos key");
+
+    // The suffix must still fit, and the result must still be a legal username.
+    const std::string full(ewb::USERNAME_MAX, 'a');
+    const std::string cut = next_free_username(full, Names{full});
+    CHECK(cut.size() == ewb::USERNAME_MAX, "a name at the cap is cut to make room for the suffix");
+    CHECK(cut == std::string(ewb::USERNAME_MAX - 2, 'a') + "-2", "the base loses exactly the suffix width");
+    CHECK(ewb::validate_username(cut) == ewb::NameVerdict::Ok, "and the cut name validates");
+
+    // Cutting can expose a space, which validate_username refuses.
+    const std::string spaced = std::string(ewb::USERNAME_MAX - 3, 'a') + " b";   // the cut lands on the space
+    const std::string sp = next_free_username(spaced, Names{spaced});
+    CHECK(ewb::validate_username(sp) == ewb::NameVerdict::Ok, "a trailing space left by the cut is dropped");
+
+    Names many{"n"};
+    for (int i = 2; i <= 12; ++i) many.insert("n-" + std::to_string(i));
+    CHECK(next_free_username("n", many) == "n-13", "double-digit suffixes");
+    const std::string wide = next_free_username(full, Names{full, std::string(ewb::USERNAME_MAX - 2, 'a') + "-2"});
+    CHECK(wide.size() <= ewb::USERNAME_MAX && wide != full, "still bounded when the first suffix is taken");
+
+    // Eviction needs the same address AND a quiet old socket.
+    CHECK(dup_name_action(true, 20.0, 15.0) == DupNameAction::Evict, "same address, silent past the threshold");
+    CHECK(dup_name_action(true, 15.0, 15.0) == DupNameAction::Evict, "the threshold itself counts");
+    CHECK(dup_name_action(true, 3.0, 15.0) == DupNameAction::Suffix,
+          "same address but the old socket is still talking: a live player, not a stale one");
+    CHECK(dup_name_action(false, 600.0, 15.0) == DupNameAction::Suffix,
+          "a different address never evicts, however quiet");
+    CHECK(dup_name_action(true, 600.0, 0.0) == DupNameAction::Suffix, "0 turns eviction off");
+    CHECK(dup_name_action(true, 600.0, -1.0) == DupNameAction::Suffix, "negative turns it off too");
+}
+
+static void test_format_move() {
+    using ewb::format_move_float;
+    using ewb::format_move_triplet;
+
+    CHECK(format_move_float(33.92f) == "33.92", "the standing height, two decimals");
+    CHECK(format_move_float(65500.0f) == "65500.00", "an integer gains its decimals");
+    CHECK(format_move_float(-0.5f) == "-0.50", "sign kept");
+    CHECK(format_move_float(-0.001f) == "0.00", "a tiny negative is not '-0.00'");
+    CHECK(format_move_float(0.0f) == "0.00", "zero");
+    CHECK(format_move_float(16777215.0f) == "16777215.00", "the top of the x/z range fits");
+    CHECK(format_move_triplet(1.0f, 2.5f, -3.0f) == "1.00:2.50:-3.00", "triplet joins with ':'");
+
+    // The 7.18 amplifier: an in-range field the sender padded to any length.
+    float v = -1.0f;
+    const std::string padded = std::string(1300, '0') + "1";
+    CHECK(ewb::parse_move_float(padded, v) && v == 1.0f, "the padded field still parses (in range)");
+    CHECK(format_move_float(v) == "1.00", "but what goes back out is the number, not the padding");
+
+    // Whatever the parser admits formats to a bounded, re-parseable token.
+    const float samples[] = {0.0f, 33.92f, 65536.0f, 16777215.0f, 272.0f, -4096.0f, 4096.0f, 1e-7f};
+    for (float x : samples) {
+        const std::string t = format_move_float(x);
+        float back = 0;
+        CHECK(t.size() <= 12, "formatted field is short");
+        CHECK(ewb::parse_move_float(t, back), "formatted field is a valid movement token");
+    }
+}
+
 // --- ACTION payload (stage 1.7) ----------------------------------------------
 
 static void test_action_extra_validation() {
@@ -626,6 +697,35 @@ static void test_connect_limiter() {
 
 // --- constant-time compare + auth throttle (stage 1.10) --------------------
 
+// Stage 7.28: the password can come from a file or the environment, not only argv.
+static void test_password_sources() {
+    using ewb::PasswordSource;
+    CHECK(ewb::password_from_file_text("secret\n") == "secret", "trailing LF dropped");
+    CHECK(ewb::password_from_file_text("secret\r\n") == "secret", "trailing CRLF dropped");
+    CHECK(ewb::password_from_file_text("secret") == "secret", "no newline at all is fine");
+    CHECK(ewb::password_from_file_text("two words \nignored\n") == "two words ", "first line only, spaces kept");
+    CHECK(ewb::password_from_file_text("\n").empty(), "a blank file has no password");
+
+    const std::string f = "from-file";
+    ewb::PasswordChoice c = ewb::choose_password("argv", &f, "env");
+    CHECK(c.source == PasswordSource::Argv && c.value == "argv", "explicit --password wins");
+    c = ewb::choose_password("", &f, "env");
+    CHECK(c.source == PasswordSource::File && c.value == "from-file", "--password-file beats the environment");
+    c = ewb::choose_password("", nullptr, "env");
+    CHECK(c.source == PasswordSource::Env && c.value == "env", "environment is the last resort");
+    c = ewb::choose_password("", nullptr, "");
+    CHECK(c.source == PasswordSource::None && c.value.empty(), "an empty EDEN_PASSWORD is an open server");
+    c = ewb::choose_password("", nullptr, nullptr);
+    CHECK(c.source == PasswordSource::None, "nothing set is an open server");
+    // The pre-7.28 unit files pass `--password ${EDEN_PASSWORD}`; an empty one must not shadow the env.
+    c = ewb::choose_password("", nullptr, "env");
+    CHECK(c.source == PasswordSource::Env, "--password \"\" does not mask EDEN_PASSWORD");
+    const std::string empty;
+    c = ewb::choose_password("", &empty, "env");
+    CHECK(c.source == PasswordSource::File && c.value.empty(),
+          "a requested-but-empty file is reported as File so main() can refuse it");
+}
+
 static void test_const_time_eq() {
     CHECK(ewb::const_time_eq("hunter2", "hunter2"), "equal strings compare equal");
     CHECK(!ewb::const_time_eq("hunter2", "hunter3"), "one byte different");
@@ -841,6 +941,70 @@ static void test_prune_signs() {
           w[1].text == "on base terrain", "only the sign on a stored-air block is pruned");
 }
 
+// --- bounded saved-position table (stage 7.23) ----------------------------------
+
+static void test_lru_table() {
+    ewb::LruTable<int> t(3);
+    CHECK(t.put("a", 1) == 0 && t.put("b", 2) == 0 && t.put("c", 3) == 0 && t.size() == 3,
+          "fills to the cap without evicting");
+    CHECK(t.put("d", 4) == 1 && t.size() == 3, "a new key past the cap evicts exactly one");
+    CHECK(t.find("a") == nullptr, "...the least recently written");
+    CHECK(t.find("b") && *t.find("b") == 2 && t.find("d") && *t.find("d") == 4, "the rest survive");
+
+    // A returning name is refreshed, not duplicated, and is then the newest.
+    CHECK(t.put("b", 20) == 0 && t.size() == 3, "rewriting a key neither grows nor evicts");
+    CHECK(*t.find("b") == 20, "...and updates the value");
+    t.put("e", 5);   // evicts the oldest, which is now "c" (b was refreshed past it)
+    CHECK(t.find("c") == nullptr && t.find("b") != nullptr, "refresh moves a key to the back");
+
+    // find() is a read: it must not keep a row alive.
+    ewb::LruTable<int> r(2);
+    r.put("x", 1); r.put("y", 2);
+    (void)r.find("x");
+    r.put("z", 3);
+    CHECK(r.find("x") == nullptr && r.find("y") != nullptr, "find() does not refresh");
+
+    // for_each is oldest -> newest, so a save/reload round-trips recency.
+    std::string order;
+    t.for_each([&](const std::string& k, int) { order += k; });
+    CHECK(order == "dbe", "for_each visits every entry once, oldest first");
+    ewb::LruTable<int> o(4);
+    o.put("p", 0); o.put("q", 0); o.put("r", 0); o.put("p", 0);
+    order.clear();
+    o.for_each([&](const std::string& k, int) { order += k; });
+    CHECK(order == "qrp", "oldest first, refreshed key last");
+
+    // Reload in file order into a smaller table keeps the newest rows.
+    ewb::LruTable<int> small(2);
+    o.for_each([&](const std::string& k, int v) { small.put(k, v); });
+    CHECK(small.size() == 2 && small.find("r") && small.find("p") && !small.find("q"),
+          "loading an oversized file keeps the newest rows");
+
+    // set_capacity trims oldest-first; a zero cap is clamped, never a broken table.
+    ewb::LruTable<int> c(5);
+    for (int i = 0; i < 5; ++i) c.put(std::to_string(i), i);
+    CHECK(c.set_capacity(2) == 3 && c.size() == 2 && c.find("4") && c.find("3"), "shrinking evicts oldest");
+    CHECK(c.set_capacity(0) == 1 && c.capacity() == 1 && c.size() == 1, "cap 0 clamps to 1");
+
+    // The point of it: a flood of distinct names cannot grow the table.
+    ewb::LruTable<int> flood(100);
+    for (int i = 0; i < 100000; ++i) flood.put("n" + std::to_string(i), i);
+    CHECK(flood.size() == 100, "100k distinct names, table stays at the cap");
+    CHECK(flood.find("n99999") && !flood.find("n0"), "...holding the newest");
+}
+
+// --- accept() failure policy (stages 7.10 / 7.25) --------------------------------
+
+static void test_accept_error_policy() {
+    using A = ewb::AcceptErrorAction;
+    CHECK(ewb::classify_accept_error(EINTR) == A::Retry, "EINTR is routine");
+    CHECK(ewb::classify_accept_error(ECONNABORTED) == A::Retry, "ECONNABORTED is routine");
+    for (int e : {EMFILE, ENFILE, ENOBUFS, ENOMEM})
+        CHECK(ewb::classify_accept_error(e) == A::BackoffSleep, "resource exhaustion must sleep");
+    CHECK(ewb::classify_accept_error(EBADF) == A::LogRetry, "anything else is logged, rate-limited");
+    CHECK(ewb::classify_accept_error(EPROTO) == A::LogRetry, "EPROTO too");
+}
+
 int main() {
     test_sign_parse();
     test_sign_text_cannot_break_framing();
@@ -856,6 +1020,8 @@ int main() {
     test_spawn_parse();
     test_motd_parse();
     test_username_validation();
+    test_duplicate_names();
+    test_format_move();
     test_action_extra_validation();
     test_verb_allowed_before_join();
     test_parse_move_float();
@@ -868,6 +1034,9 @@ int main() {
     test_auth_failure_limiter();
     test_sanitize_text();
     test_parse_message_equivalence();
+    test_lru_table();
+    test_accept_error_policy();
+    test_password_sources();
 
     if (g_fail) {
         std::fprintf(stderr, "\n%d check(s) FAILED\n", g_fail);

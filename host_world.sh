@@ -6,6 +6,11 @@
 # Usage:
 #   ./host_world.sh <worldFile> [name] [port] [password] [matchmakerHost]
 #
+# The password is handed to the server through its environment (EDEN_PASSWORD),
+# not its command line, so `ps` does not show it. Typing it as the 4th argument
+# still puts it in your shell history: to avoid that, leave the argument empty and
+# export EDEN_PASSWORD (or `read -rs EDEN_PASSWORD; export EDEN_PASSWORD`) first.
+#
 # Examples:
 #   ./host_world.sh myworld.edits "My World"            27015
 #   ./host_world.sh myworld.edits "My World"            27015  secret   192.168.1.170
@@ -21,11 +26,12 @@ cd "$(dirname "$0")"
 WORLD="${1:-eden_world.edits}"
 NAME="${2:-Eden Server}"
 PORT="${3:-27015}"
-PASSWORD="${4:-}"
+PASSWORD="${4:-${EDEN_PASSWORD:-}}"
 MM="${5:-127.0.0.1}"
 
 ARGS=(--world "$WORLD" --name "$NAME" --port "$PORT" --matchmaker "$MM")
-[ -n "$PASSWORD" ] && ARGS+=(--password "$PASSWORD")
+# (No --password: the secret goes in the environment; see the note at the top.)
+if [ -n "$PASSWORD" ]; then export EDEN_PASSWORD="$PASSWORD"; else unset EDEN_PASSWORD; fi
 
 # --signs defaults to ./eden_signs.txt, which is the wrong file when the world
 # lives in its own directory (as everything eden_import writes does). Point it

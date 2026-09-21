@@ -50,9 +50,11 @@ EDEN_WORLD_DIR=/var/lib/edenserver/world
 # the real limit.
 EDEN_MAX_WORLD_CELLS=4000000
 
-# World password. EMPTY = open server (identical to omitting --password). A value
-# travels the network in plaintext and is visible in `ps` / `systemctl show`;
-# treat it as a griefer speed bump, not a secret. See ops/INSTALL.md.
+# World password. EMPTY = open server. The server reads this variable straight
+# from its environment (it is no longer on the command line, so `ps` and
+# /proc/<pid>/cmdline do not show it). It still travels the network in
+# plaintext at JOIN; treat it as a griefer speed bump, not a secret. Keep this
+# file mode 0600. See ops/INSTALL.md.
 EDEN_PASSWORD=
 
 # --- optional: a whitespace-split tail, omitted from this file when empty ---

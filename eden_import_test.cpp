@@ -315,6 +315,74 @@ static void test_spawn() {
     CHECK(!eden_spawn_in_range({-1.0f, 33.0f, 65536.0f}), "spawn: negative plane out of range");
 }
 
+// ── the origin sidecar (stage 5.6) ──────────────────────────────────────────
+
+static void test_origin_grammar() {
+    EdenWorld w = load(fixture_carved_64z());
+    const EdenOrigin o = eden_origin_from(w, "default");
+    const std::string body = eden_format_origin(o);
+
+    EdenOrigin back;
+    std::string err;
+    size_t unknown = 9;
+    CHECK(eden_parse_origin(body, back, err, &unknown), ("origin: own output parses: " + err).c_str());
+    CHECK(unknown == 0, "origin: nothing in our own output is unknown");
+    CHECK(back.name && *back.name == "Carved", "origin: name");
+    CHECK(back.seed && *back.seed == 12345, "origin: seed");
+    CHECK(back.yaw && *back.yaw == 1.5f, "origin: yaw");
+    CHECK(back.version && *back.version == 4, "origin: version");
+    CHECK(back.height && *back.height == 64, "origin: height 64z");
+    CHECK(back.base_profile && *back.base_profile == "default", "origin: base profile");
+    CHECK(back.pos && back.pos->x == 65540.0f && back.pos->y == 33.925f && back.pos->z == 65536.0f,
+          "origin: pos keeps a float that %.2f would have rounded");
+    CHECK(back.home && back.home->y == 22.0f, "origin: home");
+    CHECK(back.sky && (*back.sky)[0] == 3 && (*back.sky)[15] == 18, "origin: sky palette");
+    CHECK(eden_format_origin(back) == body, "origin: format(parse(format(x))) is a fixed point");
+
+    // %.9g must return the exact bits, for values with no short decimal form.
+    EdenOrigin f;
+    f.yaw = 0.1f;
+    f.pos = Spawn{1.0f / 3.0f, 33.333332f, 65536.1f};
+    EdenOrigin fb;
+    CHECK(eden_parse_origin(eden_format_origin(f), fb, err), "origin: float file parses");
+    CHECK(fb.yaw && *fb.yaw == 0.1f && fb.pos && fb.pos->x == 1.0f / 3.0f && fb.pos->z == 65536.1f,
+          "origin: floats round-trip bit-exactly");
+
+    // A hand-written file may say one thing; comments, CRLF and unknown keys are fine.
+    EdenOrigin h;
+    CHECK(eden_parse_origin("# hi\r\n\r\n  seed:  -7 \r\nfuture-key: 1\r\n", h, err, &unknown),
+          "origin: comments, CRLF, spacing and unknown keys are tolerated");
+    CHECK(h.seed && *h.seed == -7 && unknown == 1 && !h.yaw && !h.name, "origin: partial file");
+    CHECK(eden_parse_origin("", h, err) && h.empty(), "origin: an empty file is an empty origin");
+
+    // A malformed value names its line and is a refusal.
+    const char* bad[] = {
+        "seed: banana\n", "seed: 99999999999\n", "yaw: nan\n", "yaw: inf\n",
+        "pos: 1:2\n", "pos: 1:2:3:4\n", "pos: a:b:c\n", "height: 128z\n",
+        "sky: 1 2 3\n", "sky: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 256\n",
+        "sky: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17\n", "base-profile: fancy\n",
+        "no colon here\n",
+    };
+    for (const char* b : bad) {
+        EdenOrigin x;
+        CHECK(!eden_parse_origin(std::string("# c\n") + b, x, err) &&
+                  err.rfind("line 2:", 0) == 0,
+              (std::string("origin: rejects, naming the line: ") + b).c_str());
+    }
+
+    // A header name cannot start a second line.
+    EdenOrigin n;
+    n.name = std::string("a\nseed: 5");
+    EdenOrigin nb;
+    CHECK(eden_parse_origin(eden_format_origin(n), nb, err) && !nb.seed &&
+              nb.name && *nb.name == "a seed: 5",
+          "origin: control characters in a name are flattened, not injected");
+    // Non-finite header floats are omitted rather than written unreadable.
+    EdenOrigin nf;
+    nf.yaw = std::nanf("");
+    CHECK(eden_format_origin(nf).find("yaw") == std::string::npos, "origin: NaN yaw is left out");
+}
+
 // ── the profile file ────────────────────────────────────────────────────────
 
 static void test_profile_file() {
@@ -446,6 +514,15 @@ static void test_cli() {
     CHECK(got == golden, "cli: the written model is byte-for-byte the golden");
     CHECK(exists(out + "/eden_signs.txt"), "cli: signs sidecar written");
     CHECK(exists(out + "/eden_spawn.txt"), "cli: spawn sidecar written");
+    {
+        std::string origin;
+        EdenOrigin o;
+        std::string oerr;
+        CHECK(read_text(out + "/eden_origin.txt", origin), "cli: origin sidecar written");
+        CHECK(eden_parse_origin(origin, o, oerr) && o.seed && *o.seed == 12345 &&
+                  o.base_profile && *o.base_profile == "default",
+              "cli: the origin sidecar parses and carries the header's seed");
+    }
     std::string ign;
     CHECK(read_text(out + "/.gitignore", ign) && ign.find("\n*\n") != std::string::npos,
           "cli: the output .gitignore excludes the world");
@@ -545,6 +622,7 @@ int main() {
     test_sign_rename_and_grammar();
     test_signs_from_a_world();
     test_spawn();
+    test_origin_grammar();
     test_profile_file();
     test_slug();
     test_golden_model();

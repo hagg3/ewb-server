@@ -276,6 +276,33 @@ inline long long ctl_fill_volume(long long x0, long long y0, long long z0,
     return dx * dy * dz;
 }
 
+/// What `fill` / `setblock` did (stage 7.26): the cells the world accepted and
+/// the ones its `--max-world-cells` cap refused. Only accepted cells may be
+/// relayed to players — a refused cell is drawn on every screen and gone on the
+/// next `REGION`, which is the silent divergence 7.1 was about.
+struct CtlFillResult {
+    long long applied = 0;
+    long long refused = 0;
+};
+
+/// The control reply for a `fill`. Success stays `ok: filled N cells` so
+/// scripts that match it keep working; a cap refusal is named, with the flag.
+/// Everything refused is an `error:` (nothing changed), a partial fill is an
+/// `ok:` that says how many cells did not land.
+inline std::string ctl_fill_reply(const CtlFillResult& r) {
+    if (r.refused == 0) return "ok: filled " + std::to_string(r.applied) + " cells";
+    const std::string why = "refused " + std::to_string(r.refused) +
+                            " cell(s): the world is at its edited-cell cap (--max-world-cells)";
+    if (r.applied == 0) return "error: " + why + "; nothing was changed";
+    return "ok: filled " + std::to_string(r.applied) + " cells, but " + why;
+}
+
+/// The control reply for a `setblock` (a one-cell `fill`).
+inline std::string ctl_setblock_reply(const CtlFillResult& r) {
+    if (r.refused == 0) return "ok: set 1 block";
+    return "error: the world is at its edited-cell cap (--max-world-cells); block not set";
+}
+
 
 // --- control-socket flood guard (stage 3.4) --------------------------------
 //

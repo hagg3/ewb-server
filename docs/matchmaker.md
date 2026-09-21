@@ -66,6 +66,26 @@ empty until every server's next reconnect. `--registry-file PATH` overrides the 
 `edenmatch` also caps concurrent connections — 256 total, 24 per source IP — refusing (and
 logging) anything past that instead of spawning an unbounded number of threads.
 
+**Connection lifecycle.** A slot is only useful if it is eventually given back, so every
+connection has a read deadline:
+
+- A fresh connection must send its first line (`LIST`, `HOST:…` or `REGISTER:…`) within **15 s**
+  or it is closed. Every legitimate peer sends it immediately; a peer that connects and says
+  nothing would otherwise hold a thread and a cap slot forever, and a few dozen such peers would
+  make every Server Browser `LIST` refuse. Replies carry the same 15 s send deadline, so a peer
+  that asks for a list and never reads it cannot pin a slot from the other side.
+- A connection that has been accepted as a **registration** is the one peer that may go quiet, so
+  its deadline is relaxed to the 45 s heartbeat TTL plus 15 s of slack (60 s). Silence past that
+  closes the socket and orphans the row as described above; the sweep then decides its fate.
+- A `HOST` request holds its connection (and its slot) while the spawned server registers back,
+  up to 30 s. That is bounded and only reachable with `--allow-host`; it is not moved off the
+  connection because the requester is waiting on that same socket for the reply.
+
+`accept()` failures follow the same policy as `edenserver`: routine ones (`EINTR`,
+`ECONNABORTED`) retry silently, descriptor or memory exhaustion (`EMFILE`, `ENFILE`, `ENOBUFS`,
+`ENOMEM`) sleeps 100 ms before retrying so the loop cannot spin a core, and anything else is
+logged at most once a second.
+
 ### Game client → matchmaker (one-shot; connection closed after the reply)
 
 | Send | Reply |

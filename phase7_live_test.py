@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live socket test for ROADMAP-SERVER stages 7.3 / 7.4 / 7.9 / 7.16 / 7.17
+"""Live socket test for ROADMAP-SERVER stages 7.3 / 7.4 / 7.9 / 7.16 / 7.17 / 7.26
 (per-client output, shutdown behaviour, movement-field validation, the pre-JOIN
 admission gate).
 
@@ -43,6 +43,13 @@ Covers:
          world, broadcast chat, or inject a phantom player. `PING` still answers,
          and the same edit from a joined player still lands.
 
+ 10  7.5 — a JOIN under a name already connected: a live player keeps it and the
+         newcomer becomes `name-2`; the same player's own dead session (same
+         address, silent past --stale-session-secs) is evicted, silently, and the
+         rejoin keeps the name and the saved position.
+ 11  7.18 — movement is re-formatted, not echoed: a field padded to a thousand
+         characters reaches other players as a short two-decimal number.
+
 Group 1 spends ~35 s deliberately reading at ~50 KB/s; the whole pass is ~1 min.
 """
 import base64, os, re, shutil, socket, struct, subprocess, sys, tempfile, threading, time, zlib
@@ -74,7 +81,7 @@ def write_dense_world(path):
 class Server:
     """A running ./edenserver with its stdout drained (an undrained pipe would
     deadlock it once full — this test makes the server log a lot)."""
-    def __init__(self, world_dir, *extra):
+    def __init__(self, world_dir, *extra, ctl=None):
         self.dir = world_dir
         self.out = []
         self._lock = threading.Lock()
@@ -82,7 +89,8 @@ class Server:
             [SERVER, "--port", str(PORT),
              "--world", os.path.join(world_dir, "eden_world.model"),
              "--signs", os.path.join(world_dir, "eden_signs.txt"),
-             "--connect-limit", "0", "--no-control-socket",
+             "--connect-limit", "0",
+             *(["--control-socket", ctl] if ctl else ["--no-control-socket"]),
              "--handshake-timeout", "0", "--idle-timeout-conn", "0", *extra],
             cwd=world_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self._t = threading.Thread(target=self._drain, daemon=True)
@@ -708,6 +716,180 @@ def group9_prejoin_gate():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# --- group 10: duplicate names (stage 7.5) ------------------------------------
+
+def group10_duplicate_names():
+    print("\n[10] 7.5 — duplicate names: suffix a live player, evict a dead session")
+    d = tempfile.mkdtemp(prefix="ewb7-")
+    try:
+        open(os.path.join(d, "eden_world.model"), "w").close()
+        open(os.path.join(d, "eden_signs.txt"), "w").close()
+
+        # Everything here connects from 127.0.0.1, so "same address" is always true
+        # and the *silence* threshold is what separates the two cases.
+        srv = Server(d, "--stale-session-secs", "2")
+        try:
+            obs = join("observer")
+            read_for(obs, 0.5)
+
+            a = join("td0")
+            read_for(a, 0.5)
+            a.sendall(b"POS:65540.00:34.92:65500.00\n")
+            time.sleep(0.3)
+
+            # (a) the old socket just spoke: a live player, not a stale one.
+            b = join("td0")
+            got = read_for(b, 0.8)
+            check(b"Welcome, td0-2!" in got, "a live duplicate is admitted as td0-2 (%r)" % got[:70])
+            check(b"is already in use" in got, "and told why their name changed")
+            a.sendall(b"PING\n")
+            check(b"PONG" in read_for(a, 0.5), "the original td0 was left connected")
+
+            # (b) now td0 goes silent past the threshold and the same address returns.
+            time.sleep(2.3)
+            read_for(obs, 0.1)
+            c = join("td0")
+            got = read_for(c, 1.0)
+            check(b"Welcome, td0!" in got, "a silent same-address duplicate is evicted; rejoin keeps td0")
+            check(b"SPAWN:65540.00:34.92:65500.00" in got, "and gets td0's saved position back")
+            tail = read_for(a, 1.0)
+            try:
+                closed = a.recv(16) == b""
+            except (socket.timeout, OSError):
+                closed = False
+            check(closed, "the stale socket was closed by the server")
+            seen = read_for(obs, 0.5)
+            check(b"td0 has left" not in seen, "the eviction was not announced as a departure")
+            check(b"td0 (Type 17) has joined" in seen, "the rejoin was announced")
+            check(srv.alive(), "the server survived")
+            for x in (b, c, obs):
+                x.close()
+        finally:
+            srv.stop()
+
+        # (c) eviction switched off: the same silence is a suffix, never a kick.
+        srv = Server(d, "--stale-session-secs", "0")
+        try:
+            a = join("td0")
+            read_for(a, 0.5)
+            time.sleep(2.3)
+            b = join("td0")
+            got = read_for(b, 0.8)
+            check(b"Welcome, td0-2!" in got, "--stale-session-secs 0 never evicts")
+            a.sendall(b"PING\n")
+            check(b"PONG" in read_for(a, 0.5), "...and the original stays connected")
+            a.close(); b.close()
+        finally:
+            srv.stop()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# --- group 11: movement is re-formatted (stage 7.18) --------------------------
+
+def group11_movement_reformatted():
+    print("\n[11] 7.18 — movement is relayed at a fixed precision, not echoed")
+    d = tempfile.mkdtemp(prefix="ewb7-")
+    try:
+        open(os.path.join(d, "eden_world.model"), "w").close()
+        open(os.path.join(d, "eden_signs.txt"), "w").close()
+        srv = Server(d)
+        try:
+            obs = join("observer")
+            read_for(obs, 0.5)
+            m = join("mover")
+            read_for(m, 0.5)
+            read_for(obs, 0.2)
+
+            pad = "0" * 1000
+            m.sendall(("POSVEL:%s65500.5:33.92:%s65500:%s0:0:0\n" % (pad, pad, pad)).encode())
+            m.sendall(b"POS:65540.5:34.92:65500\n")
+            m.sendall(b"VEL:-0.001:1.239:0\n")
+            got = read_for(obs, 0.8)
+            lines = [l for l in got.split(b"\n") if l]
+            check(all(len(l) < 100 for l in lines),
+                  "no relayed line is longer than a number's worth (max %d B)" % max([len(l) for l in lines] or [0]))
+            check(b"POSVEL:mover:17:65500.50:33.92:65500.00:0.00:0.00:0.00" in got,
+                  "the padded POSVEL arrived as plain two-decimal numbers")
+            check(b"POS:mover:17:65540.50:34.92:65500.00" in got, "POS re-formatted")
+            check(b"VEL:mover:17:0.00:1.24:0.00" in got, "VEL re-formatted, and -0.001 is not '-0.00'")
+            check(srv.alive(), "the server survived")
+            m.close(); obs.close()
+        finally:
+            srv.stop()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def ctl_cmd(path, line, timeout=3.0):
+    """One command over the operator control socket; returns the reply text."""
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(timeout)
+    c.connect(path)
+    c.sendall((line + "\n").encode())
+    buf = b""
+    try:
+        while not buf.endswith(b"\n"):
+            chunk = c.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    except socket.timeout:
+        pass
+    c.close()
+    return buf.decode(errors="replace").strip()
+
+
+def group12_ctl_fill_at_cap():
+    print("\n[12] 7.26 — control-socket fill/setblock at the world cell cap")
+    d = tempfile.mkdtemp(prefix="ewb7-")
+    sock = os.path.join(tempfile.gettempdir(), "ewb7-%d.sock" % os.getpid())
+    try:
+        open(os.path.join(d, "eden_world.model"), "w").close()
+        open(os.path.join(d, "eden_signs.txt"), "w").close()
+        # Cap 2 (the operator fill cap is clamped to the world cap, so a 2-cell box is the biggest).
+        srv = Server(d, "--max-world-cells", "2", ctl=sock)
+        try:
+            for _ in range(100):
+                if os.path.exists(sock):
+                    break
+                time.sleep(0.05)
+            obs = join("observer")
+            read_for(obs, 0.5)
+
+            r = ctl_cmd(sock, "setblock:65536:40:65536:5")
+            check(r == "ok: set 1 block", "a block under the cap is set (%r)" % r)
+            got = read_for(obs, 0.5)
+            check(b"65536:40:65536" in got, "and is relayed to the observer")
+            r = ctl_cmd(sock, "setblock:65537:40:65536:5")
+            check(r == "ok: set 1 block", "the second fits exactly (%r)" % r)
+            read_for(obs, 0.5)
+
+            r = ctl_cmd(sock, "setblock:65538:40:65536:5")
+            check(r.startswith("error:") and "--max-world-cells" in r, "a new cell past the cap is an error (%r)" % r)
+            got = read_for(obs, 0.5)
+            check(b"65538:40:65536" not in got, "and is NOT relayed to players")
+
+            # One existing cell + one new one: half lands, half is refused.
+            r = ctl_cmd(sock, "fill:65536:40:65536:65536:40:65537:6")
+            check(r.startswith("ok: filled 1 cells") and "refused 1" in r,
+                  "a partial fill reports applied + refused (%r)" % r)
+            got = read_for(obs, 0.5)
+            check(b"65536:40:65536" in got and b"65536:40:65537" not in got,
+                  "only the cell that fit is relayed")
+
+            r = ctl_cmd(sock, "fill:65536:40:65536:65537:40:65536:7")
+            check(r == "ok: filled 2 cells", "rewriting existing cells at the cap is still fine (%r)" % r)
+            check(srv.alive(), "the server survived")
+            obs.close()
+        finally:
+            srv.stop()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        try: os.unlink(sock)
+        except OSError: pass
+
+
 def main():
     if not os.path.exists(SERVER):
         print("no %s — run ./build_server.sh first" % SERVER)
@@ -734,6 +916,9 @@ def main():
     group7_sigterm_saves()
     group8_movement_validation()
     group9_prejoin_gate()
+    group10_duplicate_names()
+    group11_movement_reformatted()
+    group12_ctl_fill_at_cap()
 
     print()
     if fails:

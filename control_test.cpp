@@ -151,6 +151,28 @@ static void test_fill_volume() {
           "whole-world box exceeds the cap (no overflow)");
 }
 
+// Stage 7.26: a fill at the world cap must say so instead of "ok: filled N".
+static void test_fill_reply_accounting() {
+    ewb::CtlFillResult ok; ok.applied = 4096;
+    CHECK(ewb::ctl_fill_reply(ok) == "ok: filled 4096 cells", "no refusals: the historical reply, unchanged");
+    CHECK(ewb::ctl_setblock_reply({1, 0}) == "ok: set 1 block", "setblock ok reply unchanged");
+
+    ewb::CtlFillResult part; part.applied = 10; part.refused = 6;
+    const std::string p = ewb::ctl_fill_reply(part);
+    CHECK(p.rfind("ok: filled 10 cells", 0) == 0, "partial fill still starts ok: with the applied count");
+    CHECK(p.find("refused 6") != std::string::npos, "partial fill names the refused count");
+    CHECK(p.find("--max-world-cells") != std::string::npos, "partial fill names the flag");
+
+    ewb::CtlFillResult none; none.refused = 3;
+    const std::string n = ewb::ctl_fill_reply(none);
+    CHECK(n.rfind("error:", 0) == 0, "everything refused is an error, not ok");
+    CHECK(n.find("nothing was changed") != std::string::npos, "and says nothing changed");
+
+    const std::string s = ewb::ctl_setblock_reply({0, 1});
+    CHECK(s.rfind("error:", 0) == 0 && s.find("--max-world-cells") != std::string::npos,
+          "a refused setblock is an error naming the flag");
+}
+
 // Stage 3.4: the Tier 1 fill cap is *derived* from the Tier 2 per-command cap,
 // so the two tiers can no longer drift apart. Pinned here because the shipped
 // pair of numbers (131072 / 262144) is quoted in docs/commands.md.
@@ -206,6 +228,7 @@ int main() {
     test_ops();
     test_fill_volume();
     test_fill_cap_derivation();
+    test_fill_reply_accounting();
     test_flood_guard();
     if (g_fail) { std::fprintf(stderr, "%d check(s) failed\n", g_fail); return 1; }
     std::puts("control_test: all checks passed");

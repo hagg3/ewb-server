@@ -33,9 +33,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstddef>
 #include <cstdlib>
+#include <cerrno>
 #include <iterator>
+#include <list>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -105,6 +108,49 @@ inline NameVerdict validate_username(const std::string& name) {
     for (unsigned char c : name) lower.push_back(static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c));
     if (lower == USERNAME_RESERVED) return NameVerdict::Reserved;
     return NameVerdict::Ok;
+}
+
+// --- duplicate names (stage 7.5) ---------------------------------------------
+
+/// The lowest free `<wanted>-2`, `<wanted>-3`, … given the names in use.
+///
+/// `wanted` is returned untouched when it is free. Otherwise the base is cut so the
+/// suffix always fits USERNAME_MAX (a 20-character name still gets a legal `-2`),
+/// and a trailing space left by the cut is dropped, because `validate_username`
+/// refuses one. Comparison is exact, matching the `g_playerPos` key the name will
+/// be saved under. `wanted` must already have passed `validate_username`; the result
+/// then does too.
+template <class NameSet>
+inline std::string next_free_username(const std::string& wanted, const NameSet& taken) {
+    if (taken.find(wanted) == taken.end()) return wanted;
+    for (unsigned n = 2;; ++n) {
+        const std::string suffix = "-" + std::to_string(n);
+        std::string base = wanted.substr(0, USERNAME_MAX - suffix.size());
+        while (!base.empty() && base.back() == ' ') base.pop_back();
+        std::string candidate = base + suffix;
+        if (taken.find(candidate) == taken.end()) return candidate;
+    }
+}
+
+enum class DupNameAction {
+    Evict,    // same address, old socket gone quiet: it is this player's own dead session
+    Suffix,   // anyone else: keep the other player, take the next free `name-N`
+};
+
+/// What a `JOIN` for a name that is already connected should do.
+///
+/// A rejoin over a dropped mobile link is the same player from the same address
+/// while the server's copy of the old socket is still waiting on TCP to give up. That
+/// is worth evicting, so they keep their name *and* their saved position.
+///
+/// ⚠️ Address alone is not enough. Carrier-grade NAT and shared routers put strangers
+/// behind one IP, and "same IP evicts" would let any of them boot a named player by
+/// joining under their name. The old socket must also have been silent for at least
+/// `staleSecs`. A live retail client cannot satisfy that: it sends `PING` every 10 s
+/// and `POS` whenever it moves. `staleSecs <= 0` turns eviction off entirely.
+inline DupNameAction dup_name_action(bool sameAddress, double oldSilentSecs, double staleSecs) {
+    if (sameAddress && staleSecs > 0.0 && oldSilentSecs >= staleSecs) return DupNameAction::Evict;
+    return DupNameAction::Suffix;
 }
 
 // --- pre-JOIN admission gate (stage 7.17) ------------------------------------
@@ -225,6 +271,25 @@ inline bool parse_move_vel(const std::string& sx, const std::string& sy, const s
                            float& x, float& y, float& z) {
     return parse_move_float(sx, x) && parse_move_float(sy, y) && parse_move_float(sz, z) &&
            move_vel_valid(x, y, z);
+}
+
+/// One movement number as it goes back out: two decimals, the precision `SPAWN` and
+/// `eden_players.txt` already use (stage 7.18).
+///
+/// The relay used to echo the client's own token. `parse_move_float` bounds its
+/// *value*, not its *length*, so `"0"` x 1300 + `"1"` is in range, parses, and was
+/// relayed at ~8 KB a line to every peer. Formatting from the parsed float makes
+/// the size a property of the number, not of what the sender chose to type.
+/// A magnitude under 0.005 would print as `-0.00`; that is `0.00`.
+inline std::string format_move_float(float v) {
+    char buf[32];   // |v| <= 16777215 (MOVE_XZ_MAX) or 4096: 11 chars at most, with room
+    std::snprintf(buf, sizeof(buf), "%.2f", static_cast<double>(v));
+    return std::string(buf) == "-0.00" ? std::string("0.00") : std::string(buf);
+}
+
+/// `x:y:z`, each through format_move_float.
+inline std::string format_move_triplet(float x, float y, float z) {
+    return format_move_float(x) + ":" + format_move_float(y) + ":" + format_move_float(z);
 }
 
 // --- world cell cap ----------------------------------------------------------
@@ -361,6 +426,46 @@ inline bool const_time_eq(const std::string& a, const std::string& b) {
     return diff == 0;
 }
 
+// --- where the world password comes from (stage 7.28) ----------------------
+//
+// `--password` puts the secret in argv, which /proc/<pid>/cmdline shows to every
+// local user (and to `ps`, a monitoring agent, a crash reporter). So the server
+// also takes it from a file (`--password-file`, the mode-0600 file an operator
+// already keeps) or from the `EDEN_PASSWORD` environment variable (which the
+// systemd units already load from their EnvironmentFile, and which
+// /proc/<pid>/environ shows to the owner and root only). `--password` stays for
+// interactive use.
+
+enum class PasswordSource { None, Argv, File, Env };
+
+struct PasswordChoice {
+    PasswordSource source = PasswordSource::None;
+    std::string value;
+};
+
+/// First line of a password file, without its line ending. A password may contain
+/// spaces (and anything else but a newline); only the trailing CR/LF is dropped,
+/// so `echo secret > f` and `printf secret > f` mean the same thing.
+inline std::string password_from_file_text(const std::string& raw) {
+    const size_t nl = raw.find('\n');
+    std::string line = nl == std::string::npos ? raw : raw.substr(0, nl);
+    while (!line.empty() && line.back() == '\r') line.pop_back();
+    return line;
+}
+
+/// Precedence: an explicit non-empty `--password`, then `--password-file`, then
+/// `EDEN_PASSWORD`. `--password ""` (which the shipped units used to pass for an
+/// open server) counts as "not given", so an old unit file keeps working against
+/// a new binary. `file_pw` is null when no file was requested; a requested file
+/// that is missing or empty is the caller's error, never an open server.
+inline PasswordChoice choose_password(const std::string& argv_pw, const std::string* file_pw,
+                                      const char* env_pw) {
+    if (!argv_pw.empty()) return {PasswordSource::Argv, argv_pw};
+    if (file_pw)          return {PasswordSource::File, *file_pw};
+    if (env_pw && *env_pw) return {PasswordSource::Env, env_pw};
+    return {};
+}
+
 // --- per-IP failed-auth limiter --------------------------------------------
 
 /// Per-IP wrong-password throttle (stage 1.10). Mirrors ConnectLimiter — pure,
@@ -469,5 +574,92 @@ class AuthFailureLimiter {
     size_t max_tracked_;
     std::unordered_map<std::string, Entry> entries_;
 };
+
+// --- bounded, recency-ordered table (stage 7.23) -------------------------------
+
+/// String-keyed table that never holds more than `capacity` entries: inserting a
+/// new key past the cap evicts the least-recently-*written* one, and writing an
+/// existing key refreshes it rather than duplicating it. Used for state keyed on a
+/// username, which is untrusted input — a client can `JOIN` under a fresh name every
+/// few seconds, so an unkeyed-growth `std::map` there is a slow memory and disk leak.
+///
+/// Recency is list order, not a timestamp, so unlike the limiters above it needs no
+/// injected clock; `for_each` walks oldest -> newest so a caller that persists in
+/// that order and reloads with `put` in file order gets its recency back across a
+/// restart. Not internally locked — the caller holds whatever mutex guards it.
+template <typename V>
+class LruTable {
+  public:
+    explicit LruTable(size_t capacity = 10000) : cap_(capacity ? capacity : 1) {}
+
+    /// Insert or refresh `key`. Returns how many entries were evicted to make room.
+    size_t put(const std::string& key, const V& value) {
+        auto it = index_.find(key);
+        if (it != index_.end()) {
+            it->second->second = value;
+            order_.splice(order_.end(), order_, it->second);   // refresh: now newest
+            return 0;
+        }
+        order_.emplace_back(key, value);
+        index_[key] = std::prev(order_.end());
+        return trim();
+    }
+
+    /// Lookup without refreshing — reading is not a reason to keep a row alive.
+    const V* find(const std::string& key) const {
+        auto it = index_.find(key);
+        return it == index_.end() ? nullptr : &it->second->second;
+    }
+
+    /// Change the cap, evicting oldest-first if it now exceeds it. Returns evictions.
+    size_t set_capacity(size_t capacity) {
+        cap_ = capacity ? capacity : 1;
+        return trim();
+    }
+
+    size_t size() const { return order_.size(); }
+    size_t capacity() const { return cap_; }
+
+    /// Visit every entry, oldest first: `fn(const std::string&, const V&)`.
+    template <typename F>
+    void for_each(F fn) const {
+        for (const auto& kv : order_) fn(kv.first, kv.second);
+    }
+
+  private:
+    size_t trim() {
+        size_t evicted = 0;
+        while (order_.size() > cap_) {
+            index_.erase(order_.front().first);
+            order_.pop_front();
+            ++evicted;
+        }
+        return evicted;
+    }
+
+    using Order = std::list<std::pair<std::string, V>>;
+    size_t cap_;
+    Order order_;
+    std::unordered_map<std::string, typename Order::iterator> index_;
+};
+
+// --- accept() failure policy (stages 7.10 / 7.25) --------------------------------
+
+enum class AcceptErrorAction {
+    Retry,        // routine (EINTR, a peer that reset before accept): loop again, silently
+    BackoffSleep, // resource exhaustion: sleep before retrying or the loop pins a core
+    LogRetry,     // anything else: retry, but rate-limit the log line
+};
+
+/// What an `accept()` loop should do about `err` (an `errno`). Shared by every accept
+/// loop — the client listener, the control socket and `edenmatch` — because a
+/// persistent `EMFILE` with no sleep is a tight 100 % CPU spin, and it was fixed on
+/// one loop at a time.
+inline AcceptErrorAction classify_accept_error(int err) {
+    if (err == EINTR || err == ECONNABORTED) return AcceptErrorAction::Retry;
+    if (err == EMFILE || err == ENFILE || err == ENOBUFS || err == ENOMEM)
+        return AcceptErrorAction::BackoffSleep;
+    return AcceptErrorAction::LogRetry;
+}
 
 }  // namespace ewb

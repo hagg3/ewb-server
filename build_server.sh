@@ -35,18 +35,33 @@ if [ -z "${CXX:-}" ]; then
 fi
 echo "Using compiler: $CXX"
 
+# Flags for the two binaries that face a public port, edenserver and edenmatch
+# (ROADMAP-SERVER 7.27). Warnings are always on: the build is expected to stay
+# clean, so a new -Wall/-Wextra hit is a real signal. The exploit-mitigation
+# baseline (fortified libc calls, stack protector, PIE, and on Linux full RELRO)
+# can be dropped for an unusual toolchain with EDEN_HARDEN=0 ./build_server.sh.
+SHIPPED_CXXFLAGS="-Wall -Wextra"
+SHIPPED_LDFLAGS=""
+if [ "${EDEN_HARDEN:-1}" != "0" ]; then
+    SHIPPED_CXXFLAGS="$SHIPPED_CXXFLAGS -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE"
+    # -z relro/now is GNU ld; Apple's linker rejects it and already defaults to PIE.
+    if [ "$(uname -s)" = "Linux" ]; then
+        SHIPPED_LDFLAGS="-pie -Wl,-z,relro,-z,now"
+    fi
+fi
+
 # -lz: raw DEFLATE for the SNAPZ region-streaming encoder (snapz_codec.h,
 # ROADMAP-SERVER stage 1.2). On Debian/Ubuntu: apt install build-essential zlib1g-dev.
 #
 # WARNING: the resulting ./edenserver is native to THIS machine's CPU. Do not
 # copy an arm64 build (Apple Silicon, ARM VPS) to an x86-64 VPS or vice versa —
 # it will not run. Build on the box you deploy to (see ops/INSTALL.md).
-"$CXX" -std=c++17 -O2 -pthread server_posix.cpp -lz -o edenserver
+"$CXX" -std=c++17 -O2 -pthread $SHIPPED_CXXFLAGS server_posix.cpp -lz $SHIPPED_LDFLAGS -o edenserver
 echo "Built ./edenserver  —  run with: ./edenserver [port]   (default 27015)"
 
 # The standalone matchmaker (ROADMAP-SERVER Phase 2). Same single-TU + pure-header
 # style as the server; no zlib. Point a server at it with --matchmaker.
-"$CXX" -std=c++17 -O2 -pthread edenmatch.cpp -o edenmatch
+"$CXX" -std=c++17 -O2 -pthread $SHIPPED_CXXFLAGS edenmatch.cpp $SHIPPED_LDFLAGS -o edenmatch
 echo "Built ./edenmatch  —  run with: ./edenmatch [--port 27020]"
 
 # Offline SNAPZ codec round-trip (no server needed).
@@ -129,6 +144,23 @@ echo "Built ./eden_import  —  run with: ./eden_import <world.eden> [--help]"
 "$CXX" -std=c++17 -O2 -Wall eden_import_test.cpp -lz -o eden_import_test
 ./eden_import_test
 echo "Built ./eden_import_test  —  base profile / emitter / budgets / golden model"
+
+# The server-world -> .eden writer (ROADMAP-SERVER stage 5.5), the inverse of
+# eden_import. Offline tool; run it against a stopped world directory. Links -lz
+# for the optional ZIP wrapper.
+"$CXX" -std=c++17 -O2 -Wall eden_export.cpp -lz -o eden_export
+echo "Built ./eden_export  —  run with: ./eden_export <world-dir> --out <file.eden> [--help]"
+
+# Offline export-core checks: the round-trip property (import(export(import(f)))
+# keeps the cell set; export(import(export(S))) is byte-identical), the two cell
+# sentinels, chunk selection, fill-then-overlay, the axis rename backwards for
+# blocks and signs, 64z vs 256z, the dropped-and-counted cases (height ceiling,
+# chunk-coordinate gate, inexpressible signs), sidecar vs inline signs, the ZIP
+# wrapper and the byte ceiling. The CLI half shells out to ./eden_export, built
+# just above (stage 5.5).
+"$CXX" -std=c++17 -O2 -Wall eden_export_test.cpp -lz -o eden_export_test
+./eden_export_test
+echo "Built ./eden_export_test  —  .eden writer / round-trip property / drops / signs"
 
 # Offline matchmaker checks: name sanitising, REGISTER parsing, SERVER: row /
 # LIST formatting, the TTL registry (ROADMAP-SERVER Phase 2). No zlib needed.

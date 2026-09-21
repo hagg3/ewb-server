@@ -89,8 +89,7 @@ A raw client works too — `printf 'who\n' | nc -U ./edenserver.sock`.
   `eden_motd.txt` (grammar in
   [configuration.md § `eden_motd.txt`](configuration.md#eden_motdtxt)) and run `motd reload`.
   The file is operator input only — the server never rewrites it — so editing it on a running
-  server is safe, unlike `eden_signs.txt`. [`ops/motd-edit.sh`](../ops/motd-edit.sh) does both
-  steps interactively over ssh for a remote host.
+  server is safe, unlike `eden_signs.txt`.
 - Every command that changes state is written to the audit channel — one `[Audit]` line with a
   UTC timestamp, on stdout and in `--audit-file`. See
   [configuration.md § The audit channel](configuration.md#the-audit-channel).
@@ -98,6 +97,10 @@ A raw client works too — `printf 'who\n' | nc -U ./edenserver.sock`.
   edited-cell ceiling. It is derived from the player tier's cap rather than set separately
   because both bound the same thing: one pass over the world holding the world lock. Moving
   `--we-max-cells` moves both. A `fill` past the cap is refused with its size and the flag name.
+  Separately, at `--max-world-cells` a `fill` / `setblock` only stores cells the world already
+  holds or has room for: cells the cap refuses are **not relayed to players** and are reported in
+  the reply (`ok: filled 10 cells, but refused 6 cell(s): …` when partly applied, `error: …` when
+  nothing landed; `setblock` is an `error:`) and in the audit line (`(refused N at the world cell cap)`).
 - **The socket is paced.** 64 commands at once refilling at 16/s per connection, 8 concurrent
   connections, disconnect after 8 refusals, 300 s idle timeout. Filesystem permissions decide who
   may connect; these decide how fast, so a runaway script cannot monopolise the world lock. All

@@ -44,8 +44,34 @@ worlds/<name>/
   eden_world.model   x:y:z:type:color, one cell per line   (docs/configuration.md)
   eden_signs.txt     x:y:z:a:b:c:text, one sign per line
   eden_spawn.txt     x:y:z — the server sends a spawnless joiner here
+  eden_origin.txt    the source header's seed, yaw, home, sky palette … — inert; see below
   .gitignore         keeps the above out of commits
 ```
+
+### `eden_origin.txt`
+
+The server has nowhere to keep a `.eden` header's seed, yaw, `home`, sky palette or version, so
+`eden_import` writes them into `eden_origin.txt` beside the world — one `key: value` per line,
+hand-editable, in the spirit of `eden_spawn.txt`:
+
+```
+name: Texture Test 3'0'5 by td0 VE
+seed: 0
+pos: 64638.9219:33.9249992:66262.5
+home: 64607.0625:46.9249992:66269.0469
+yaw: 125.999748
+version: 5
+height: 256z
+sky: 14 14 14 14 14 14 14 14 14 14 14 14 14 14 14 14
+base-profile: default
+```
+
+**The server never reads it.** It is inert state next to the world; its only reader is
+[`eden_export`](export.md#the-origin-sidecar), which replays it so a world that came *from* a
+`.eden` goes back as that same world rather than as defaults. Floats are written with enough
+digits to round-trip exactly (the `pos` above is what `eden_spawn.txt` holds as `33.92`).
+`base-profile` records `default`, `none`, or `custom` for a `--base-profile FILE` (the file itself
+is not copied). The grammar and every key are in [export.md](export.md#the-origin-sidecar).
 
 Everything is written with a temp file and a `rename()`, the same discipline the server's own
 saves use: a crash or a full disk mid-write cannot leave a truncated world.
@@ -262,6 +288,10 @@ eden_import <world.eden> [options]
 
 ## What is not converted
 
-Export (writing a `.eden` back out), live world switching, sky colours (the wire protocol has no
-world-metadata or sky message — the summary prints them for information only), creature/entity
-data, and any invented meaning for the sign `a`/`b`/`c` fields.
+Live world switching, sky colours (the wire protocol has no world-metadata or sky message — the
+summary prints them, and `eden_origin.txt` keeps them for `eden_export`, but the server does
+nothing with them), creature/entity data, and any invented meaning for the
+sign `a`/`b`/`c` fields.
+
+The other direction — writing a `.eden` back out from a world this server hosts — is
+[`eden_export`](export.md).

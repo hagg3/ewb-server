@@ -34,9 +34,14 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>     // snprintf, for the spawn line's fixed precision
 #include <cstdlib>
+#include <cstring>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -465,6 +470,228 @@ inline bool eden_spawn_in_range(const Spawn& s) {
     return s.x >= 0 && s.x <= float(SIGN_COORD_MAX) &&
            s.z >= 0 && s.z <= float(SIGN_COORD_MAX) &&
            s.y >= 0 && s.y <= float(SIGN_Y_MAX);
+}
+
+// ── origin: the header fields the server does not store ─────────────────────
+
+/// `eden_origin.txt` — what a world's source `.eden` header said that the server
+/// has nowhere to keep (stage 5.6). `eden_import` writes it beside the world;
+/// `eden_export` replays it, so a world that came *from* a `.eden` goes back as
+/// that same world rather than as defaults. The server never reads it: it is
+/// inert state next to the world, in the same hand-editable spirit as
+/// `eden_spawn.txt`.
+///
+/// Grammar: one `key: value` per line, `#` comments and blank lines skipped,
+/// keys case-sensitive, an unknown key ignored (so a newer tool's file still
+/// reads). Every key is optional — a hand-written file may carry one line.
+///
+///     name: Texture Test
+///     seed: 0
+///     pos: 65548.37:47.92:65607.27
+///     home: 65536.00:33.92:65536.00
+///     yaw: 1.5707964
+///     version: 4
+///     height: 64z
+///     sky: 14 14 14 14 14 14 14 14 14 14 14 14 14 14 14 14
+///     base-profile: default
+///
+/// Floats are written with `%.9g`, which round-trips an IEEE single exactly —
+/// the fidelity this file exists for. Deliberately *not* recorded: the header's
+/// content hash (it would be stale the moment the world is edited), the bytes
+/// nothing parses, and `dir_offset` (a property of the chunk payload).
+struct EdenOrigin {
+    std::optional<std::string> name;
+    std::optional<int32_t>     seed;
+    std::optional<Spawn>       pos;
+    std::optional<Spawn>       home;
+    std::optional<float>       yaw;
+    std::optional<int32_t>     version;
+    std::optional<int>         height;          ///< 64 or 256 — the source's z format
+    std::optional<std::array<uint8_t, 16>> sky;
+    std::optional<std::string> base_profile;    ///< `default`, `none` or `custom`
+
+    bool empty() const {
+        return !name && !seed && !pos && !home && !yaw && !version && !height && !sky &&
+               !base_profile;
+    }
+};
+
+inline constexpr const char* EDEN_ORIGIN_FILE = "eden_origin.txt";
+
+/// Snapshot a source header. `base_profile` is what the import diffed against
+/// (`default`, `none`, or `custom` for a `--base-profile FILE` — the file's
+/// contents are not copied, so export can only warn).
+inline EdenOrigin eden_origin_from(const EdenWorld& w, const std::string& base_profile) {
+    EdenOrigin o;
+    o.name = w.hdr.name;
+    o.seed = w.hdr.seed;
+    o.pos  = Spawn{w.hdr.pos[0], w.hdr.pos[1], w.hdr.pos[2]};
+    o.home = Spawn{w.hdr.home[0], w.hdr.home[1], w.hdr.home[2]};
+    o.yaw  = w.hdr.yaw;
+    o.version = w.hdr.version;
+    o.height  = w.z_ceiling + 1;
+    std::array<uint8_t, 16> sky;
+    std::memcpy(sky.data(), w.hdr.skycolors, 16);
+    o.sky = sky;
+    o.base_profile = base_profile;
+    return o;
+}
+
+namespace origin_detail {
+inline std::string fmt_f(float f) {
+    char b[48];
+    std::snprintf(b, sizeof b, "%.9g", double(f));
+    return b;
+}
+inline std::string fmt_xyz(const Spawn& s) {
+    return fmt_f(s.x) + ":" + fmt_f(s.y) + ":" + fmt_f(s.z);
+}
+inline bool finite3(const Spawn& s) {
+    return std::isfinite(s.x) && std::isfinite(s.y) && std::isfinite(s.z);
+}
+inline bool parse_int(const std::string& v, long long lo, long long hi, long long& out) {
+    if (v.empty()) return false;
+    char* e = nullptr;
+    errno = 0;
+    const long long x = std::strtoll(v.c_str(), &e, 10);
+    if (errno || e != v.c_str() + v.size() || x < lo || x > hi) return false;
+    out = x;
+    return true;
+}
+inline bool parse_float(const std::string& v, float& out) {
+    if (v.empty()) return false;
+    char* e = nullptr;
+    const float f = std::strtof(v.c_str(), &e);
+    if (e != v.c_str() + v.size() || !std::isfinite(f)) return false;
+    out = f;
+    return true;
+}
+inline bool parse_xyz(const std::string& v, Spawn& out) {
+    const size_t a = v.find(':');
+    const size_t b = a == std::string::npos ? a : v.find(':', a + 1);
+    if (b == std::string::npos || v.find(':', b + 1) != std::string::npos) return false;
+    return parse_float(v.substr(0, a), out.x) &&
+           parse_float(v.substr(a + 1, b - a - 1), out.y) &&
+           parse_float(v.substr(b + 1), out.z);
+}
+}  // namespace origin_detail
+
+/// The file body. Non-finite floats are left out (the reader would refuse them,
+/// and `strtof` would not give the bits back anyway); control characters in the
+/// name become spaces so one header can never smuggle in a second line.
+inline std::string eden_format_origin(const EdenOrigin& o) {
+    using namespace origin_detail;
+    std::string out =
+        "# Written by eden_import: the source .eden header's fields the server does not\n"
+        "# store. eden_export replays them; the server never reads this file. Hand-edit\n"
+        "# freely - every key is optional. See docs/export.md.\n";
+    if (o.name) {
+        std::string n = *o.name;
+        for (char& c : n)
+            if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f) c = ' ';
+        out += "name: " + n + "\n";
+    }
+    if (o.seed)    out += "seed: " + std::to_string(*o.seed) + "\n";
+    if (o.pos && finite3(*o.pos))   out += "pos: "  + fmt_xyz(*o.pos)  + "\n";
+    if (o.home && finite3(*o.home)) out += "home: " + fmt_xyz(*o.home) + "\n";
+    if (o.yaw && std::isfinite(*o.yaw)) out += "yaw: " + fmt_f(*o.yaw) + "\n";
+    if (o.version) out += "version: " + std::to_string(*o.version) + "\n";
+    if (o.height)  out += "height: " + std::to_string(*o.height) + "z\n";
+    if (o.sky) {
+        out += "sky:";
+        for (uint8_t b : *o.sky) out += " " + std::to_string(int(b));
+        out += "\n";
+    }
+    if (o.base_profile) out += "base-profile: " + *o.base_profile + "\n";
+    return out;
+}
+
+/// Parse an origin file. False with `err` naming the line on the first
+/// malformed one — the caller decides whether that is fatal (`eden_export`
+/// treats it as a refusal: a half-read header is worse than a loud stop).
+/// `unknown` receives the count of keys skipped for not being recognised.
+inline bool eden_parse_origin(const std::string& text, EdenOrigin& out, std::string& err,
+                              size_t* unknown = nullptr) {
+    using namespace origin_detail;
+    out = EdenOrigin{};
+    err.clear();
+    if (unknown) *unknown = 0;
+    size_t pos = 0;
+    int lineno = 0;
+    while (pos <= text.size()) {
+        const size_t nl = text.find('\n', pos);
+        std::string line = text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = (nl == std::string::npos) ? text.size() + 1 : nl + 1;
+        ++lineno;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t b = line.find_first_not_of(" \t");
+        if (b == std::string::npos || line[b] == '#') continue;
+
+        auto fail = [&](const std::string& why) {
+            err = "line " + std::to_string(lineno) + ": " + why;
+            return false;
+        };
+        const size_t colon = line.find(':', b);
+        if (colon == std::string::npos) return fail("expected `key: value`");
+        std::string key = line.substr(b, colon - b);
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+        std::string val = line.substr(colon + 1);
+        // One separating space is not part of the value; anything past that is,
+        // so a name keeps its own spacing. Everything but `name` is trimmed.
+        if (!val.empty() && val.front() == ' ') val.erase(0, 1);
+        std::string trimmed = val;
+        {
+            const size_t vb = trimmed.find_first_not_of(" \t");
+            trimmed = vb == std::string::npos ? "" : trimmed.substr(vb);
+            while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t'))
+                trimmed.pop_back();
+        }
+
+        long long n = 0;
+        if (key == "name") {
+            out.name = val.size() > 50 ? val.substr(0, 50) : val;
+        } else if (key == "seed") {
+            if (!parse_int(trimmed, INT32_MIN, INT32_MAX, n)) return fail("seed wants a 32-bit integer");
+            out.seed = int32_t(n);
+        } else if (key == "version") {
+            if (!parse_int(trimmed, INT32_MIN, INT32_MAX, n)) return fail("version wants a 32-bit integer");
+            out.version = int32_t(n);
+        } else if (key == "yaw") {
+            float f;
+            if (!parse_float(trimmed, f)) return fail("yaw wants a finite number");
+            out.yaw = f;
+        } else if (key == "pos" || key == "home") {
+            Spawn s;
+            if (!parse_xyz(trimmed, s)) return fail(key + " wants x:y:z (three finite numbers)");
+            (key == "pos" ? out.pos : out.home) = s;
+        } else if (key == "height") {
+            if (trimmed == "64z" || trimmed == "64") out.height = 64;
+            else if (trimmed == "256z" || trimmed == "256") out.height = 256;
+            else return fail("height wants 64z or 256z");
+        } else if (key == "sky") {
+            std::array<uint8_t, 16> sky{};
+            size_t at = 0, count = 0;
+            while (at < trimmed.size()) {
+                const size_t s0 = trimmed.find_first_not_of(" \t", at);
+                if (s0 == std::string::npos) break;
+                size_t s1 = trimmed.find_first_of(" \t", s0);
+                if (s1 == std::string::npos) s1 = trimmed.size();
+                if (count >= 16 || !parse_int(trimmed.substr(s0, s1 - s0), 0, 255, n))
+                    return fail("sky wants 16 integers, each 0..255");
+                sky[count++] = uint8_t(n);
+                at = s1;
+            }
+            if (count != 16) return fail("sky wants 16 integers, each 0..255");
+            out.sky = sky;
+        } else if (key == "base-profile") {
+            if (trimmed != "default" && trimmed != "none" && trimmed != "custom")
+                return fail("base-profile wants default, none or custom");
+            out.base_profile = trimmed;
+        } else if (unknown) {
+            ++*unknown;
+        }
+    }
+    return true;
 }
 
 /// The `.gitignore` every output directory gets. `worlds/` is tracked in this

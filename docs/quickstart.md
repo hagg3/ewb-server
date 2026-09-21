@@ -32,6 +32,12 @@ build is not usable.
 
 The script uses `$CXX` if set, otherwise prefers `clang++` and falls back to `g++`.
 
+`edenserver` and `edenmatch` — the two binaries that face a network — are built with `-Wall -Wextra`
+(the build is expected to stay warning-free) and a hardening baseline: `-D_FORTIFY_SOURCE=2`,
+`-fstack-protector-strong`, `-fPIE`, and on Linux `-pie -Wl,-z,relro,-z,now`. If a toolchain
+rejects those, `EDEN_HARDEN=0 ./build_server.sh` drops them (see
+[configuration.md § Build](configuration.md#build)).
+
 `./build_server.sh --with-admin` additionally builds `admin/edenadmin`, an optional local
 operator GUI (needs a Go toolchain). It is not required to run a server — see `admin/README.md`.
 
@@ -96,7 +102,9 @@ Useful variations:
 
 ```bash
 edenserver --port 27016                  # a different port
-edenserver --password hunter2            # require a password at JOIN
+edenserver --password hunter2            # require a password at JOIN (visible in `ps`; fine locally)
+EDEN_PASSWORD=hunter2 edenserver         # same, but not on the command line
+edenserver --password-file ./pw          # or from a 0600 file
 edenserver --verbose                     # log every edit and every rejection
 ```
 
@@ -149,7 +157,7 @@ Your position is remembered by username, so rejoining puts you back where you le
 | Client connects, world is empty flat terrain | Expected if the world has no edits — only edits are stored and sent. |
 | Client connects but the world never appears | The client did not get a `REGION` answered. Run with `--verbose` and check for a `REGION` line; if none arrives, the client never sent one. |
 | `[Server] Invalid name (…)` | The username breaks a rule — see [protocol.md § Usernames](protocol.md#usernames). |
-| `[Server] Name already in use.` | That username is already connected. Names are unique per server. |
+| `[Server] The name X is already in use; you are X-2.` | That username is already connected, so you were given the next free `X-N`. If it was your own dropped session from the same address, it is evicted after `--stale-session-secs` of silence and you keep `X`. See [protocol.md § Duplicate names](protocol.md#duplicate-names). |
 | `[Server] Server full.` | 64 clients already connected. |
 | `[Server] Rejected <ip> (connect rate limit).` | More than 10 connections from one address in 10 s. Raise or disable with `--connect-limit`. |
 | `[Server] Rejected <ip> (auth lockout).` | That address sent too many wrong passwords and is in an escalating cooldown. Tune or disable with `--auth-fail-limit`. |

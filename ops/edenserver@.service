@@ -37,12 +37,20 @@
 #   the required keys to empty and the server exits with a flag error in the
 #   journal. Create the file.
 #
-#   ExecStart below uses BRACED ${VAR} for the five always-set keys (one argument
+#   ExecStart below uses BRACED ${VAR} for the four always-set keys (one argument
 #   each, spaces preserved) and BARE $EDEN_EXTRA_ARGS once, for a whitespace-split
 #   tail of optional spaceless flags. An unset braced ${VAR} still passes an
 #   empty argument, so anything optional-and-possibly-spaced must live in
 #   EDEN_EXTRA_ARGS, never as its own ${VAR}. The conf file header explains this
 #   at length; do not "tidy" ExecStart by turning EDEN_EXTRA_ARGS into ${...}.
+#
+#   EDEN_PASSWORD is deliberately NOT on the command line (stage 7.28): argv is
+#   world-readable in /proc/<pid>/cmdline and `ps`. The EnvironmentFile puts it
+#   in the server's environment, which edenserver reads itself (visible to that
+#   user and root only). ⚠️ That needs an edenserver built from 7.28 or later —
+#   an older binary ignores the variable and would start an OPEN server. Upgrade
+#   the binary BEFORE installing this unit file, and confirm the journal says
+#   "Password: from EDEN_PASSWORD." after the restart.
 #
 # ---------------------------------------------------------------------------
 # Restart policy — why NOT Restart=always
@@ -82,7 +90,7 @@ EnvironmentFile=-/etc/eden/instances/%i.conf
 # Braced ${VAR} for the always-set keys; bare $EDEN_EXTRA_ARGS for the optional
 # spaceless tail. Edit /etc/eden/instances/%i.conf, not this line. See the conf
 # header and the note block above for why the split matters.
-ExecStart=/usr/local/bin/edenserver --port ${EDEN_PORT} --name ${EDEN_NAME} --world ${EDEN_WORLD_DIR}/eden_world.model --signs ${EDEN_WORLD_DIR}/eden_signs.txt --spawn-file ${EDEN_WORLD_DIR}/eden_spawn.txt --motd-file ${EDEN_WORLD_DIR}/eden_motd.txt --ban-file ${EDEN_WORLD_DIR}/eden_bans.txt --ops-file ${EDEN_WORLD_DIR}/eden_ops.txt --control-socket ${EDEN_WORLD_DIR}/edenserver.sock --max-world-cells ${EDEN_MAX_WORLD_CELLS} --password ${EDEN_PASSWORD} $EDEN_EXTRA_ARGS
+ExecStart=/usr/local/bin/edenserver --port ${EDEN_PORT} --name ${EDEN_NAME} --world ${EDEN_WORLD_DIR}/eden_world.model --signs ${EDEN_WORLD_DIR}/eden_signs.txt --spawn-file ${EDEN_WORLD_DIR}/eden_spawn.txt --motd-file ${EDEN_WORLD_DIR}/eden_motd.txt --ban-file ${EDEN_WORLD_DIR}/eden_bans.txt --ops-file ${EDEN_WORLD_DIR}/eden_ops.txt --control-socket ${EDEN_WORLD_DIR}/edenserver.sock --max-world-cells ${EDEN_MAX_WORLD_CELLS} $EDEN_EXTRA_ARGS
 
 Restart=on-failure
 RestartSec=2s

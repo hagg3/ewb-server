@@ -14,6 +14,7 @@
 //         registry persistence: --registry-file PATH  (default eden_registry.txt; empty disables)
 //
 // Point a server at it with:  ./edenserver --matchmaker <edenmatch-host>[:27020]
+#include "hardening.h"
 #include "matchmaker.h"
 
 #include <arpa/inet.h>
@@ -21,6 +22,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -40,6 +42,19 @@ static std::atomic<bool>     g_running{true};
 static std::atomic<uint64_t> g_nextConn{1};
 static Registry               g_registry;
 static ConnCaps               g_connCaps;    // stage 2.2: global + per-IP concurrent cap
+
+// Connection deadlines (stage 7.21). Without them a peer that connects and sends
+// nothing holds a thread and a ConnCaps slot forever, so ~11 source addresses
+// exhaust MAX_CONNS_GLOBAL and every Server Browser LIST is refused.
+//   PRE_VERB: how long a fresh connection has to send its first line — every legitimate
+//     peer (a browsing client, a HOST request, a REGISTERing server) sends it at once.
+//     Mirrors edenserver's --handshake-timeout.
+//   REGISTERED: a registered server is the one peer that legitimately goes quiet, so it
+//     gets the heartbeat TTL plus a little slack; past that the row is dead anyway.
+// The send side gets the PRE_VERB figure too: a LIST reply can exceed the socket buffer,
+// and a peer that never reads it would otherwise pin the slot from the other direction.
+static const int PRE_VERB_TIMEOUT_SEC   = 15;
+static const int REGISTERED_TIMEOUT_SEC = HEARTBEAT_TTL_SEC + 15;
 
 static int         g_port         = DEFAULT_PORT;
 static std::string g_advertiseIP;                 // global override for the per-peer fallback
@@ -63,6 +78,17 @@ static void logline(const std::string& s) {
 }
 static void vlog(const std::string& s) {
     if (g_verbose) logline(s);
+}
+
+// SO_RCVTIMEO makes recv() fail with EAGAIN after `secs` of silence, which readLine
+// reports as a closed connection — the caller's normal cleanup path handles it.
+static void setRecvTimeout(int fd, int secs) {
+    struct timeval tv{ secs, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+static void setSendTimeout(int fd, int secs) {
+    struct timeval tv{ secs, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
 // Send an entire buffer, looping over partial writes.
@@ -279,7 +305,13 @@ static void handleConn(int fd, sockaddr_in peer) {
     ConnCapGuard capGuard(ip);   // released on every return path below (stage 2.2)
     std::string carry, line;
 
-    if (!readLine(fd, carry, line)) { close(fd); return; }
+    setRecvTimeout(fd, PRE_VERB_TIMEOUT_SEC);
+    setSendTimeout(fd, PRE_VERB_TIMEOUT_SEC);
+    if (!readLine(fd, carry, line)) {
+        vlog("no first line from " + ip + " within " + std::to_string(PRE_VERB_TIMEOUT_SEC) + "s; dropping");
+        close(fd);
+        return;
+    }
 
     // ---- game client: one-shot browse / host ----
     if (line == "LIST" || line == "LISTP") {
@@ -313,6 +345,7 @@ static void handleConn(int fd, sockaddr_in peer) {
             return;
         }
         sendAll(fd, "REGISTERED\n");
+        setRecvTimeout(fd, REGISTERED_TIMEOUT_SEC);   // registered: allowed to go quiet between heartbeats
         logline("REGISTER '" + reg.name + "' " + reg.ip + ":" + std::to_string(reg.port) +
                 (reg.hasPassword ? " [locked]" : "") + " (conn " + std::to_string(id) + ")");
         if (displaced) vlog("  replaced stale conn " + std::to_string(displaced));
@@ -453,11 +486,28 @@ int main(int argc, char** argv) {
             (g_allowHost ? "  [HOST enabled]" : ""));
     std::thread(sweeper).detach();
 
+    int64_t lastAcceptFailLog = -1;
     while (g_running) {
         sockaddr_in peer{};
         socklen_t plen = sizeof(peer);
         int fd = accept(srv, reinterpret_cast<sockaddr*>(&peer), &plen);
-        if (fd < 0) continue;
+        if (fd < 0) {
+            // Same policy as edenserver's accept loops (stages 7.10 / 7.25): routine
+            // errors retry silently, fd/memory exhaustion sleeps so this doesn't spin a
+            // core at the moment the process can least afford it, the rest log <= 1/s.
+            const int err = errno;
+            const auto act = ewb::classify_accept_error(err);
+            if (g_running && act != ewb::AcceptErrorAction::Retry) {
+                const int64_t now = monoSeconds();
+                if (now - lastAcceptFailLog >= 1) {
+                    logline(std::string("accept failed: ") + strerror(err));
+                    lastAcceptFailLog = now;
+                }
+                if (act == ewb::AcceptErrorAction::BackoffSleep)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            continue;
+        }
         // Every accepted fd, not just the listener, must not survive a HOST
         // spawn's fork+exec: without this a hosted edenserver also inherits
         // every other live client's socket (stage 2.2).

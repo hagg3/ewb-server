@@ -113,7 +113,7 @@ Unicast to one client:
 | `[Server] This world has reached its sign limit, so that sign was not saved.` | A `SIGNP` refused at the sign cap. |
 | `[Server] Invalid name (<reason>).` | `JOIN` refused; connection closed. |
 | `[Server] Wrong password.` | `JOIN` refused; connection closed. |
-| `[Server] Name already in use.` ⚠️ unconfirmed wording | `JOIN` refused; connection closed. |
+| `[Server] The name <name> is already in use; you are <name>-N.` ⚠️ our wording | Sent right after the welcome line when a duplicate `JOIN` was renamed. See [Duplicate names](#duplicate-names). |
 | `[Server] Server full.` | Refused at accept; connection closed. |
 
 ⚠️ The **peer-relay `ACTION`** shape (`ACTION:<user>:<type>:x:y:z:mode[:extra]`) has not been
@@ -173,8 +173,12 @@ Consequences worth knowing as a client author:
 - The default spawn (`eden_spawn.txt` or `--spawn`) takes the same bound; out of range, it
   warns and is ignored rather than being sent.
 
-Fields are otherwise relayed as the client wrote them — the server does not currently re-format
-them to a fixed precision.
+What is relayed is **re-formatted from the parsed numbers, not echoed**: every field goes back
+out with two decimals (`65500.50`, `-0.50`, `0.00` — the precision `SPAWN` and `eden_players.txt`
+use). The size of a relayed line is therefore a property of the number, never of what the sender
+typed: a field padded with a thousand zeros used to be relayed at that length to every peer. The
+cost is precision beyond 0.005 units in a relayed position or velocity. ⚠️ Not checked against a
+live retail client's sub-0.01 motion; if remote avatars look jerky, velocity is the field to widen.
 
 ## `ACTION` — terrain edits
 
@@ -383,14 +387,38 @@ Enforced at `JOIN`; a name that fails is refused with a reason and the connectio
 - No `:` (the field delimiter), no `[` or `]` (they would forge the `[name (Tn)]` chat
   structure), no leading or trailing space.
 - `server` is reserved, case-insensitively — it is the sender token clients trust.
-- A name already connected is refused. Saved positions are keyed by username, so two players
-  sharing one would share and clobber a single slot.
+- A name already connected is never refused; see [Duplicate names](#duplicate-names) below.
+  Saved positions are keyed by username, so two players sharing one would share and clobber a
+  single slot — which is why the newcomer is renamed rather than admitted under the same name.
 
 `characterType` is accepted in `0..255` and echoed back in the welcome line. ⚠️ Its exact
 meaning is unsettled: a retail client was observed sending 17 where the retail server's welcome
 line said 0, which is consistent either with clamping or with the field not being a plain
 character index at all. Accepting the wider range is strictly safer than silently rewriting a
 legitimate value.
+
+### Duplicate names
+
+Names are unique per server. A `JOIN` for one already connected is resolved one of two ways:
+
+- **A stale session of the same player** — the old socket is from the **same IP address** *and*
+  has sent nothing for at least `--stale-session-secs` (default 15). A dropped mobile link leaves
+  exactly this behind: the server's copy of the socket waits on TCP to give up while the player
+  is already back. The old session is closed, without a `has left` line, and the rejoin keeps
+  the name **and its saved position**. A live retail client can't look stale: it sends `PING`
+  every 10 s and `POS` whenever it moves.
+- **Anyone else** — a different address, or the same address with a live old socket: the newcomer
+  is admitted as the lowest free `name-2`, `name-3`, … (the base is cut so the suffix still fits
+  20 bytes). The welcome line carries the assigned name, and one ordinary `[Server]` chat line
+  follows it saying the requested name was taken. The renamed player has no saved position of
+  their own until they have moved, so they spawn at the world spawn.
+
+Why the silence condition and not the address alone: carrier-grade NAT and shared routers put
+strangers behind one IP, and address-only eviction would let any of them kick a named player by
+joining under their name. `--stale-session-secs 0` turns eviction off (always suffix).
+
+⚠️ Unverified against the retail client: whether it displays the server-assigned name or keeps
+the one it sent. Either way the server treats the player as the assigned name.
 
 ## Chat
 
