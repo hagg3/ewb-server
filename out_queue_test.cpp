@@ -197,6 +197,20 @@ static void test_lo_overflow_refuses() {
     CHECK(!q2.push_reply(std::string(60, 'b')), "a reply that would exceed the budget is refused");
     CHECK(!q2.over_budget(), "a refused reply does not disconnect anyone");
     CHECK(q2.lo_bytes() == 60, "the refused reply was not queued");
+
+    // Stage 7.30: the shared overload (the SIGNQ burst) has the same admission rule,
+    // shares rather than copies, and drains as a shared item with its bytes accounted.
+    OutQueue q4(OutQueue::Limits{1024, 100, 2});
+    const auto blob = std::make_shared<const std::string>(60, 's');
+    CHECK(q4.push_reply(blob), "shared reply fits");
+    CHECK(blob.use_count() == 2, "the queue holds a reference, not a copy");
+    CHECK(q4.lo_bytes() == 60, "shared reply bytes are accounted");
+    CHECK(!q4.push_reply(blob), "a shared reply that would exceed the budget is refused");
+    CHECK(!q4.over_budget(), "a refused shared reply does not disconnect anyone");
+    CHECK(q4.push_reply(std::shared_ptr<const std::string>()), "a null shared reply is a no-op success");
+    OutItem sh;
+    CHECK(q4.take(sh) && sh.kind == OutItem::Kind::SharedBytes && sh.shared_bytes == blob,
+          "the shared reply drains as the same blob");
 }
 
 static void test_region_admission() {

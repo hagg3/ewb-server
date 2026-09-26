@@ -22,9 +22,9 @@
 // ⚠️ R = 224 is **derived, not measured** — it comes from fitting the Pass-2
 // capture's observed span (`REGION:65539:65540` → x 65312–65691, z 65312–65775)
 // against that formula: x0, z0 and z1 land exactly on the prediction, and the
-// fourth edge is content-bounded. It is the same number VuencLink hardcodes as
-// `net::region::REGION_RADIUS`, whose `REGION_STRIDE = 2*R` lattice is built to
-// tile this box without gaps — so our server and our client agree by construction.
+// fourth edge is content-bounded. It is the same number a reference test client
+// hardcodes as `net::region::REGION_RADIUS`, whose `REGION_STRIDE = 2*R` lattice
+// is built to tile this box without gaps — so server and client agree by construction.
 // `region_box()` takes the radius as a defaulted argument precisely so hosting our
 // own server can vary it experimentally (`--region-radius`), which is the only
 // place that number can be measured without burning someone else's CPU.
@@ -151,8 +151,8 @@ inline void emit_cell_records(int x, int y, int z, unsigned char type, unsigned 
 /// it compresses 3.7% better than the flat `(z,x,y,flag)` order this replaced,
 /// on top of being 44x better chunk locality.
 ///
-/// Record order is **not semantically significant for merging**: VuencLink's
-/// `ingest_snapz` merges a cell's `flag 0` / `flag 3` records in either order,
+/// Record order is **not semantically significant for merging**: a reference
+/// test client's `ingest_snapz` merges a cell's `flag 0` / `flag 3` records in either order,
 /// and the capture shows both orders occurring for a single cell. But chunk
 /// grouping *is* significant for whatever the client's mesh builder does with
 /// each incoming block — a community report attributes client-side lag to

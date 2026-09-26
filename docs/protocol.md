@@ -130,13 +130,14 @@ rather than unsolicited pushes:
 ```
 1.  [Server] Welcome, <name>! (Character Type: N)
 2.  [Server] <motd line>  0..8 lines, only if the world has an eden_motd.txt
+    [Server] The name <name> is protected. ...   only if the name has a login PIN
 3.  CAPS:region
 4.  SPAWN:x:y:z          this name's saved position, else the world default spawn
 5.  SIGNP:server:...      burst — answers the client's SIGNQ
 6.  SNAPZ:<n>:<b64>       burst — answers the client's REGION
 ```
 
-Step 2 adds no new message: the MOTD lines are the same `[Server] <text>` chat shape the
+Step 2 adds no new message: the MOTD lines (and the PIN notice) are the same `[Server] <text>` chat shape the
 server already sends, so a client written against the pre-MOTD sequence sees ordinary chat and
 nothing changes for a world that has no MOTD.
 
@@ -207,13 +208,29 @@ charged much more heavily against the per-connection edit budget (see
 [configuration.md](configuration.md)).
 
 A chain reaction is bounded two ways: a recursion-depth guard (an explosion caused by an
-explosion caused by... six levels deep, the same as before), and a hard cap on the *total*
-number of explosions processed for one `ACTION:...:2` (`EXPLODE_MAX_CHAIN`, `explode.h`), added
-because depth alone does not bound fan-out — a dense enough TNT/firework field chains every
-block in the blast into its own explosion, and each one is a ~13³ sphere scan under the world
-lock. Explosions dropped once the cap is hit count toward the same `refused` total as a
-world-cell-cap refusal, so the player gets the existing "part of that explosion was not saved"
-notice rather than the chain silently stopping.
+explosion caused by... six levels deep, the same as before), and a **work budget** for the
+whole chain — `--burn-max-cells`, the number of cells one `ACTION:...:2` may read before the
+chain is cut short (`explode.h`). Depth alone does not bound fan-out: a dense enough
+TNT/firework field chains every block in the blast into its own explosion, each one a ~1 000-cell
+sphere scan, and all of it runs under the world lock that every other player's edit needs. The
+budget is what bounds how long that is. It is spent one whole blast at a time, so a chain is
+never cut off half-way through a sphere.
+
+The server's copy of a blast is clipped to the world (`y` 0–255, `x`/`z` 0–16777215): the part of
+a sphere that pokes out past the top or an edge is neither read nor written. Nothing is lost —
+no client can see or reach a cell there — and it is not a cap refusal.
+
+When the budget runs out the server simply stops detonating — but every client simulated the
+whole chain itself, so the TNT the server did not reach is still in the saved world and is there
+again on the next join. The player is told (`[Server] That explosion chain was too big to
+finish; some of the TNT is still there on the server.`, at most once every 30 s) and the
+operator gets a log line naming the flag. If it happens in ordinary play, raise
+`--burn-max-cells`; see [configuration.md](configuration.md).
+
+The blasts a chain actually ran are charged back against the sender's `ACTION` budget (1 token
+each, over the flat 64 a burn pays upfront), so a player who keeps setting off large chains
+pays for them in edits they cannot make for the next second or two. It is a pause, not a
+lockout: the debt is capped at one burst.
 
 ### At the world cell cap
 
@@ -225,14 +242,67 @@ in open air, a natural block mined or painted — is refused:
   something no `REGION` will ever send back.
 - The player who placed a refused block is sent `ACTION:server:0:x:y:z:1` to take it back out
   of their world (the cell was untouched terrain as far as the server knows, and a client only
-  builds into air). ⚠️ This is the relay shape the player commands use; the retail client
-  applying it is unconfirmed.
+  builds into air). This is the relay shape the player commands use; the retail client applies
+  it mid-session, without the player moving away (confirmed with a control-socket `setblock`).
 - The player is told `[Server] This world is full, so that edit was not saved. Please tell the
   server operator.`, at most once every 30 s.
 - A burn is relayed regardless, since every client simulates the blast itself; if part of the
   blast was refused, the player is told that instead.
 
 Sizing the cap so this never happens is covered in [configuration.md](configuration.md).
+
+### Protected zones
+
+An operator can mark boxes of the world as protected (`eden_zones.txt`, see
+[configuration.md](configuration.md#eden_zonestxt)). No player edit lands inside one: not a
+build, mine, paint or burn, not a sign, not a player command. The client knows nothing about
+zones and has usually drawn the edit before it tells the server, so a refusal is two things —
+the model is left alone, and the player's screen is put back.
+
+- A refused `ACTION` is **not simulated and not relayed**. No peer ever sees it.
+- The sender gets a **restore**: `ACTION:server:0:…` lines that redraw the cell as the server
+  holds it — a mine, then a build of the block (for air, just the mine), then a paint if it is
+  painted. A cell the server has never stored is redrawn as the natural terrain at that height
+  (bedrock, stone, dirt, grass at `y` 32, sky above). A painted natural block is rebuilt and
+  repainted, not just repainted: the refused edit may have removed it from the screen. If the
+  restored block carries signs, their `SIGNP:server:…` lines follow, because a client hides a
+  sign while its block is air.
+- The restore is built from the world as it is **when it is sent**, and it is sent
+  `--zone-revert-delay-ms` after the refusal (default 1000; `0` sends it at once). ⚠️ The
+  default is a placeholder: whether the retail client needs the restore to trail its own
+  handling of the edit has not been measured. That the retail client applies a mid-session
+  `ACTION:server:0` restore at all is confirmed.
+- Restores are **coalesced per player per cell**: a cell already waiting to be restored for
+  that player is not queued again, so mining one protected block a hundred times inside the
+  delay produces one restore.
+- A refused edit **still spends its `ACTION` budget** (a burn still costs 64), so hammering a
+  protected wall is paced like any other editing and cannot be used to make the server send
+  restores faster than it accepts edits.
+- The player is told `[Server] This area is protected ('<zone>').`, at most once every 10 s.
+- **Burns.** A burn *on* a protected cell is refused like any other edit; if the cell holds TNT
+  or a firework, the sender's client has already set it off, so its blast sphere is restored to
+  the sender too. A burn *outside* a zone whose blast reaches into one is relayed as normal and
+  the unprotected part of the blast applies. The protected cells it reached are left alone, and
+  a protected TNT or firework is **not chained** — it does not go off on the server, so it
+  cannot carry the blast further. Every client, though, runs the whole blast itself, zones
+  unknown, so **every connected client** gets a restore of the protected cells, queued behind
+  the relay that makes it run the blast; the sphere of each protected TNT the clients will
+  have set off is included. The restore for one burn is capped at 16,384 cells; past that the
+  rest is intact on the server but not redrawn, and the player is told it may look damaged until
+  they rejoin. ⚠️ Two limits, both unverified against the retail client: a client may chain from
+  a protected TNT into further TNT the server never reached, and the restore does not follow that
+  second chain; and whether a restore can land before the client's own blast has finished is not
+  measured.
+- **Player commands** (`//set`, `//paste`, `//undo`, …) are decided by the server before anything
+  is drawn, so there is nothing to restore: protected cells are skipped, the rest of the
+  command applies, and the reply says `N cell(s) skipped: protected area '<zone>'.`.
+- **The control socket is not subject to zones** — `setblock`, `fill` and `signs` are the
+  operator's own tools, and work inside a zone as anywhere else.
+- **Who bypasses a zone.** Only a session that has logged in with its name's PIN (`/login`,
+  see [commands.md § Player identity](commands.md#player-identity-pins-and-login)), at or above the
+  zone's `level`. An op level on its own is a claimed name, so it never bypasses anything. A
+  bypassing edit is an ordinary edit: stored and relayed like one, with no restore. To build
+  inside a zone otherwise, turn it `off` or edit through the control socket.
 
 ## `REGION` → `SNAPZ`
 
@@ -359,11 +429,16 @@ without the sender field; a line carrying `server` there fails to parse and is i
   its next join.
 - It is refused before `JOIN`, paced per connection, and refused with a chat line to the
   player once the world holds 20,000 signs. Values are in [configuration.md](configuration.md).
+- A sign on a block inside a [protected zone](#protected-zones) is **not stored and not
+  relayed**. If that slot already held a sign, the original is sent back to the writer as
+  `SIGNP:server:…` so their edit is overwritten on their screen. A brand-new sign has nothing to
+  send back, and no line is known that un-draws one: its writer sees it until they next join,
+  and nobody else ever does.
 - **The client sends nothing when a sign is removed.** In game a sign goes only when the block
   it is attached to does, and the server sees just that block's `ACTION`. So the server removes
   **every** sign on a block, whatever its `a`, whenever any edit stores air there: a mine, a burn
   or explosion, the control socket's `setblock`/`fill`, a player command, `//undo` or `//redo`.
-  An edit refused at the world cell cap leaves the block, and its signs.
+  An edit refused at the world cell cap or by a protected zone leaves the block, and its signs.
 - No message is sent for that removal. Peers already get the block's own relay, and a client
   does not show a sign whose block is air (⚠️ inferred from a player's report, not captured).
   The next `SIGNQ` answer leaves the sign out, and `eden_signs.txt` loses it on the next save.
@@ -452,6 +527,11 @@ before a successful `JOIN` are ignored in silence. The full vocabulary, its perm
 and its bounds are in [commands.md § Part 2](commands.md#part-2--player-commands); nothing about
 it changes the wire, which is why it is documented there rather than here.
 
+**`MSG:/login <pin>` is the one line that is never logged.** The server takes it before any other
+command handling, and it does not appear in the server's output, the audit channel or
+`--verbose` — only the outcome does. The line still crosses the wire in plaintext like all
+chat, so a PIN is as secret as the world password.
+
 ## Direct connection
 
 Retail clients have **no "connect to IP" field**; the shipped flow is the in-game Server
@@ -478,9 +558,21 @@ against a client that never sends `REGION`.
 
 ⚠️ Within it, a server-pushed edit to an occupied cell must mine before it builds — a bare
 build does not overwrite an occupied cell, so the mine→build→paint ordering is load-bearing.
-The operator control socket's `setblock` / `fill` relay their edits the same way
-(`ACTION:server:0:…`, mine→build→paint), so connected clients apply an admin edit without
-re-requesting the region.
+The operator control socket's `setblock` / `fill` and every player build command relay their
+edits the same way, so connected clients apply the edit without re-requesting the region. One
+relay rule, per stored cell:
+
+| Cell becomes | Relayed as |
+|---|---|
+| air | `…:x:y:z:1` (mine) |
+| a block, unpainted | mine, then `…:x:y:z:0:<type>` (build) |
+| a block, painted | mine, build, then `…:x:y:z:3:<color>` (paint) |
+| a natural block, painted (stored `255`) | `…:x:y:z:3:<color>` **alone** — the natural block is already on every screen, and mining it first would delete the block being recoloured |
+| a natural block, paint stripped | mine, then build the natural block at that height (unpainted) |
+
+Before stage 3.7 the painted-natural-block row took the generic path and relayed
+mine → `build 255` → paint, so a `//paint` over the ground deleted it on every connected
+client and asked them to build a block id that does not exist.
 
 ## Operator commands are out of band
 

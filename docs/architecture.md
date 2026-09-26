@@ -31,8 +31,25 @@ control.h            Operator control-socket line grammar + command table, the
                      eden_bans.txt / eden_ops.txt formats, fill volume + the cap it
                      derives from the player tier, the connection flood guard.
 worldedit.h          Player command table with a permission level per row, chat-line
-                     grammar, ~-relative coordinates, the selection cap, shape
+                     grammar, ~-relative coordinates and explicit //pos corners, the
+                     selection cap, how an untouched cell reads (its natural block) and
+                     which edits change nothing, the ACTION:server relay shape, shape
                      predicates, the byte-bounded undo store, clipboard rotation.
+base_profile.h       The base terrain profile: what a client draws in a cell the server
+                     has never stored. Shared by the WorldEdit path, the zone restore and
+                     eden_import / eden_export; tested by worldedit_test and eden_import_test.
+explode.h            The TNT / paint explosion chain: worklist, depth guard, cell-visit
+                     budget, the protectedAt hook zones use, EXPLODE_REACH.
+zones.h              Protected zones: the eden_zones.txt grammar, load / normalise / caps,
+                     and the two lookups — blocking(cell) and intersects(box).
+zone_guard.h         What happens after a zone says no: the restore wire, a capped
+                     deduplicated cell set, the delayed + coalesced RevertQueue, and the
+                     audit folding.
+auth.h               Player identity: SHA-256, HMAC-SHA-256, PBKDF2 (no crypto dependency),
+                     PIN generation and shape, the eden_auth.txt grammar, and the rules for
+                     the level a session gets and the level it may bypass a zone with.
+topmap.h             The topmap control verb: request bounds, the surface rule against the
+                     base profile, and the chunk-column walk the server locks by.
 matchmaker.h         Matchmaker REGISTER parsing, name sanitising, SERVER: row / LIST
                      formatting, the TTL registry. Used by edenmatch.cpp.
 edenmatch.cpp        The standalone matchmaker: sockets, threads, on-demand HOST spawn.
@@ -46,6 +63,9 @@ eden_import.h        The .eden -> server-world conversion core: the base terrain
                      the diff/solid/full emitter, the axis rename for blocks and signs,
                      the cell and worst-case-REGION projections, the output line
                      grammars. Pure; no file I/O.
+durable_write.h      write-temp + fsync + rename + directory-fsync file replacement, shared by
+                     the server's saves and eden_import's writers. Pure POSIX; offline suite
+                     durable_write_test.cpp.
 eden_import.cpp      The eden_import CLI: argument parsing, file I/O, atomic writers,
                      the summary. A third single translation unit. Offline tool, run
                      before the server starts — see docs/import.md.
@@ -67,11 +87,23 @@ out_queue_test.cpp     The no-split invariant (a queue entry is always a whole l
                        whole frame), drain order, world-state FIFO, byte accounting, both
                        overflow policies, region-job admission, a whole region draining to
                        exactly its input records.
-protocol_test.cpp      Signs, usernames, ACTION validation, rate limiters.
+protocol_test.cpp      Signs, usernames, ACTION validation, rate limiters, the explosion
+                       chain and its zone hook (a protected TNT does not chain, EXPLODE_REACH
+                       is tight), the zone restore wire, the revert queue's coalescing, and
+                       the audit folding.
+zones_test.cpp         eden_zones.txt grammar, normalisation, caps, unknown-flag and
+                       duplicate-name refusal, blocking() / intersects() against brute force,
+                       bypass levels.
+auth_test.cpp          SHA-256 / HMAC / PBKDF2 against published vectors, PIN uniformity,
+                       eden_auth.txt all-or-nothing load, effective level and zone bypass.
+topmap_test.cpp        topmap parsing and the sample cap, the surface rule, the chunk-column
+                       walk, and the whole verb against a brute-force surface scan.
 control_test.cpp       Control line grammar, command table, ban/ops files, fill bounds,
                        the derived fill cap, the flood guard's state machine.
-worldedit_test.cpp     Player command table + permission floors, grammar, selection cap,
-                       shape predicates, undo byte budget, clipboard rotation.
+worldedit_test.cpp     Player command table + permission floors, grammar, explicit //pos
+                       corners, selection cap, how untouched cells read and which edits
+                       change nothing, the ACTION:server relay shape, shape predicates,
+                       undo byte budget, clipboard rotation.
 matchmaker_test.cpp    Name sanitising, REGISTER parsing, SERVER: row / LIST, the registry.
 eden_file_test.cpp     .eden header decode, chunk-size detection (version / creature-gap /
                        min-gap), directory gate, derived spans + bounded voxel reads,
@@ -87,8 +119,9 @@ eden_import_test.cpp   The base terrain profile, the diff/solid/full emitter, th
 
 Supporting files: `build_server.sh` (build + run all suites), `host_world.sh`
 (convenience launcher), `edenctl` (client for the operator control socket), `run_server.bat`
-(Windows/MSVC launcher), the `phase3_live_test.py` and `phase7_live_test.py` scripts (run by
-hand, not by the build — they bind a port and spawn processes), `worlds/<name>/` (sample
+(Windows/MSVC launcher), the `phase3_live_test.py`, `phase7_live_test.py` and
+`phase8_live_test.py` scripts (run by hand, not by the build — they bind a port and spawn
+processes), `worlds/<name>/` (sample
 worlds), `testdata/` (committed golden files for the offline suites).
 
 `admin/` is a separate, optional Go module — `edenadmin`, a local operator GUI that drives
@@ -100,7 +133,11 @@ worlds), `testdata/` (committed golden files for the offline suites).
 command-surface bounds are correct, and it tries to break them over real sockets — oversized
 selections against every command that reads one, permission escalation by casing and prefix
 tricks, undo growth across a long session, command flooding, malformed-argument fuzzing, and the
-control socket's own pacing and connection cap. Run it before hosting anything publicly.
+control socket's own pacing and connection cap. It also checks, against the real relay and the
+real save, that player edits treat untouched ground as the natural terrain it is: explicit
+`//pos` corners, `//set 0` in open sky storing nothing, `//paint` relaying a lone paint and
+skipping open sky, `//undo` rebuilding natural ground, and the cell cap charging only new cells.
+Run it before hosting anything publicly.
 
 `phase7_live_test.py` is the counterpart for the output path, and it exists because that failure
 mode is **invisible on a fast link** — a test that reads promptly proves nothing. Every group in
@@ -118,6 +155,15 @@ only exists across a connection's *lifecycle*: `SIGTERM` persisting an edit made
 a poisoned `POS` refused at ingest and still absent from the `SPAWN` of a later join under the
 same name, and a peer that never sent `JOIN` reaching neither the world, the chat channel, the
 roster nor the player file on a passworded server. Run it after touching the admission path too.
+
+`phase8_live_test.py` covers protected zones, with a second client watching what gets relayed:
+refused builds, mines and paints are neither relayed nor stored and the sender gets the cell put
+back; a sign write in a zone is refused and an existing sign sent back; a burn outside a zone
+whose blast reaches in restores both clients after the relay and leaves a protected TNT
+unchained; WorldEdit across a zone edge changes only the outside cells; the control socket
+bypasses zones; a hundred mines on one protected cell under a revert delay produce one restore
+and one audit line; refused edits spend the `ACTION` budget; and a malformed `eden_zones.txt`
+stops the server. Run it after touching any edit path.
 
 `server.cpp` is the original Winsock server this was ported from — reference only, a strict
 subset with no world model, persistence or validation. `server_posix_modded.cpp` is a
@@ -148,10 +194,11 @@ height. If you change one side of such a pair, the build fails until you change 
 | main | process start | `accept()` loop: IP ban check, auth lockout check, connect rate limit, client cap, spawn a handler |
 | client handler | one per accepted socket, **detached** | the whole session: recv, line framing, dispatch, and its own cleanup |
 | client writer | one per accepted socket, **joined** by its own handler | the only thread that ever writes that socket: drains the client's output queue, encodes `SNAPZ` frames, enforces the write timeout |
-| autosave | at startup, detached | every 15 s: `saveWorld()`, `savePlayerPos()`, `saveSigns()`, and the `--idle-timeout` check |
+| autosave | at startup, detached | every 15 s: `saveWorld()`, `savePlayerPos()`, `saveSigns()`, the zone-refusal audit counts folded into closed windows, and the `--idle-timeout` check |
 | matchmaker | at startup **iff** `--matchmaker` was given, detached | keeps one TCP registration open, heartbeats a player count every ~15 s, reconnects on failure |
 | control listener | at startup unless `--no-control-socket`, detached | `accept()` loop on the `0600` unix domain socket |
 | control handler | one per control connection, **detached** | reads `\n`-framed command lines, runs each, replies; `stop` saves and exits the process |
+| zone restore | at startup **iff** `--zone-revert-delay-ms` > 0, detached | drains the `RevertQueue`: when a refused edit's delay is up, builds its restore from the world as it is then and queues it on the client's (or every client's) world stream |
 
 Every thread is detached **except a client's writer**, which is joined by that client's own
 handler and by nobody else. A client handler removes itself from the roster, retires its writer,
@@ -205,13 +252,19 @@ backpressure as backpressure.
 | Mutex | Guards |
 |---|---|
 | `clientsMutex` | the socket list and `playerInfoMap` |
+| `g_zonesMtx` | the pointer to the current protected-zone set, and nothing else. Taken and **released** before `g_worldMtx`: an edit copies the (immutable) set's `shared_ptr` out, then locks the world, and reads the zones with no lock held. Never held across any other lock |
 | `g_worldMtx` | the world cell map |
 | `g_posMtx` | saved player positions |
 | `g_signMtx` | the sign list, the pre-formatted `SIGNP` burst, the index of signed blocks and the queue of sign-removal audit lines. Taken after `g_worldMtx` when an edit turns a signed block to air, so nothing holding it may take `g_worldMtx` |
 | `g_signSaveMtx` | spans `saveSigns()`' snapshot and write, so of two racing sign saves the newer list is the one left on disk. Taken before `g_signMtx`, never after it |
-| `g_saveMtx` | serialises on-disk writes so two saves cannot interleave (world, players, `eden_bans.txt`, `eden_ops.txt`, `eden_signs.txt`) |
+| `g_saveMtx` | serialises on-disk writes so two saves cannot interleave (world, players, `eden_bans.txt`, `eden_ops.txt`, `eden_signs.txt`, `eden_auth.txt`) |
 | `g_banMtx` / `g_opsMtx` | the in-memory ban list and op-level table |
+| `g_authMtx` | the login-PIN table. May be taken **before** `clientsMutex` (a `/login` sets the session's `verified` flag under both, so a concurrent `passwd` cannot slip between the PIN check and the flag), never after it: `who` and `pins` copy the PIN names out before taking `clientsMutex`. The slow PIN hash runs with no lock held |
+| `g_authEditMtx` / `g_zonesEditMtx` | serialise the writers of `eden_auth.txt` / `eden_zones.txt` (control verbs and `/zone`), each of which copies the live set, edits the copy, saves it and swaps it in. Never held across `g_worldMtx` |
+| `g_loginFailMtx` | the per-IP wrong-PIN table. Takes no other lock |
 | `g_auditMtx` | serialises audit lines so two threads cannot interleave one |
+| `g_revertMtx` | the zone `RevertQueue`. Takes no other lock: the restore thread releases it before it reads the world to build a restore |
+| `g_zoneAuditMtx` | the zone-refusal audit folding table. Takes no other lock; the lines it yields are written after it is released |
 | `g_outsMtx` | the socket → client-writer map. Held for a map lookup or walk and nothing else |
 | `ClientOut::m` | one client's output queue and writer state |
 
@@ -323,7 +376,11 @@ on a real shipped world — is what `world_store_test.cpp` exists to hold down.
 
 A chunk is keyed by `(x>>4, y>>4, z>>4)` of a coordinate packed exactly as the old map's key was:
 x and z into 24 bits each, y into 16 — which is where the coordinate bounds enforced on `ACTION`,
-`REGION` and sign lines come from. A cap on the number of distinct edited
+`REGION` and sign lines come from. Because the mask silently aliases anything outside those bounds
+(y ≥ 256 into chunks the `REGION` sweep never visits, a wrapped x/z onto a real cell at the far
+edge), `WorldStore::set` itself refuses any cell outside `ewb::ws_in_world` and counts it — so a
+bug in a caller (the TNT blast used to clip at y 1024) cannot plant an invisible, uneditable cell,
+and a file holding one is dropped at load with a warning. A cap on the number of distinct edited
 cells bounds memory and the on-disk file: past the cap, updates to existing cells still apply
 and brand-new cells are refused. (Chunked storage is what makes that cap affordable to raise:
 ~8 KB per populated chunk and ~4 bytes per cell on disk, against ~19 bytes of text per cell
@@ -339,8 +396,10 @@ just recording a delta:
 - **burn** on TNT or a firework runs `simExplode()`, a spherical blast that mirrors the game's
   `Terrain::explode`: a coloured centre paints the sphere, an uncoloured one destroys it,
   bedrock and steel survive, and TNT caught in the blast chains (bounded by a recursion depth
-  guard). One `ACTION` can therefore write hundreds of cells, which is why burn is charged a
-  much higher rate-limit cost than an ordinary edit.
+  guard and by `--burn-max-cells`, a budget of cells the whole chain may read — the world lock
+  is held for all of it). One `ACTION` can therefore write hundreds of cells, which is why burn
+  is charged a much higher rate-limit cost than an ordinary edit, plus the blasts its chain
+  actually ran once they are known.
 
 Modelling the rules rather than the deltas is what lets a late joiner be handed a correct
 snapshot regardless of the order edits arrived in.
@@ -352,6 +411,26 @@ command, `//undo` — and it removes every sign on that block there. A hash set 
 keeps that to one lookup per cell, and a world with no signs skips it entirely. The removal is
 recorded under the world lock; its audit line and the rebuilt `SIGNQ` burst wait until the
 lock is released, so a `fill` over many signed blocks formats the burst once, not per sign.
+
+**Protected zones sit in front of the model, not in it.** Every player edit path asks one
+predicate, `zoneDenies()`, before it writes: the `ACTION` handler (before `simAction()`, and
+after the edit budget, so a refusal still costs its tokens), the explosion chain (through
+`explode.h`'s `protectedAt` hook, which skips a protected cell *and* declines to chain a protected
+TNT), the player sign write, and the WorldEdit scan-and-commit path (`weCommit()` /
+`weEditBox()`, which every `//` command, `//paste`, `//undo` and `//redo` go through). The control
+socket's `setblock` / `fill` / `signs` have their own write path and never ask. The zone set is
+immutable once loaded and published behind a `shared_ptr`, so a check copies the pointer under
+`g_zonesMtx` before `g_worldMtx` is taken and never holds the zone lock into an edit. A burn and a
+WorldEdit box first narrow the set to the zones that meet their box (`EXPLODE_REACH` around a
+burn's root), which is usually none, so a world with zones pays nothing per cell away from them.
+
+A refused `ACTION` or burn is followed by a **restore** — the refused cells redrawn from the
+model — because the client drew the edit before asking. It is built when it is *sent*, from the
+world as it is then, so an operator edit that lands in the meantime is not painted over. With
+`--zone-revert-delay-ms` above 0, restores wait in a `RevertQueue` (a min-heap by due time,
+coalesced per client per cell) drained by the zone restore thread; with 0 the refusing thread
+sends it at once. Either way it goes on the client's world-state stream, behind anything already
+queued there — for a burn, behind the relay that makes each peer run the blast.
 
 ## Persistence
 
@@ -368,9 +447,11 @@ magic bytes and falls back to the legacy `x:y:z:type:color` reader, so every wor
 | `eden_signs.txt` | autosave, disconnect and control `save`/`stop` after a player's sign write or an edit that removed signs with their block; at once on control `signs add`/`rm`, and at startup or `signs reload` when signs on blocks stored as air were dropped | only when the sign list changed |
 | `eden_spawn.txt` | never | read-only; the default spawn for a player with no `eden_players.txt` row. `--spawn`/`--spawn-file` override. Malformed → one warning, ignored |
 | `eden_motd.txt` | never | read-only; the welcome message sent on join (`--motd-file`). Re-read on control `motd reload`, so it is the one sidecar an operator can safely hand-edit while the server runs |
+| `eden_zones.txt` | never | read-only, at startup; protected zones (`--zones-file`). All-or-nothing: a malformed file stops the server from starting rather than leaving its zones unprotected |
 
-Writes are **atomic and serialised**: the snapshot is taken under the data lock, written to a
-`.tmp` file, flushed, and `rename()`d over the real file while holding `g_saveMtx`. For the world
+Writes are **atomic, durable and serialised**: the snapshot is taken under the data lock, then —
+holding `g_saveMtx`, with the data lock already released — written to a `.tmp` file, `fsync`ed,
+`rename()`d over the real file, and the containing directory `fsync`ed (`durable_write.h`). For the world
 the "snapshot" is the **serialised `EDMB` blob**, not a copy of the model — on that same synthetic
 13.9 M-cell world, copying the old hash map held `g_worldMtx` for 1.24 s per save while
 serialising holds it for 0.18 s, and the write that follows went from 5.8 s / 276 MB of text to
@@ -378,6 +459,18 @@ serialising holds it for 0.18 s, and the write that follows went from 5.8 s / 27
 kill mid-write can therefore never leave a truncated world, and a disconnect-save racing the
 autosave cannot interleave. If any step fails, the dirty flag is set again so the next save
 retries.
+
+**Durability.** `flush()` alone only hands bytes to the kernel: after a power loss or hard VM reset
+the `rename()` can be on disk while the data is not, leaving an empty `eden_world.model` where a
+whole one was (ext4's `auto_da_alloc` usually papers over this; XFS, btrfs and a VPS with an
+aggressive write cache do not promise it). Since stage 7.29 the file is `fsync`ed before the rename
+and the directory after it, so after a crash the world is either the old save or the new one, never
+a partial one. On macOS the sync is `F_FULLFSYNC`, the call that reaches the drive rather than its
+cache. The world, player-position, sign, ban and op files and `eden_import`'s output all go through
+the same helper. The sync happens outside `g_worldMtx`, so its cost delays other *saves*, never a
+player's edit; the `Saved world` log line reports it (`write N ms, of which fsync M ms`) so an
+operator can see what it costs on their disk. Measured on a 56 MB world on an SSD, the sync was
+1–2 ms (about 50–80 ms with `F_FULLFSYNC`); a slow VPS disk will show up in that number.
 
 Autosave runs every 15 s, so the worst case for an unclean stop is losing one interval.
 
@@ -389,9 +482,10 @@ or an edit that removed signs with their block).
 ## Startup and shutdown
 
 `main()` parses arguments, clamps out-of-range values, ignores `SIGPIPE`, loads the world,
-player positions, signs (then drops signs on blocks the world stores as air) and the MOTD
-sidecar, starts the autosave thread (and the matchmaker thread if
-configured), then binds, listens and accepts. `SO_REUSEADDR` is set on the listener and
+player positions, signs (then drops signs on blocks the world stores as air), the ban and op
+lists, the protected zones (exiting with status 2 if `eden_zones.txt` does not parse) and the
+MOTD sidecar, starts the autosave thread (and the matchmaker thread if configured, and the zone
+restore thread if `--zone-revert-delay-ms` is above 0), then binds, listens and accepts. `SO_REUSEADDR` is set on the listener and
 `SO_KEEPALIVE` on each accepted socket so peers that vanish without a FIN eventually free their
 thread. Because that keepalive reap takes ~2 h on a default Linux, the client handler also sets
 `SO_RCVTIMEO` — first to `--handshake-timeout` (a connection that never sends `JOIN` is dropped,

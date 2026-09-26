@@ -87,6 +87,112 @@ static void test_parse_register() {
     CHECK(!parse_register("REGISTER:x:27o15:0", "1.2.3.4", r), "non-numeric port rejected");
     CHECK(!parse_register("REGISTER:x:27015:0", "", r), "no IP anywhere rejected");
     CHECK(!parse_register("LIST", "1.2.3.4", r), "non-REGISTER line rejected");
+
+    // --- stage 7.20: the advertise field must be an IPv4 address ---
+    CHECK(!parse_register("REGISTER:x:27015:0:not-an-ip", "1.2.3.4", r), "hostname-ish advertise rejected");
+    CHECK(!parse_register("REGISTER:x:27015:0:1.2.3.4\x1b[2J", "1.2.3.4", r),
+          "control bytes in advertise rejected");
+    CHECK(!parse_register("REGISTER:x:27015:0:1.2.3", "1.2.3.4", r), "short dotted quad rejected");
+    CHECK(!parse_register("REGISTER:x:27015:0:256.1.1.1", "1.2.3.4", r), "octet > 255 rejected");
+    CHECK(!parse_register("REGISTER:x:27015:0: 1.2.3.4", "1.2.3.4", r), "leading space rejected");
+    CHECK(parse_register("REGISTER:x:27015:0:::1", "1.2.3.4", r) && r.ip == "1.2.3.4",
+          "an IPv6 literal splits into an empty field and falls back to the peer");
+    Registration keep; keep.name = "untouched";
+    CHECK(!parse_register("REGISTER:x:27015:0:bogus", "1.2.3.4", keep) && keep.name == "untouched",
+          "a rejected line leaves `out` untouched");
+}
+
+static void test_advertise_policy() {
+    Registration r;
+    // peer 198.51.100.7 claims a different public server's address
+    CHECK(parse_register("REGISTER:Free V-Bucks:27015:0:203.0.113.5", "198.51.100.7", r), "parses");
+    CHECK(advertise_policy(r, "198.51.100.7", "198.51.100.7", false), "untrusted foreign claim overridden");
+    CHECK(r.ip == "198.51.100.7", "listed under the peer's own address instead");
+
+    CHECK(parse_register("REGISTER:x:27015:0:198.51.100.7", "198.51.100.7", r), "parses");
+    CHECK(!advertise_policy(r, "198.51.100.7", "198.51.100.7", false) && r.ip == "198.51.100.7",
+          "a peer may always advertise its own address");
+
+    CHECK(parse_register("REGISTER:x:27015:0:203.0.113.5", "127.0.0.1", r), "parses");
+    CHECK(!advertise_policy(r, "127.0.0.1", "127.0.0.1", true) && r.ip == "203.0.113.5",
+          "a trusted peer's claim is honoured");
+
+    // --advertise-ip set globally: the fallback is honoured as a claim too
+    CHECK(parse_register("REGISTER:x:27015:0:192.0.2.1", "10.0.0.9", r), "parses");
+    CHECK(!advertise_policy(r, "10.0.0.9", "192.0.2.1", false) && r.ip == "192.0.2.1",
+          "claiming the operator's --advertise-ip is allowed");
+
+    TrustList t;
+    CHECK(t.trusted("127.0.0.1") && t.trusted("127.8.9.10"), "loopback is always trusted");
+    CHECK(!t.trusted("10.0.0.9"), "nothing else is trusted by default");
+    CHECK(!t.trusted("not-an-ip"), "junk is never trusted");
+    CHECK(t.parse("192.168.1.0/24, 203.0.113.5"), "CIDR + bare address list parses");
+    CHECK(t.trusted("192.168.1.200") && !t.trusted("192.168.2.1"), "/24 matched by prefix");
+    CHECK(t.trusted("203.0.113.5") && !t.trusted("203.0.113.6"), "bare address is a /32");
+    CHECK(!t.parse("10.0.0.0/33") && t.trusted("203.0.113.5"), "bad prefix rejected, list unchanged");
+    CHECK(!t.parse("example.com"), "hostname rejected");
+    CHECK(t.parse("0.0.0.0/0") && t.trusted("8.8.8.8"), "/0 trusts everyone (explicit opt-in)");
+}
+
+static void test_registry_ownership() {
+    using R = Registry::AddResult;
+    Registry reg;
+    Registration victim; victim.name = "Real"; victim.ip = "203.0.113.5"; victim.port = 27015;
+    victim.peer = "203.0.113.5";
+    CHECK(reg.add(victim, 10, 0) == R::Ok, "victim registers");
+    reg.set_players(10, 4);
+
+    // A different peer that somehow holds the same ip:port claim (e.g. a trusted
+    // peer, or the operator's --advertise-ip) cannot displace a live row.
+    Registration attacker = victim; attacker.name = "Free V-Bucks"; attacker.peer = "198.51.100.7";
+    uint64_t displaced = 999;
+    CHECK(reg.add(attacker, 20, 1, &displaced) == R::Taken, "foreign peer refused");
+    CHECK(displaced == 0, "nothing displaced");
+    auto snap = reg.snapshot();
+    CHECK(snap.size() == 1 && snap[0].name == "Real" && snap[0].conn == 10, "victim row intact");
+
+    // The same peer on a new connection (a restarted server) does displace it.
+    Registration restarted = victim; restarted.name = "Real v2";
+    CHECK(reg.add(restarted, 11, 2, &displaced) == R::Ok && displaced == 10,
+          "same peer replaces its own stale connection");
+    snap = reg.snapshot();
+    CHECK(snap[0].players == 4, "player count carried across the restart");
+
+    // An orphaned row is reclaimable by anyone whose claim passed advertise_policy.
+    reg.orphan(11);
+    CHECK(reg.add(attacker, 21, 3, &displaced) == R::Ok && displaced == 0,
+          "orphaned row reclaimed (no live owner to displace)");
+
+    // One connection owns one row: re-REGISTER on a new port moves it.
+    Registry r2;
+    Registration a; a.name = "A"; a.ip = "1.1.1.1"; a.port = 27015; a.peer = "1.1.1.1";
+    CHECK(r2.add(a, 30, 0) == R::Ok, "add");
+    for (int p = 27016; p < 27100; ++p) {
+        Registration m = a; m.port = p;
+        r2.add(m, 30, 0);
+    }
+    CHECK(r2.size() == 1 && r2.snapshot()[0].port == 27099, "port-hopping re-REGISTERs keep one row");
+
+    // Per-peer cap on new rows.
+    Registry r3;
+    size_t ok = 0;
+    for (int i = 0; i < 40; ++i) {
+        Registration m = a; m.port = 30000 + i;
+        if (r3.add(m, 100 + i, 0, nullptr, MAX_REGISTRATIONS_PER_PEER) == R::Ok) ++ok;
+    }
+    CHECK(ok == MAX_REGISTRATIONS_PER_PEER, "untrusted peer capped at MAX_REGISTRATIONS_PER_PEER rows");
+    Registration m = a; m.port = 30000;
+    CHECK(r3.add(m, 100, 1, nullptr, MAX_REGISTRATIONS_PER_PEER) == R::Ok,
+          "re-REGISTER of an existing row is not blocked by the cap");
+    Registration other = a; other.ip = other.peer = "2.2.2.2";
+    CHECK(r3.add(other, 500, 0, nullptr, MAX_REGISTRATIONS_PER_PEER) == R::Ok, "another peer unaffected");
+    Registration loop = a; loop.peer = "127.0.0.1";
+    size_t okLoop = 0;
+    for (int i = 0; i < 40; ++i) {
+        loop.port = 31000 + i;
+        if (r3.add(loop, 600 + i, 0, nullptr, 0) == R::Ok) ++okLoop;
+    }
+    CHECK(okLoop == 40, "maxPerPeer 0 (trusted peer) is uncapped");
 }
 
 static void test_format_rows() {
@@ -182,14 +288,14 @@ static void test_registry() {
     Registration b;
     b.name = "B"; b.ip = "2.2.2.2"; b.port = 27016;
 
-    CHECK(reg.add(a, /*conn*/ 10, /*now*/ 0), "add A");
-    CHECK(reg.add(b, /*conn*/ 11, /*now*/ 0), "add B");
+    CHECK(reg.add(a, /*conn*/ 10, /*now*/ 0) == Registry::AddResult::Ok, "add A");
+    CHECK(reg.add(b, /*conn*/ 11, /*now*/ 0) == Registry::AddResult::Ok, "add B");
     CHECK(reg.size() == 2, "two entries");
 
     // Re-register same (name, ip, port) from a new connection: replaces, and
     // reports the displaced connection id.
     uint64_t displaced = 999;
-    CHECK(reg.add(a, /*conn*/ 12, /*now*/ 5, &displaced), "re-add A on a new conn");
+    CHECK(reg.add(a, /*conn*/ 12, /*now*/ 5, &displaced) == Registry::AddResult::Ok, "re-add A on a new conn");
     CHECK(reg.size() == 2, "still two entries (replaced, not appended)");
     CHECK(displaced == 10, "old conn id reported as displaced");
 
@@ -204,7 +310,7 @@ static void test_registry() {
     CHECK(reg.sweep(200).size() == 1, "A finally swept once its touch ages out");
 
     // remove() by connection id.
-    CHECK(reg.add(b, 20, 0), "re-add B");
+    CHECK(reg.add(b, 20, 0) == Registry::AddResult::Ok, "re-add B");
     reg.remove(20);
     CHECK(reg.size() == 0, "remove by conn id");
 }
@@ -257,13 +363,13 @@ static void test_players_and_ordering() {
 static void test_dedupe_by_ip_port() {
     Registry reg;
     Registration a; a.name = "Alpha"; a.ip = "1.1.1.1"; a.port = 27015;
-    CHECK(reg.add(a, 10, 0), "add Alpha");
+    CHECK(reg.add(a, 10, 0) == Registry::AddResult::Ok, "add Alpha");
 
     // A rename from the SAME connection's REGISTER, same ip:port, different
     // name: must replace (dedupe on ip:port), not create a second row (2.2).
     Registration renamed = a; renamed.name = "Alpha Renamed";
     uint64_t displaced = 999;
-    CHECK(reg.add(renamed, 10, 1, &displaced), "re-register with a new name");
+    CHECK(reg.add(renamed, 10, 1, &displaced) == Registry::AddResult::Ok, "re-register with a new name");
     CHECK(reg.size() == 1, "still one entry — no double-listing on rename");
     auto snap = reg.snapshot();
     CHECK(snap.size() == 1 && snap[0].name == "Alpha Renamed", "row picked up the new name");
@@ -315,6 +421,7 @@ static void test_persistence_roundtrip() {
 
     CHECK(!parse_persisted_line("garbage:not:enough:fields", back), "wrong field count rejected");
     CHECK(!parse_persisted_line("Name:1.2.3.4:notaport:0:0:0", back), "bad port rejected");
+    CHECK(!parse_persisted_line("Name:evil\x07:27015:0:0:0", back), "non-IP address rejected (7.20)");
 
     std::vector<Registration> two = {r, r};
     CHECK(serialize_registry(two) == line + "\n" + line + "\n", "serialize_registry is one line each");
@@ -360,6 +467,8 @@ static void test_conn_caps() {
 int main() {
     test_sanitize_name();
     test_parse_register();
+    test_advertise_policy();
+    test_registry_ownership();
     test_parse_ping();
     test_format_rows();
     test_registry();

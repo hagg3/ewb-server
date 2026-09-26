@@ -338,6 +338,55 @@ static void test_legacy_text() {
 // The critical regression check: a world this repo actually ships must load
 // through the legacy reader into exactly the cells the sparse map would have
 // held, and survive an EDMB save/load unchanged.
+// 7.22: `set` refuses exactly the coordinates `key_of` cannot map one-to-one onto
+// a chunk the box sweep visits — and anything it accepts, the sweep sees.
+static void test_out_of_world() {
+    ewb::WorldStore w;
+    const int H = ewb::WS_WORLD_HEIGHT, M = (int)ewb::WS_XZ_MASK;
+    // The edges are in the world.
+    const int ok[][3] = {{0, 0, 0}, {M, H - 1, M}, {65536, H - 1, 65536}, {65536, 0, 65536}};
+    for (const auto& p : ok) CHECK(w.set(p[0], p[1], p[2], 5, 0), "an edge cell is accepted");
+    // One past each edge is not. y 256 was what a pre-7.22 TNT at y 255 wrote.
+    const int bad[][3] = {{65536, H, 65536}, {65536, H + 4, 65536}, {65536, -1, 65536},
+                          {-1, 40, 65536}, {65536, 40, -1}, {M + 1, 40, 65536}, {65536, 40, M + 1}};
+    for (const auto& p : bad) CHECK(!w.set(p[0], p[1], p[2], 5, 0), "an out-of-world cell is refused");
+    CHECK(w.out_of_range() == 7, "every refusal is counted");
+    CHECK(w.size() == 4, "and none is stored");
+    // In particular none aliased onto a real cell: x = M + 1 masks to x = 0.
+    CHECK(!w.contains(0, 40, 65536) && !w.contains(M, 40, 65536), "no wrap-around alias");
+
+    // One small box per accepted cell (a whole-world box is 2^40 chunk probes).
+    size_t seen = 0;
+    for (const auto& p : ok)
+        w.for_each_in_box(p[0], p[0], p[2], p[2], [&](int x, int y, int z, int, int) {
+            seen += (x == p[0] && y == p[1] && z == p[2]);
+        });
+    CHECK(seen == w.size(), "every accepted cell is visible to for_each_in_box");
+
+    // The loaders drop them too. EDMB: hand-build a well-formed cy = 16 chunk —
+    // exactly what a pre-7.22 server saved after a blast at y 255.
+    ewb::WorldStore good;
+    good.set(65536, 40, 65536, 5, 0);
+    std::string blob = good.to_edmb();
+    blob[8] = 2;   // chunkCount (u64 LE at offset 8): 1 -> 2
+    auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) blob.push_back((char)((v >> (8 * i)) & 0xFF)); };
+    u32(65536 >> 4); u32(16); u32(65536 >> 4); u32(1);
+    blob.push_back(0); blob.push_back(0);   // localIdx 0 -> y 256
+    blob.push_back(9); blob.push_back(0);
+    ewb::WorldStore fromBin; std::string err;
+    CHECK(fromBin.load_edmb(blob.data(), blob.size(), err), "a cy 16 chunk is well-formed EDMB");
+    CHECK(fromBin.size() == 1 && fromBin.out_of_range() == 1, "its cell is dropped and counted");
+    CHECK(fromBin.to_edmb() == good.to_edmb(), "the next save no longer carries it");
+
+    std::istringstream in("65536:40:65536:5:0\n65536:256:65536:5:0\n-3:40:65536:5:0\n"
+                          "16777218:40:65536:5:0\n65536:-1:65536:5:0\n");
+    ewb::WorldStore fromText;
+    CHECK(ewb::world_load_text(in, fromText) == 1, "text: only the in-world row is taken");
+    CHECK(fromText.out_of_range() == 4 && fromText.size() == 1, "text: the rest are counted, not aliased");
+    CHECK(!fromText.contains(2, 40, 65536) && !fromText.contains(M - 2, 40, 65536),
+          "text: an over-range / negative x did not land on the far edge");
+}
+
 static void test_shipped_world(const char* path) {
     std::ifstream f(path);
     if (!f) { std::printf("  (skipped: %s not found)\n", path); return; }
@@ -408,6 +457,7 @@ int main() {
     test_edmb_round_trip();
     test_edmb_rejections();
     test_legacy_text();
+    test_out_of_world();
     test_shipped_world("testdata/carved_64z.model");
     test_shipped_world("worlds/ari/eden_world.model");
     if (g_fail) {

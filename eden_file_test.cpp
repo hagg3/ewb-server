@@ -364,6 +364,27 @@ static void test_directory_gate() {
     CHECK(world.chunks[0].cx == 5, "directory gate: the valid chunk survives");
 }
 
+// Stage 7.30: a directory past EDEN_MAX_DIR_ENTRIES is cut short, and says so.
+static void test_directory_truncation_is_reported() {
+    const size_t rows = EDEN_MAX_DIR_ENTRIES + 1;
+    std::vector<uint8_t> buf(EDEN_HEADER_BYTES + rows * EDEN_DIR_ENTRY, 0);
+
+    bool truncated = false;
+    auto d = eden_decode_directory(buf.data(), buf.size(), EDEN_HEADER_BYTES, &truncated);
+    CHECK(d.size() == EDEN_MAX_DIR_ENTRIES, "directory: read stops at the cap");
+    CHECK(truncated, "directory: one row past the cap is reported as truncated");
+
+    // Exactly at the cap nothing was left behind, so nothing is reported.
+    truncated = true;
+    d = eden_decode_directory(buf.data(), buf.size() - EDEN_DIR_ENTRY, EDEN_HEADER_BYTES, &truncated);
+    CHECK(d.size() == EDEN_MAX_DIR_ENTRIES, "directory: exactly the cap is read whole");
+    CHECK(!truncated, "directory: exactly the cap is not truncated");
+
+    // The pointer is optional: the old call shape still works.
+    CHECK(eden_decode_directory(buf.data(), 192 + 64, EDEN_HEADER_BYTES).size() == 4,
+          "directory: the flag is optional");
+}
+
 int main() {
     test_header();
     test_flat_64z();
@@ -373,6 +394,7 @@ int main() {
     test_detect_legacy_12000_gap();
     test_detect_min_gap_fallback();
     test_hostile_directory_offsets();
+    test_directory_truncation_is_reported();
     test_short_span_overlap();
     test_inline_sign_trailer();
     test_sidecar_signs();

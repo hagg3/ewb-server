@@ -29,7 +29,7 @@ Newline-framed, `:`-delimited, one message per line, lines capped at ~4 KB. Raw 
 
 | Send | Reply | Notes |
 |---|---|---|
-| `REGISTER:<name>:<port>:<hasPassword>[:<advertiseIP>]` | `REGISTERED` | The registration lives as long as the TCP connection stays open. `hasPassword` is `0`/`1`. If `advertiseIP` is omitted or empty, the matchmaker uses the connection's peer address (fine on a LAN, wrong behind NAT — pass it explicitly for a public server). `edenmatch` also replies `REGISTERFAIL:full` if its registry is full. |
+| `REGISTER:<name>:<port>:<hasPassword>[:<advertiseIP>]` | `REGISTERED` | The registration lives as long as the TCP connection stays open. `hasPassword` is `0`/`1`. If `advertiseIP` is omitted or empty, the matchmaker uses the connection's peer address. `advertiseIP` must be a dotted IPv4 address, and `edenmatch` only lists it as sent under the rules in [Advertised addresses](#advertised-addresses). `edenmatch` can also reply `REGISTERFAIL:full` (registry full), `REGISTERFAIL:taken` (another peer's live server holds that `ip:port`) or `REGISTERFAIL:limit` (this address already has 8 rows). |
 | `PING[:<players>]` | *(none)* | Keep-alive. Resets the ~45 s TTL. `<players>` (optional) reports the live join count, clamped to `[0, 1000]`; a bare `PING` leaves the last reported count as-is rather than clearing it. Junk after the colon is treated the same as a bare `PING` — the heartbeat itself is never rejected. `ewb-server` sends one every ~20 s, with the count reflecting joined players (not raw accepted sockets). |
 
 #### Server names
@@ -45,9 +45,42 @@ nothing is rejected outright, and `REGISTER` fails.
 This is deliberately *not* the same function as the `HOST` world-file slug below, which has to be
 a safe path component and is therefore much narrower.
 
+#### Advertised addresses
+
+The `ip` in a browser row is the address every client will dial, so `edenmatch` does not take a
+server's word for it. A row is keyed on `ip:port`, and before these rules any peer could register
+another server's address and take over its row.
+
+- `advertiseIP` must parse as a dotted IPv4 address. Anything else — a hostname, a truncated
+  address, a stray control byte — fails the whole `REGISTER`, and the connection is closed.
+- It is listed as sent only if it is the connecting peer's **own** address, or equals
+  `--advertise-ip`, or the peer is **trusted**. Otherwise the row lists the peer address instead,
+  and `edenmatch` logs the substitution. A peer can't forge its TCP source address, so no remote
+  peer can list a row under somebody else's address.
+- **Trusted** peers are loopback (`127.0.0.0/8`, a process on the matchmaker's own host — including
+  every `HOST` spawn) plus anything listed in `--trust-advertise`.
+
+In practice: a server on the matchmaker's own host, or on a network listed in `--trust-advertise`,
+can advertise any address (its public IP, its LAN IP). A server that connects from anywhere else
+is listed under the address it connects from. For a server behind NAT that is its router's public
+address, which is the one remote clients need. `edenserver` advertises its LAN address by default,
+so this is the usual case for a home-hosted server.
+
 Re-registering with the same `ip:port` **replaces** the old entry (dedupe — keyed on `ip:port`,
 not `name:ip:port`, so a server that renames itself doesn't appear twice) but **carries the
-player count forward**, so a rename or reconnect does not flicker the row back to `0`.
+player count forward**, so a rename or reconnect does not flicker the row back to `0`. Who may
+replace a row:
+
+- **the connection that owns it** — a rename;
+- **another connection from the same peer address** — a restarted server whose old socket hasn't
+  errored yet. `edenmatch` closes the old connection rather than leaving it open;
+- **anyone**, if the row is orphaned (see below);
+- **nobody else.** A live row owned by a different peer address gets `REGISTERFAIL:taken`.
+
+Each connection owns at most one row: a re-`REGISTER` on a new port moves the row, it doesn't add a
+second one. An untrusted peer address may hold at most **8** rows (`REGISTERFAIL:limit` past that),
+so a handful of source addresses can no longer fill the 512-row registry and lock every real
+server out.
 
 **A dropped registration socket does not immediately delist the server.** The entry is orphaned
 (kept, with no owning connection) instead, so a brief network hiccup doesn't vanish a server that
@@ -128,6 +161,9 @@ server to register back before replying `HOSTED`. The name determines what happe
   `<slug>` is the name lowercased, folded to `[a-z0-9]` with every other run of bytes collapsed
   to a single `_` — a name that already has a saved world under that slug reloads it, otherwise
   the server starts with an empty world;
+- only rows registered **from the matchmaker's own host** count as "live" here, and a spawn is only
+  considered registered once a loopback connection registers its port — a remote peer can't
+  pre-register a name or a port and have `HOST` hand requesters its address;
 - the spawned server's `--advertise` (and the `HOSTED` reply) use `--publicip` if set, else
   `--advertise-ip`, else the HOST requester's own peer address — *not* a hardcoded loopback, so a
   world hosted for a remote client is reachable by other remote clients too.
@@ -143,7 +179,8 @@ implement the agent role — it spawns locally under `--allow-host` instead.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--port N` | `27020` | TCP port to listen on (all interfaces). A bare leading number also works. |
-| `--advertise-ip IP` | *(peer address)* | Override the advertised address for **every** registration — the address clients are told to dial. Without it, each server's row uses the address it sent in `REGISTER`, or its peer IP if it sent none. |
+| `--advertise-ip IP` | *(peer address)* | The address listed for a registration that sends no `advertiseIP`, and the one a foreign `advertiseIP` falls back to — use it when every server is on the matchmaker's host behind one public address. Any peer may also advertise it explicitly. Must be IPv4; `edenmatch` refuses to start otherwise. |
+| `--trust-advertise LIST` | *(loopback only)* | Comma-separated IPv4 addresses and/or CIDR ranges (`192.168.1.0/24,203.0.113.5`) whose `REGISTER` may advertise an address other than their own, and which aren't held to the 8-rows-per-address cap. Loopback is always trusted. `0.0.0.0/0` restores the old trust-everyone behaviour — only for a matchmaker nobody hostile can reach. See [Advertised addresses](#advertised-addresses). |
 | `--short-list` | off | Emit the 4-field developer-sketch `SERVER:` row instead of the 7-field default. |
 | `--prod-list` | off | Emit the 6-field `SERVER:` row (no `flag6`) instead of the 7-field default. |
 | `--verbose` | off | Log every `LIST`, `HOST`, bad line, and unknown verb, not just registrations. |
@@ -151,7 +188,7 @@ implement the agent role — it spawns locally under `--allow-host` instead.
 | `--edenserver PATH` | `./edenserver` | Binary to spawn for `HOST` (with `--allow-host`). |
 | `--world DIR` | `.` | Working directory for a spawned server; each `HOST` name gets its own `world_<slug>.model` inside it (world/player/sign files land alongside it). |
 | `--host-ports LO-HI` | `27600-27699` | Port range `HOST` allocates from. |
-| `--publicip IP` | *(unset)* | Address to advertise for a `HOST`-spawned server (both the `HOSTED` reply and the child's own `--advertise`). Falls back to `--advertise-ip`, then the `HOST` requester's peer address. |
+| `--publicip IP` | *(unset)* | Address to advertise for a `HOST`-spawned server (both the `HOSTED` reply and the child's own `--advertise`). Falls back to `--advertise-ip`, then the `HOST` requester's peer address. Must be IPv4. |
 | `--registry-file PATH` | `eden_registry.txt` | Where the live registry is persisted (atomic temp+rename, rewritten every ~10 s). `--registry-file ""` disables persistence. Reloaded entries are re-verified by probe before being trusted — see above. |
 
 Registrations are otherwise held in memory; a restart still requires each server's own reconnect
@@ -164,8 +201,11 @@ persisted file keeps the browser populated with probe-verified entries in the me
 ./build_server.sh          # builds ./edenmatch alongside ./edenserver
 ./edenmatch --verbose       # listen on 27020
 
-# in another shell / on another host:
+# in another shell, on the same host (loopback is trusted, so --advertise is honoured):
 ./edenserver --port 27015 --name "My World" --matchmaker 127.0.0.1:27020 --advertise 192.168.1.20
+
+# servers on other LAN machines advertising addresses other than their own need, e.g.:
+./edenmatch --trust-advertise 192.168.1.0/24
 ```
 
 Firewall: open TCP **27020** only if you are hosting a matchmaker other machines must reach.

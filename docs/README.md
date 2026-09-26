@@ -53,13 +53,20 @@ Practically, when you touch a source file, move the doc in the same row:
 | `server_posix.cpp` — command-line flag parsing in `main()` | [configuration.md](configuration.md) |
 | `server_posix.cpp` — `matchmakerThread()`, or `matchmaker.h` / `edenmatch.cpp` (the matchmaker) | [matchmaker.md](matchmaker.md) |
 | `server_posix.cpp` — the control socket (`handleControlLine()`), `control.h`, `edenctl` | [commands.md](commands.md); [configuration.md](configuration.md) for the flags and file formats |
-| `server_posix.cpp` — the player commands (`handleWorldEditLine()`), `worldedit.h` | [commands.md](commands.md); [configuration.md](configuration.md) for the flags |
+| `server_posix.cpp` — the player commands (`handleWorldEditLine()`), `worldedit.h` | [commands.md](commands.md) — including its **reply-string contract**, which tools parse; [configuration.md](configuration.md) for the flags |
+| `worldedit.h` — `we_emit_edit_wire()`, the `ACTION:server:0:…` relay shape (player commands and `setblock`/`fill`) | [protocol.md](protocol.md) § Legacy world snapshot (the relay rules); [commands.md](commands.md) |
+| `base_profile.h` — the base terrain profile (what an untouched cell looks like) | [import.md](import.md) § The base terrain profile; [commands.md](commands.md) § Untouched ground |
 | `eden_names.h` — community block / paint / character name tables (`/id`, `/searchblocks`, `/searchcolors`, named `//set` / `//paint`) | [commands.md](commands.md) |
 | `server_posix.cpp` — any message handled in `handleClient()`, or anything the server sends | [protocol.md](protocol.md) |
 | `server_posix.cpp` — join sequence, threading, world model, persistence/autosave | [architecture.md](architecture.md), and [protocol.md](protocol.md) if the join order moves |
 | `region_query.h`, `snapz_codec.h` — `REGION`/`SNAPZ` geometry, encoding or framing | [protocol.md](protocol.md) |
 | `world_store.h` — the chunk store, the mined sentinel, the `EDMB` world format, the legacy text reader | [configuration.md](configuration.md) § `eden_world.model` (both formats + `--world-format`); [architecture.md](architecture.md) § World model / Persistence |
-| `explode.h` — TNT/paint explosion chain, `EXPLODE_MAX_CHAIN` fan-out bound | [protocol.md](protocol.md) (`ACTION` mode 2 bounds), [configuration.md](configuration.md) (the compiled-in-limits table) |
+| `explode.h` — TNT/paint explosion chain, `--burn-max-cells` work budget, the `protectedAt` zone hook | [protocol.md](protocol.md) (`ACTION` mode 2 bounds; § Protected zones for the hook), [configuration.md](configuration.md) (the compiled-in-limits table) |
+| `zones.h` — the `eden_zones.txt` grammar and zone lookups | [configuration.md](configuration.md) § `eden_zones.txt` |
+| `zone_guard.h`, or `zoneDenies()` and its callers in `server_posix.cpp` — protected-zone enforcement: the restore wire, the revert queue, notices, audit folding | [protocol.md](protocol.md) § Protected zones; [configuration.md](configuration.md) § Protected zones, the audit channel and the compiled-in limits; [architecture.md](architecture.md) (threads, locks, world model) |
+| `auth.h`, or `handleLogin()` / the `passwd`/`unpasswd`/`pins` verbs in `server_posix.cpp` — PINs, `/login`, the level a session gets, zone bypass | [commands.md](commands.md) § Player identity (and its reply strings); [configuration.md](configuration.md) § `eden_auth.txt`, `--auth-file`, `eden_ops.txt`, Protected zones; [protocol.md](protocol.md) § Chat and § Protected zones; [architecture.md](architecture.md) § Locks |
+| `topmap.h`, or the `topmap` verb | [commands.md](commands.md) (the verb and its reply format) |
+| `durable_write.h` — how the world and sidecar files reach disk (`fsync` + `rename` + directory `fsync`) | [architecture.md](architecture.md) § Persistence (the durability guarantee); [configuration.md](configuration.md) § Temporary files |
 | `out_queue.h`, or anything that writes to a player's socket | [architecture.md](architecture.md) § The output path; [configuration.md](configuration.md) for the per-client bounds |
 | `sign_store.h` — `SIGNQ`/`SIGNP` wire shape | [protocol.md](protocol.md); the `eden_signs.txt` grammar lives in [configuration.md](configuration.md) |
 | `spawn_store.h` — `eden_spawn.txt` grammar (world default spawn) | [configuration.md](configuration.md) § `eden_spawn.txt` and the `--spawn` / `--spawn-file` flags |
@@ -67,7 +74,7 @@ Practically, when you touch a source file, move the doc in the same row:
 | `hardening.h` — limits, username rules, `ACTION` and movement validation, the pre-`JOIN` verb gate | [protocol.md](protocol.md) (what clients may send, and when) and [configuration.md](configuration.md) (what an operator can tune) |
 | `build_server.sh` — compiler, flags, dependencies, or the test suites it runs | [quickstart.md](quickstart.md), [architecture.md](architecture.md) |
 | `admin/` — the optional `edenadmin` operator GUI (separate Go module) | `admin/README.md` (not part of `docs/`); mention it in [quickstart.md](quickstart.md) / [architecture.md](architecture.md) only where it touches the build |
-| `phase3_live_test.py`, `phase7_live_test.py` — the by-hand live socket tests | [architecture.md](architecture.md) (what each one covers) |
+| `phase3_live_test.py`, `phase7_live_test.py`, `phase8_live_test.py` — the by-hand live socket tests | [architecture.md](architecture.md) (what each one covers) |
 | `server_posix.cpp` — anything written to the audit channel (`auditLog()`) | [configuration.md](configuration.md) § The audit channel |
 | `host_world.sh`, `run_server.bat` — launcher arguments | [configuration.md](configuration.md), [quickstart.md](quickstart.md) |
 | `ops/edenserver.service`, `ops/edenserver@.service`, `ops/edenserver.conf.example`, `ops/edenserver-writeconf` — the systemd `EnvironmentFile` layer (`EDEN_*` keys, `${VAR}` vs `$VAR`) | [configuration.md](configuration.md) § The systemd EnvironmentFile; `ops/INSTALL.md` (template unit in § Multi-world hosting) |
@@ -76,7 +83,7 @@ Practically, when you touch a source file, move the doc in the same row:
 | `eden_import.h` / `eden_import.cpp` — the converter: base profile, fill strategies, axis rename, budget projections, the `eden_origin.txt` grammar, flags | [import.md](import.md); [export.md](export.md#the-origin-sidecar) for the origin keys; [configuration.md](configuration.md) for the files it writes |
 | `eden_export.h` / `eden_export.cpp` — the `.eden` **writer**: chunk selection, fill-then-overlay, the cell sentinels, the axis rename backwards, height format, signs sidecar vs inline, origin replay, flags | [export.md](export.md); [import.md](import.md) if the round trip's shape changes |
 | A new header + `*_test.cpp` pair | [architecture.md](architecture.md) (the file map) and whichever doc above owns its behaviour |
-| On-disk format: `eden_world.model`, `eden_players.txt`, `eden_signs.txt`, `eden_spawn.txt`, `eden_bans.txt`, `eden_ops.txt` | [configuration.md](configuration.md) |
+| On-disk format: `eden_world.model`, `eden_players.txt`, `eden_signs.txt`, `eden_spawn.txt`, `eden_bans.txt`, `eden_ops.txt`, `eden_zones.txt` | [configuration.md](configuration.md) |
 
 Two more rules for anything written here:
 

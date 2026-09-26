@@ -66,6 +66,14 @@ inline const std::vector<CtlSpec>& ctl_specs() {
         {"signs",        1, -1, "signs:reload | signs:add:<x>:<y>:<z>:<a>:<b>:<c>:<text> | signs:rm:<x>:<y>:<z>"},
         {"motd",         1,  1, "motd:reload | motd:show          — re-read / print the welcome message"},
         {"region-stats", 0,  0, "region-stats                     — REGION counters since start"},
+        {"zones",        0,  0, "zones                            — list protected zones"},
+        {"zone",         1, -1, "zone:add:<name>:<x0>:<y0>:<z0>:<x1>:<y1>:<z1>[:<all|off>[:<level>]] |"
+                                 " zone:set:<name>:<x0>:<y0>:<z0>:<x1>:<y1>:<z1> |"
+                                 " zone:flags:<name>:<all|off>[:<level>] | zone:rm:<name> | zone:reload"},
+        {"topmap",       5,  5, "topmap:<x0>:<z0>:<x1>:<z1>:<step> — top-down surface map (<=256x256 samples)"},
+        {"passwd",       1,  1, "passwd:<name>                    — issue (or replace) a login PIN; shown once"},
+        {"unpasswd",     1,  1, "unpasswd:<name>                  — remove a name's PIN"},
+        {"pins",         0,  0, "pins                             — names that have a login PIN"},
     };
     return specs;
 }
@@ -181,9 +189,10 @@ struct BanList {
 
 // --- op levels (eden_ops.txt) ---------------------------------------------
 
-/// `0` visitor · `1` builder · `2` operator. Stored, but nothing *consumes* the
-/// level until Tier 2 (stage 3.3); `op`/`deop`/`who` maintain it now so the file
-/// exists and is correct when 3.3 lands.
+/// `0` visitor · `1` builder · `2` operator. Consumed by the Tier 2 permission
+/// gate (stage 3.3). ⚠️ A level is keyed on the *claimed* name: it goes to anyone
+/// who joins under it, unless the name also has a PIN (auth.h, stage 8.6), in
+/// which case only a session that has logged in gets it.
 constexpr int CTL_LEVEL_MIN = 0;
 constexpr int CTL_LEVEL_MAX = 2;
 

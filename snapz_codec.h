@@ -12,8 +12,8 @@
 //
 // This must be byte-compatible with the two Rust reference implementations it is
 // verified against:
-//   - VuencLink  apps/vuenclink/src-tauri/src/world/snapz.rs :: decode_frame
-//   - mock_server apps/vuenclink/src-tauri/examples/mock_server.rs :: encode_snapz
+//   - a companion Rust test client's SNAPZ decoder :: decode_frame
+//   - a matching mock-server encoder :: encode_snapz
 // both of which use flate2's DeflateEncoder at Compression::new(6) == zlib level 6,
 // headerless. Hence deflateInit2(&s, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY).
 //
@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -60,12 +61,24 @@ inline std::vector<uint8_t> raw_deflate(const std::vector<uint8_t>& in) {
 
 // --- raw INFLATE (for the round-trip test / debugging) ----------------------
 
-inline std::vector<uint8_t> raw_inflate(const uint8_t* data, size_t len, size_t size_hint = 0) {
+/// Ceiling on what `raw_inflate` will produce unless the caller says otherwise. A SNAPZ
+/// frame is at most ~3000 records (tens of KB inflated); 64 MiB is generous for a test
+/// or a debugging tool and small enough that a bad stream cannot eat the machine.
+inline constexpr size_t RAW_INFLATE_MAX_OUT = size_t(64) << 20;
+
+/// Inflate a raw DEFLATE stream. Throws — never spins — on truncated or empty input
+/// (the stream cannot finish, however much room it is given) and on output past
+/// `max_out` (stage 7.30; this used to double its buffer forever on either). Nothing on
+/// the server path calls it today, and the ceiling is what keeps it from becoming a
+/// live-path hazard if something later does; `eden_file.h`'s `raw_inflate_bounded` is
+/// the equivalent for untrusted `.eden` archives.
+inline std::vector<uint8_t> raw_inflate(const uint8_t* data, size_t len, size_t size_hint = 0,
+                                        size_t max_out = RAW_INFLATE_MAX_OUT) {
     z_stream s{};
     if (inflateInit2(&s, -15) != Z_OK)
         throw std::runtime_error("inflateInit2 failed");
 
-    std::vector<uint8_t> out(size_hint ? size_hint : (len * 4 + 64));
+    std::vector<uint8_t> out(std::min(size_hint ? size_hint : (len * 4 + 64), max_out));
     s.next_in  = const_cast<Bytef*>(data);
     s.avail_in = static_cast<uInt>(len);
 
@@ -74,8 +87,17 @@ inline std::vector<uint8_t> raw_inflate(const uint8_t* data, size_t len, size_t 
         s.avail_out = static_cast<uInt>(out.size() - s.total_out);
         const int rc = inflate(&s, Z_FINISH);
         if (rc == Z_STREAM_END) break;
-        if (rc == Z_OK || rc == Z_BUF_ERROR) {  // need more output room
-            out.resize(out.size() * 2);
+        if (rc == Z_OK || rc == Z_BUF_ERROR) {
+            // Room left in the output and still not done: the input ran out first.
+            if (s.avail_out > 0 && s.avail_in == 0) {
+                inflateEnd(&s);
+                throw std::runtime_error("inflate: truncated or empty input");
+            }
+            if (out.size() >= max_out) {
+                inflateEnd(&s);
+                throw std::runtime_error("inflate: output exceeds the size cap");
+            }
+            out.resize(std::min(max_out, out.size() * 2));   // need more output room
             continue;
         }
         inflateEnd(&s);

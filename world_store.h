@@ -117,6 +117,22 @@ constexpr unsigned char CELL_MINED = 254;
 constexpr uint32_t WS_XZ_MASK = 0xFFFFFFu;
 constexpr uint32_t WS_Y_MASK  = 0xFFFFu;
 
+/// The addressable world: x/z in `[0, 0xFFFFFF]`, y in `[0, WS_WORLD_HEIGHT)` —
+/// the same box `ACTION`, `setblock`/`fill`, WorldEdit and the sign parser
+/// validate against. It is also exactly the set of coordinates the masking in
+/// `key_of` maps one-to-one onto a chunk `for_each_in_box` sweeps:
+///   - y >= WS_WORLD_HEIGHT lands in `cy > WS_MAX_CY`, which no box query
+///     visits — stored, saved, counted against the cap, never sent, and not
+///     addressable by any player to remove (ROADMAP-SERVER 7.22);
+///   - y < 0 masks to `cy` 4080..4095, the same;
+///   - x/z outside 24 bits wrap onto the opposite edge of the world, i.e. an
+///     *existing, reachable* cell some 16 million blocks away.
+/// `WorldStore::set` refuses anything outside it (see `out_of_range()`).
+inline bool ws_in_world(int x, int y, int z) {
+    return x >= 0 && z >= 0 && (uint32_t)x <= WS_XZ_MASK && (uint32_t)z <= WS_XZ_MASK &&
+           y >= 0 && y < WS_WORLD_HEIGHT;
+}
+
 struct WorldCell {
     unsigned char type = 0;    ///< logical: 0 = air (mined), 255 = painted base
     unsigned char color = 0;
@@ -167,8 +183,11 @@ public:
     size_t chunk_count() const { return chunks_.size(); }
     /// Cells whose stored type was the reserved 254 and were loaded as air.
     size_t reserved_coerced() const { return coerced_; }
+    /// Writes `set()` refused because the coordinate is outside `ws_in_world`.
+    /// Nonzero after a load means the file held cells no client could ever see.
+    size_t out_of_range() const { return outOfRange_; }
 
-    void clear() { chunks_.clear(); cells_ = 0; coerced_ = 0; }
+    void clear() { chunks_.clear(); cells_ = 0; coerced_ = 0; outOfRange_ = 0; }
 
     /// Resident bytes of chunk payload (the arrays only) — what the denser
     /// storage actually buys, for the cap advice in `docs/configuration.md`.
@@ -195,13 +214,19 @@ public:
     /// Write a logical type/colour. Creates the chunk if needed. A logical type
     /// of `CELL_MINED` (254) cannot be stored — see the header comment — and is
     /// recorded as mined air, counted by `reserved_coerced()`.
-    void set(int x, int y, int z, unsigned char type, unsigned char color) {
+    ///
+    /// Returns false, stores nothing and counts `out_of_range()` for a
+    /// coordinate outside `ws_in_world` — without this, `key_of`'s masking
+    /// would alias it into a chunk no box query reaches, or onto another cell.
+    bool set(int x, int y, int z, unsigned char type, unsigned char color) {
+        if (!ws_in_world(x, y, z)) { ++outOfRange_; return false; }
         if (type == CELL_MINED) { ++coerced_; type = 0; }
         WChunk& c = chunks_[key_of(x, y, z)];
         const int i = ws_local_index(x, y, z);
         if (c.type[i] == 0) { ++c.nonZero; ++cells_; }
         c.type[i] = ws_encode_type(type);
         c.color[i] = color;
+        return true;
     }
 
     /// Visit every present cell as `fn(x, y, z, logicalType, color)`. Order is
@@ -265,6 +290,27 @@ public:
         return st;
     }
 
+    /// Visit every present cell of one x/z column, bottom to top, as
+    /// `fn(y, logicalType, color)`. `WS_MAX_CY + 1` chunk probes — the per-column
+    /// cost `topmap` (stage 8.5) pays per sample, independent of world size.
+    template <class F>
+    void for_each_in_column(int x, int z, F&& fn) const {
+        if (x < 0 || z < 0 || (uint32_t)x > WS_XZ_MASK || (uint32_t)z > WS_XZ_MASK) return;
+        const int cx = x >> 4, cz = z >> 4;
+        const int col = ((z & 15) << 4) | (x & 15);
+        for (int cy = 0; cy <= WS_MAX_CY; ++cy) {
+            auto it = chunks_.find(ws_chunk_key(cx, cy, cz));
+            if (it == chunks_.end()) continue;
+            const WChunk& c = it->second;
+            for (int ly = 0; ly < WS_CHUNK; ++ly) {
+                const int i = (ly << 8) | col;
+                const unsigned char t = c.type[i];
+                if (t == 0) continue;
+                fn(cy * WS_CHUNK + ly, ws_decode_type(t), c.color[i]);
+            }
+        }
+    }
+
     // --- EDMB serialisation --------------------------------------------------
 
     /// Serialise the whole store to an EDMB blob. Deterministic: chunks ascending
@@ -305,6 +351,11 @@ public:
     /// Parse an EDMB blob into this store (additive — call `clear()` first for a
     /// fresh load). Returns false with `err` set on a malformed or truncated
     /// file, having applied whatever it read before the damage.
+    ///
+    /// A chunk above `WS_MAX_CY` is well-formed EDMB but not a world cell: a
+    /// server before 7.22 let a TNT blast near the top of the world write
+    /// `y = 256..260` and saved it. Those cells are dropped and counted in
+    /// `out_of_range()` (via `set`), so the next save no longer carries them.
     bool load_edmb(const char* p, size_t n, std::string& err) {
         size_t o = 0;
         if (!is_edmb(p, n)) { err = "not an EDMB file"; return false; }
@@ -388,6 +439,7 @@ private:
     std::unordered_map<uint64_t, WChunk> chunks_;
     size_t cells_ = 0;
     size_t coerced_ = 0;
+    size_t outOfRange_ = 0;
 };
 
 // --- the legacy text reader --------------------------------------------------
@@ -416,7 +468,9 @@ inline bool world_parse_text_line(const std::string& line, int& x, int& y, int& 
     return true;
 }
 
-/// Load the legacy text format from a stream into `store`.
+/// Load the legacy text format from a stream into `store`. Returns the rows
+/// stored; a row outside `ws_in_world` is skipped and counted in the store's
+/// `out_of_range()`.
 inline size_t world_load_text(std::istream& in, WorldStore& store) {
     std::string line;
     size_t n = 0;
@@ -424,8 +478,7 @@ inline size_t world_load_text(std::istream& in, WorldStore& store) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         int x, y, z; unsigned char t, c;
         if (!world_parse_text_line(line, x, y, z, t, c)) continue;
-        store.set(x, y, z, t, c);
-        ++n;
+        if (store.set(x, y, z, t, c)) ++n;   // out-of-world rows: counted by the store
     }
     return n;
 }

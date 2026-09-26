@@ -4,9 +4,12 @@
 // payload validation, the world cell cap headroom, token bucket, per-IP connect
 // limiter, constant-time password compare, per-IP failed-auth limiter, text
 // sanitisation) — plus the explode.h TNT/paint chain worklist and its
-// EXPLODE_MAX_CHAIN fan-out bound (stage 7.7), the movement-field validator
+// explosion chain fan-out + work budget (stages 7.7 / 7.19), the movement-field validator
 // and spawn formatter of stage 7.16, and the `eden_motd.txt` welcome-message
-// sidecar (motd_store.h).
+// sidecar (motd_store.h). Stage 8.2 adds the explosion chain's protectedAt hook
+// (protected cells untouched, a protected TNT not chained, EXPLODE_REACH tight) and
+// zone_guard.h: the restore wire, the capped cell set, the revert queue's
+// coalescing, and the audit folding.
 //
 //   clang++ -std=c++17 -O2 -Wall protocol_test.cpp -o protocol_test
 //   ./protocol_test
@@ -30,6 +33,9 @@
 #include <unordered_map>
 
 #include "explode.h"
+#include "world_store.h"
+#include "zones.h"
+#include "zone_guard.h"
 #include "hardening.h"
 #include "motd_store.h"
 #include "sign_store.h"
@@ -252,39 +258,376 @@ static void test_explode_single_tnt_golden() {
     };
     fw.cells[FakeWorld::key(100, 100, 100)] = {(unsigned char)w.tntType, 0};
 
-    const size_t refused = ewb::simExplode(w, 100, 100, 100);
+    const ewb::ExplodeResult r = ewb::simExplode(w, 100, 100, 100);
     // Golden: an isolated TNT in an empty world, R=6 sphere, no chain — 923
     // distinct cells touched (1 explicit center-consume call, then every other
     // distinct cell the sphere's samples land on; repeat visits to an
     // already-air cell are skipped). A change here means the destroyed-cell
     // geometry changed, not just this refactor.
-    CHECK(refused == 0, "an unbounded single TNT refuses nothing");
+    CHECK(r.refused == 0 && r.truncated == 0, "an unbounded single TNT refuses nothing");
     CHECK(setCalls == 923, "an isolated TNT's blast touches the same cell count as before 7.7");
+    CHECK(r.explosions == 1, "one blast");
+    CHECK(r.visits == ewb::EXPLODE_VISITS_PER_BLAST && r.visits == 1037,
+          "one blast reads exactly EXPLODE_VISITS_PER_BLAST cells");
 }
 
 // A dense field where every queried cell reports back another TNT block: the
 // blast chains into an unbounded number of neighbours. Before 7.7 this was
 // bounded only by recursion depth (still a huge, uncapped fan-out per level);
-// after 7.7, EXPLODE_MAX_CHAIN bounds the total explosions processed.
-static void test_explode_chain_capped() {
-    size_t setCalls = 0;
+// 7.7 capped the blasts; 7.19 expresses that cap as a budget of cell visits.
+static void test_explode_chain_budget() {
+    size_t gets = 0;
     ewb::ExplodeWorld w;
-    w.get = [](int, int, int, ewb::ExplodeCell& out) -> bool {
+    w.get = [&](int, int, int, ewb::ExplodeCell& out) -> bool {
+        ++gets;
         out = {(unsigned char)9 /* SV_TNT */, 0};
         return true;
     };
-    w.set = [&](int, int, int, int, int) -> bool {
-        ++setCalls;
-        return true;
-    };
+    w.set = [](int, int, int, int, int) -> bool { return true; };
     w.tntType = 9;
 
-    const size_t maxChain = 50;
-    const size_t refused = ewb::simExplode(w, 65536, 100, 65536, maxChain);
+    const size_t per = ewb::EXPLODE_VISITS_PER_BLAST;
+    for (size_t budget : {per * 50, per * 50 + per - 1, ewb::EXPLODE_DEFAULT_MAX_VISITS}) {
+        gets = 0;
+        const ewb::ExplodeResult r = ewb::simExplode(w, 65536, 100, 65536, budget);
+        CHECK(r.visits <= budget, "a chain never reads more cells than its budget");
+        CHECK(r.visits == gets, "visits counts every read");
+        CHECK(r.explosions == budget / per, "the budget is spent in whole blasts");
+        CHECK(r.truncated > 0, "a chain cut short by the budget reports it");
+        CHECK(r.refused == 0, "truncation is not reported as a cap refusal");
+    }
 
-    CHECK(setCalls >= 1 && setCalls <= maxChain,
-          "a dense chain processes at most EXPLODE_MAX_CHAIN explosions");
-    CHECK(refused > 0, "a chain that would exceed the cap reports truncation via `refused`");
+    // A budget below one blast still runs the root: a single TNT always works.
+    const ewb::ExplodeResult one = ewb::simExplode(w, 65536, 100, 65536, 1);
+    CHECK(one.explosions == 1 && one.visits == per, "the root blast always runs");
+}
+
+// A small cluster finishes inside the default budget with nothing truncated,
+// including the re-explosions of already-consumed TNT that the client's
+// collect-then-recurse order produces.
+static void test_explode_cluster_completes() {
+    FakeWorld fw;
+    ewb::ExplodeWorld w;
+    w.get = [&](int x, int y, int z, ewb::ExplodeCell& out) -> bool {
+        auto it = fw.cells.find(FakeWorld::key(x, y, z));
+        if (it == fw.cells.end()) return false;
+        out = it->second;
+        return true;
+    };
+    w.set = [&](int x, int y, int z, int type, int color) -> bool {
+        fw.cells[FakeWorld::key(x, y, z)] = {(unsigned char)type, (unsigned char)color};
+        return true;
+    };
+    for (int x = 0; x < 3; ++x)
+        for (int y = 0; y < 3; ++y)
+            for (int z = 0; z < 3; ++z) fw.cells[FakeWorld::key(1000 + x, 100 + y, 1000 + z)] = {9, 0};
+
+    const ewb::ExplodeResult r = ewb::simExplode(w, 1001, 101, 1001);
+    CHECK(r.truncated == 0, "a 3x3x3 TNT block runs to completion under the default budget");
+    CHECK(r.explosions > 27, "re-explosions of consumed TNT are kept (client order)");
+    size_t left = 0;
+    for (const auto& kv : fw.cells) left += kv.second.type == 9;
+    CHECK(left == 0, "every TNT in the block is consumed");
+}
+
+// 7.22: a blast near the top (or bottom) of the world writes nothing outside
+// [0, WS_WORLD_HEIGHT), and every cell it did write is visible to the REGION
+// sweep. Backed by the real chunk store so the check is the one that matters:
+// a cell `set` took but `for_each_in_box` cannot see is a permanent leak.
+static void test_explode_stays_in_world() {
+    CHECK(ewb::ExplodeWorld{}.yMax == ewb::WS_WORLD_HEIGHT,
+          "the explode default clips at the height the chunk store sweeps");
+    for (int cy : {ewb::WS_WORLD_HEIGHT - 1, 0}) {
+        ewb::WorldStore store;
+        int yLo = 1 << 30, yHi = -(1 << 30);
+        size_t setCalls = 0;
+        ewb::ExplodeWorld w;
+        w.get = [&](int x, int y, int z, ewb::ExplodeCell& out) -> bool {
+            ewb::WorldCell c;
+            if (!store.get(x, y, z, c)) return false;
+            out.type = c.type; out.color = c.color;
+            return true;
+        };
+        w.set = [&](int x, int y, int z, int type, int color) -> bool {
+            ++setCalls;
+            yLo = std::min(yLo, y); yHi = std::max(yHi, y);
+            return store.set(x, y, z, (unsigned char)type, (unsigned char)color);
+        };
+        store.set(65536, cy, 65536, (unsigned char)w.tntType, 0);
+        const ewb::ExplodeResult r = ewb::simExplode(w, 65536, cy, 65536);
+        CHECK(yLo >= 0 && yHi < ewb::WS_WORLD_HEIGHT, "a blast at the world's edge writes only inside it");
+        CHECK(r.refused == 0 && store.out_of_range() == 0, "nothing was refused as out of range");
+        size_t seen = 0;
+        store.for_each_in_box(65536 - 16, 65536 + 16, 65536 - 16, 65536 + 16,
+                              [&](int, int, int, int, int) { ++seen; });
+        CHECK(seen == store.size(), "every cell the blast wrote is visible to a REGION sweep");
+        CHECK(setCalls < 923, "the half-sphere outside the world is clipped, not written");
+    }
+}
+
+// --- protected zones: the explosion hook (stage 8.2) -------------------------
+
+// A FakeWorld-backed ExplodeWorld with a zone set wired to protectedAt, collecting
+// every cell the hook refused — the shape the server's SvExplodeWorld has.
+struct ZonedBlast {
+    FakeWorld fw;
+    ewb::ZoneSet zones;
+    std::set<std::tuple<int, int, int>> refused;   // distinct protected cells reached
+    ewb::ExplodeWorld w;
+    ZonedBlast() {
+        w.get = [this](int x, int y, int z, ewb::ExplodeCell& out) -> bool {
+            auto it = fw.cells.find(FakeWorld::key(x, y, z));
+            if (it == fw.cells.end()) return false;
+            out = it->second;
+            return true;
+        };
+        w.set = [this](int x, int y, int z, int type, int color) -> bool {
+            fw.cells[FakeWorld::key(x, y, z)] = {(unsigned char)type, (unsigned char)color};
+            return true;
+        };
+        w.protectedAt = [this](int x, int y, int z) -> bool {
+            if (!zones.blocking(x, y, z)) return false;
+            refused.insert({x, y, z});
+            return true;
+        };
+    }
+    void zone(const char* line) {
+        ewb::Zone z;
+        CHECK(ewb::zone_parse_line(line, z) && zones.add(z), "test zone parses");
+    }
+    const ewb::ExplodeCell* at(int x, int y, int z) const {
+        auto it = fw.cells.find(FakeWorld::key(x, y, z));
+        return it == fw.cells.end() ? nullptr : &it->second;
+    }
+};
+
+static void test_explode_protected_cells_untouched() {
+    // A TNT at x 1000, a zone covering x >= 1003: the blast's x 994..1002 goes, the
+    // part of its sphere inside the zone is refused and reported, and none of it is
+    // written. A block placed in the zone survives.
+    ZonedBlast b;
+    b.zone("wall:1003:0:900:1100:255:1100:all");
+    b.fw.cells[FakeWorld::key(1000, 100, 1000)] = {9, 0};
+    b.fw.cells[FakeWorld::key(1004, 100, 1000)] = {5, 0};   // a placed block, protected
+    b.fw.cells[FakeWorld::key(998, 100, 1000)] = {5, 0};    // one outside the zone
+    const ewb::ExplodeResult r = ewb::simExplode(b.w, 1000, 100, 1000);
+    CHECK(r.explosions == 1 && r.protectedHits > 0, "the blast ran and was refused some cells");
+    bool inZoneWritten = false, outsideWritten = false;
+    for (const auto& kv : b.fw.cells) {
+        const int x = int(kv.first >> 40), y = int(kv.first & 0xFFFF), z = int((kv.first >> 16) & 0xFFFFFF);
+        if (x >= 1003 && !(x == 1004 && y == 100 && z == 1000)) inZoneWritten = true;
+        if (x < 1003) outsideWritten = true;
+    }
+    CHECK(!inZoneWritten, "nothing inside the zone was written");
+    CHECK(outsideWritten, "the unprotected part of the blast still applied");
+    const ewb::ExplodeCell* kept = b.at(1004, 100, 1000);
+    CHECK(kept && kept->type == 5, "a placed block inside the zone survives the blast");
+    const ewb::ExplodeCell* gone = b.at(998, 100, 1000);
+    CHECK(gone && gone->type == 0, "a placed block outside it does not");
+
+    // The refused list is exactly the sphere's cells that fall in the zone.
+    std::set<std::tuple<int, int, int>> expect;
+    ewb::explode_for_each_blast_cell(1000, 100, 1000, 0, 256, [&](int x, int y, int z) {
+        if (x >= 1003) expect.insert({x, y, z});
+    });
+    CHECK(!expect.empty() && b.refused == expect, "the refused cells are exactly the sphere's cells in the zone");
+}
+
+static void test_explode_protected_tnt_does_not_chain() {
+    // Two TNT 4 apart. Unprotected, the first chains into the second.
+    {
+        ZonedBlast b;
+        b.fw.cells[FakeWorld::key(2000, 100, 2000)] = {9, 0};
+        b.fw.cells[FakeWorld::key(2004, 100, 2000)] = {9, 0};
+        const ewb::ExplodeResult r = ewb::simExplode(b.w, 2000, 100, 2000);
+        CHECK(r.explosions >= 2, "control: an unprotected TNT in the blast chains");
+        const ewb::ExplodeCell* far = b.at(2010, 100, 2000);   // only the second blast reaches it
+        CHECK(far && far->type == 0, "control: the chained blast reaches past the first");
+    }
+    // The second inside a zone: it is not set off, not written, and so nothing
+    // beyond the first blast's own sphere is touched.
+    {
+        ZonedBlast b;
+        b.zone("museum:2004:100:2000:2004:100:2000:all");
+        b.fw.cells[FakeWorld::key(2000, 100, 2000)] = {9, 0};
+        b.fw.cells[FakeWorld::key(2004, 100, 2000)] = {9, 0};
+        const ewb::ExplodeResult r = ewb::simExplode(b.w, 2000, 100, 2000);
+        CHECK(r.explosions == 1, "a protected TNT is not chained");
+        const ewb::ExplodeCell* t = b.at(2004, 100, 2000);
+        CHECK(t && t->type == 9, "the protected TNT is still there");
+        CHECK(b.at(2010, 100, 2000) == nullptr, "nothing past the first sphere was touched");
+        CHECK(b.refused.size() == 1 && b.refused.count({2004, 100, 2000}), "the TNT is the one refused cell");
+    }
+    // A protected root runs no blast at all.
+    {
+        ZonedBlast b;
+        b.zone("root:3000:100:3000:3000:100:3000:all");
+        b.fw.cells[FakeWorld::key(3000, 100, 3000)] = {9, 0};
+        const ewb::ExplodeResult r = ewb::simExplode(b.w, 3000, 100, 3000);
+        CHECK(r.explosions == 0 && r.visits == 0 && b.fw.cells.size() == 1, "a protected root is not set off");
+    }
+    // An "off" zone protects nothing.
+    {
+        ZonedBlast b;
+        b.zone("idle:2004:100:2000:2004:100:2000:off");
+        b.fw.cells[FakeWorld::key(2000, 100, 2000)] = {9, 0};
+        b.fw.cells[FakeWorld::key(2004, 100, 2000)] = {9, 0};
+        CHECK(ewb::simExplode(b.w, 2000, 100, 2000).explosions >= 2, "an 'off' zone does not stop the chain");
+    }
+}
+
+// EXPLODE_REACH is what lets the server hand a chain only the zones near its root,
+// so it must bound every cell the chain can touch — and be tight, or it filters
+// in zones for nothing. A line of TNT 6 apart chains as deep as the guard allows.
+static void test_explode_reach() {
+    ZonedBlast b;
+    // TNT at depths 0..6; the last link's blast is the one that reaches furthest.
+    for (int k = 0; k <= ewb::EXPLODE_MAX_DEPTH; ++k) b.fw.cells[FakeWorld::key(5000 + 6 * k, 100, 5000)] = {9, 0};
+    int maxOff = 0;
+    auto set = b.w.set;
+    b.w.set = [&](int x, int y, int z, int type, int color) -> bool {
+        maxOff = std::max({maxOff, std::abs(x - 5000), std::abs(y - 100), std::abs(z - 5000)});
+        return set(x, y, z, type, color);
+    };
+    const ewb::ExplodeResult r = ewb::simExplode(b.w, 5000, 100, 5000);
+    // (More blasts than links: the y = cy layer is sampled twice, so each link is
+    // queued twice — the client's order, kept since 7.7.)
+    CHECK(r.truncated == 0 && r.explosions > size_t(ewb::EXPLODE_MAX_DEPTH), "the chain runs to the depth guard");
+    CHECK(maxOff == ewb::EXPLODE_REACH, "the chain reaches exactly EXPLODE_REACH from its root, no further");
+}
+
+static void test_explode_blast_footprint() {
+    // explode_for_each_blast_cell is the footprint simExplode actually sets: an
+    // isolated blast's distinct cells, the 923 of the 7.7 golden.
+    std::set<std::tuple<int, int, int>> fp;
+    ewb::explode_for_each_blast_cell(100, 100, 100, 0, 256, [&](int x, int y, int z) { fp.insert({x, y, z}); });
+    ZonedBlast b;
+    b.fw.cells[FakeWorld::key(100, 100, 100)] = {9, 0};
+    ewb::simExplode(b.w, 100, 100, 100);
+    std::set<std::tuple<int, int, int>> set;
+    for (const auto& kv : b.fw.cells)
+        set.insert({int(kv.first >> 40), int(kv.first & 0xFFFF), int((kv.first >> 16) & 0xFFFFFF)});
+    CHECK(fp.size() == 923 && fp == set, "the blast footprint matches what a blast writes");
+    size_t clipped = 0;
+    ewb::explode_for_each_blast_cell(100, 0, 100, 0, 256, [&](int, int y, int) { clipped += (y < 0); });
+    CHECK(clipped == 0, "the footprint is clipped to the world");
+}
+
+// --- protected zones: the restore (stage 8.2) --------------------------------
+
+static void test_zone_restore_wire() {
+    auto wire = [](bool present, int type, int color, int y = 40) {
+        std::string w;
+        ewb::zone_restore_wire(w, 7, y, 9, present, type, color);
+        return w;
+    };
+    CHECK(wire(true, 0, 0) == "ACTION:server:0:7:40:9:1\n", "stored air: a mine");
+    CHECK(wire(true, 5, 0) == "ACTION:server:0:7:40:9:1\nACTION:server:0:7:40:9:0:5\n",
+          "stored block: mine then build");
+    CHECK(wire(true, 5, 12) ==
+              "ACTION:server:0:7:40:9:1\nACTION:server:0:7:40:9:0:5\nACTION:server:0:7:40:9:3:12\n",
+          "stored painted block: mine, build, paint");
+    // Painted natural grass: the relay would be a lone paint, but the refused edit may
+    // have removed the block from the screen, so the restore rebuilds it.
+    CHECK(wire(true, 255, 12, 32) ==
+              "ACTION:server:0:7:32:9:1\nACTION:server:0:7:32:9:0:8\nACTION:server:0:7:32:9:3:12\n",
+          "painted natural block: mine, build the natural block, paint");
+    CHECK(wire(false, 0, 0, 32) == "ACTION:server:0:7:32:9:1\nACTION:server:0:7:32:9:0:8\n",
+          "untouched grass height: the natural grass comes back");
+    CHECK(wire(false, 0, 0, 20) == "ACTION:server:0:7:20:9:1\nACTION:server:0:7:20:9:0:3\n",
+          "untouched dirt height: dirt");
+    CHECK(wire(false, 0, 0, 0) == "ACTION:server:0:7:0:9:1\nACTION:server:0:7:0:9:0:1\n",
+          "untouched bedrock height: bedrock");
+    CHECK(wire(false, 0, 0, 33) == "ACTION:server:0:7:33:9:1\n", "untouched sky: just a mine");
+    CHECK(wire(true, 5, 99) == "ACTION:server:0:7:40:9:1\nACTION:server:0:7:40:9:0:5\n",
+          "an out-of-palette colour is not sent");
+    // A custom profile is honoured when given.
+    ewb::BaseProfile p;
+    p.layers.resize(41);
+    p.layers[40] = {42, 7};
+    std::string w;
+    ewb::zone_restore_wire(w, 1, 40, 2, false, 0, 0, p);
+    CHECK(w == "ACTION:server:0:1:40:2:1\nACTION:server:0:1:40:2:0:42\nACTION:server:0:1:40:2:3:7\n",
+          "an untouched cell restores from the profile it is given");
+}
+
+static void test_zone_cell_set() {
+    ewb::ZoneCellSet s(3);
+    CHECK(s.add(1, 2, 3) && !s.add(1, 2, 3), "a cell is added once");
+    CHECK(s.add(4, 5, 6) && s.add(7, 8, 9), "distinct cells are added");
+    CHECK(!s.add(10, 11, 12) && s.overflow() == 1 && s.size() == 3, "past the cap: refused and counted");
+    CHECK(!s.add(1, 2, 3) && s.overflow() == 1, "a repeat at the cap is a repeat, not an overflow");
+    const ewb::RevertCell first{1, 2, 3}, third{7, 8, 9};
+    CHECK(s.cells()[0] == first && s.cells()[2] == third, "first-seen order is kept");
+}
+
+static void test_revert_queue() {
+    ewb::RevertQueue<int> q;
+    const std::vector<ewb::RevertCell> one{{65536, 33, 65536}};
+    // A hundred mines on one protected block inside the delay: one restore.
+    size_t queued = 0;
+    for (int i = 0; i < 100; ++i) queued += q.push(10.0 + i * 0.001, 1, 0, one);
+    CHECK(queued == 1 && q.jobs() == 1 && q.pending() == 1, "100 denials of one cell coalesce to one restore");
+    // Another client denied the same cell gets their own.
+    CHECK(q.push(10.5, 2, 0, one) == 1, "coalescing is per client, not global");
+    // A burn restore mixed with a cell already queued: only the new cells are queued.
+    CHECK(q.push(11.0, 1, 0, {{65536, 33, 65536}, {1, 2, 3}}) == 1, "a batch skips cells already pending");
+
+    ewb::RevertQueue<int>::Job j;
+    CHECK(!q.pop_due(9.99, j), "nothing is sent before it is due");
+    CHECK(q.pop_due(10.0, j) && j.target == 1 && j.cells.size() == 1, "the earliest job comes first");
+    CHECK(!q.pop_due(10.2, j), "the next one is not due yet");
+    CHECK(q.pop_due(10.6, j) && j.target == 2, "then the second client's");
+    // Once sent, the cell can be restored again — the next denial is a new attempt.
+    CHECK(q.push(12.0, 1, 0, one) == 1, "a cell is queueable again once its restore went out");
+    CHECK(q.pop_due(100.0, j) && j.due == 11.0 && q.pop_due(100.0, j) && j.due == 12.0 && q.empty(),
+          "the rest drain in due order");
+
+    // Equal due times leave in push order.
+    q.push(20.0, 7, 70, {{1, 1, 1}});
+    q.push(20.0, 8, 80, {{1, 1, 1}});
+    CHECK(q.pop_due(20.0, j) && j.payload == 70 && q.pop_due(20.0, j) && j.payload == 80, "ties are FIFO");
+
+    // The pending cap drops, and counts.
+    ewb::RevertQueue<int> small(2);
+    size_t dropped = 0;
+    CHECK(small.push(1.0, 1, 0, {{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}, &dropped) == 2 && dropped == 1,
+          "past the pending cap a restore is dropped and counted");
+    CHECK(small.push(1.0, 1, 0, {{4, 4, 4}}, &dropped) == 0 && dropped == 2 && small.jobs() == 1,
+          "a push that admits nothing queues no job");
+}
+
+static void test_zone_audit_agg() {
+    ewb::ZoneAuditAgg a(10.0);
+    std::string line;
+    CHECK(a.note(0.0, "bob", "spawn", "mine", 1, 2, 3, line) &&
+              line == "denied mine in zone spawn at 1,2,3",
+          "the first denial is written at once");
+    int written = 0;
+    for (int i = 1; i <= 50; ++i) written += a.note(i * 0.1, "bob", "spawn", "mine", 1, 2, 3, line);
+    CHECK(written == 0, "denials inside the window are folded, not written");
+    CHECK(a.note(0.5, "bob", "museum", "build", 4, 5, 6, line), "another zone is its own window");
+    CHECK(a.note(0.5, "eve", "spawn", "mine", 1, 2, 3, line), "another player is their own window");
+    CHECK(a.flush(9.0).empty(), "nothing is flushed while the window is open");
+    auto out = a.flush(10.0);
+    CHECK(out.size() == 1 && out[0].first == "bob" &&
+              out[0].second == "denied 50 more edit(s) in zone spawn (last: mine at 1,2,3)",
+          "the folded count is written once the window closes");
+    // The flushed line opened a window of its own: a denial right after is folded.
+    CHECK(!a.note(10.5, "bob", "spawn", "paint", 1, 2, 3, line), "never two lines in one window");
+    out = a.flush(20.0);
+    CHECK(out.size() == 1 && out[0].second == "denied 1 more edit(s) in zone spawn (last: paint at 1,2,3)",
+          "and it is flushed in the next");
+    // Quiet pairs are forgotten, so the table does not grow with names seen once.
+    a.flush(40.0);
+    CHECK(a.size() == 0, "closed windows with nothing folded are dropped");
+    // A folded count still pending when the next denial arrives is carried onto it.
+    ewb::ZoneAuditAgg b(10.0);
+    b.note(0.0, "p", "z", "mine", 0, 0, 0, line);
+    b.note(1.0, "p", "z", "mine", 0, 0, 0, line);
+    CHECK(b.note(11.0, "p", "z", "build", 9, 9, 9, line) &&
+              line == "denied build in zone z at 9,9,9 (1 more before this)",
+          "a count not yet flushed rides on the next line");
 }
 
 // --- usernames (stage 1.7) ---------------------------------------------------
@@ -664,6 +1007,14 @@ static void test_token_bucket() {
     CHECK(!burn.allow(0.0, 9.0), "a cost above the whole burst can never be paid");
     CHECK(burn.allow(0.0, 8.0), "a cost exactly the burst can");
     CHECK(!burn.allow(0.0, 1.0), "...and empties it");
+
+    // Post-hoc charge (stage 7.19): may go into debt, bounded at one burst.
+    ewb::TokenBucket chain(8.0, 2.0);
+    CHECK(chain.allow(0.0, 4.0), "upfront cost paid");
+    chain.charge(0.0, 1000.0);
+    CHECK(chain.tokens == -8.0, "debt floored at minus one burst");
+    CHECK(!chain.allow(4.0, 1.0), "4 s repays the debt to 0 — still nothing to spend");
+    CHECK(chain.allow(4.5, 1.0), "the next token arrives after the debt is repaid");
 }
 
 // --- connect limiter (stage 1.7) ---------------------------------------------
@@ -1016,7 +1367,17 @@ int main() {
     test_prune_signs();
     test_cell_cap_headroom();
     test_explode_single_tnt_golden();
-    test_explode_chain_capped();
+    test_explode_chain_budget();
+    test_explode_cluster_completes();
+    test_explode_stays_in_world();
+    test_explode_protected_cells_untouched();
+    test_explode_protected_tnt_does_not_chain();
+    test_explode_reach();
+    test_explode_blast_footprint();
+    test_zone_restore_wire();
+    test_zone_cell_set();
+    test_revert_queue();
+    test_zone_audit_agg();
     test_spawn_parse();
     test_motd_parse();
     test_username_validation();

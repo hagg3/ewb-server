@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "durable_write.h"
 #include "eden_file.h"
 #include "eden_import.h"
 
@@ -82,27 +83,11 @@ static bool make_dirs(const std::string& path, std::string& err) {
     return true;
 }
 
-// Temp file + rename, the same discipline `saveWorld()` uses: a crash or a full
-// disk mid-write must never leave a truncated world where a whole one was.
+// Temp file + fsync + rename + directory fsync, the same discipline `saveWorld()`
+// uses (durable_write.h, stage 7.29): a crash, a power loss or a full disk
+// mid-write must never leave a truncated world where a whole one was.
 static bool write_atomic(const std::string& path, const std::string& body, std::string& err) {
-    const std::string tmp = path + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f) { err = "cannot open " + tmp + ": " + std::strerror(errno); return false; }
-        f.write(body.data(), std::streamsize(body.size()));
-        f.flush();
-        if (!f) {
-            err = "write error on " + tmp;
-            ::remove(tmp.c_str());
-            return false;
-        }
-    }
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-        err = "rename " + tmp + " -> " + path + " failed: " + std::strerror(errno);
-        ::remove(tmp.c_str());
-        return false;
-    }
-    return true;
+    return write_file_durable(path, body, err);
 }
 
 static std::string commas(size_t v) {
@@ -354,6 +339,12 @@ int main(int argc, char** argv) {
     // Every branch here is a no-op under --yes, --dry-run or a pipe.
     const bool ask_user = interactive() && !a.yes && !a.dry_run;
 
+    // The comparison table below already walks the world once per strategy; keep those
+    // results so the projection the run is judged on is not a fourth and fifth walk
+    // (stage 7.30). Keyed by AirFill; a.opt is unchanged between here and there except
+    // for the strategy itself, which is what the lookup at the bottom checks.
+    std::vector<std::pair<AirFill, ImportProjection>> probed;
+
     if (ask_user && !a.air_fill_set) {
         std::cerr << "\nStrategy — what becomes a stored cell:\n";
         std::cerr << "  name   cells         worst REGION   verdict\n";
@@ -362,6 +353,7 @@ int main(int argc, char** argv) {
             ImportOptions probe = a.opt;
             probe.air_fill = af;
             const ImportProjection pp = eden_project(world, probe);
+            probed.emplace_back(af, pp);
             std::string verdict = "ok";
             if (pp.sentinel_cells) verdict = "reserved block id 254/255 (refused)";
             else if (pp.cells > a.opt.max_world_cells) verdict = "over the cell cap";
@@ -428,7 +420,11 @@ int main(int argc, char** argv) {
     }
 
     // ── project ─────────────────────────────────────────────────────────────
-    const ImportProjection p = eden_project(world, a.opt);
+    ImportProjection p;
+    bool have_p = false;
+    for (const auto& kv : probed)
+        if (kv.first == a.opt.air_fill) { p = kv.second; have_p = true; break; }
+    if (!have_p) p = eden_project(world, a.opt);
 
     const std::string world_name = a.name.empty()
                                        ? eden_slug(world.hdr.name.empty() ? a.input : world.hdr.name)
@@ -490,6 +486,13 @@ int main(int argc, char** argv) {
                      " faithfully. First at x " << p.sentinel_at[0] << ", y "
                   << p.sentinel_at[1] << ", z " << p.sentinel_at[2] << ".\n";
         fatal = true;
+    }
+    if (world.dir_truncated) {
+        std::cerr << "eden_import: " << (a.opt.strict ? "error" : "warning") << ": the chunk"
+                     " directory has more than " << commas(EDEN_MAX_DIR_ENTRIES) << " rows;"
+                     " only the first " << commas(EDEN_MAX_DIR_ENTRIES) << " were read, so"
+                     " chunks past that point are missing from the import.\n";
+        if (a.opt.strict) fatal = true;
     }
     if (p.bad_type_cells) {
         std::cerr << "eden_import: " << (a.opt.strict ? "error" : "warning") << ": "

@@ -21,11 +21,13 @@
 // The CLI half shells out to `./eden_import`, which `build_server.sh` builds
 // first; run this suite from the repo root.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
@@ -213,6 +215,49 @@ static void test_worst_region_window() {
 
     // A smaller radius must yield a smaller window.
     CHECK(eden_worst_region(row, 16).records < 29, "worst region: honours --region-radius");
+}
+
+// Stage 7.30 restructured the sweep (sort once, window by binary search). Pin it to the
+// definition: the best box's low edge sits on a populated row and column, so try every
+// populated (cx, cy) pair as a corner and sum what falls inside.
+static size_t brute_worst_region(const std::vector<std::pair<std::pair<int, int>, size_t>>& pc, int W) {
+    size_t best = 0;
+    for (const auto& a : pc)
+        for (const auto& b : pc) {
+            const int x0 = a.first.first, y0 = b.first.second;
+            size_t sum = 0;
+            for (const auto& e : pc)
+                if (e.first.first >= x0 && e.first.first < x0 + W &&
+                    e.first.second >= y0 && e.first.second < y0 + W)
+                    sum += e.second;
+            best = std::max(best, sum);
+        }
+    return best;
+}
+
+static void test_worst_region_matches_brute_force() {
+    const int W = 29;
+    uint32_t seed = 12345;
+    auto rnd = [&](uint32_t n) { seed = seed * 1664525u + 1013904223u; return (seed >> 8) % n; };
+    for (int round = 0; round < 40; ++round) {
+        // Clusters plus strays, on a span a few windows wide so boxes genuinely compete.
+        std::vector<std::pair<std::pair<int, int>, size_t>> pc;
+        std::set<std::pair<int, int>> seen;
+        const int n = 5 + int(rnd(60));
+        for (int i = 0; i < n; ++i) {
+            const std::pair<int, int> at{int(rnd(90)) - 20, int(rnd(90)) - 20};
+            if (seen.insert(at).second) pc.push_back({at, 1 + rnd(50)});
+        }
+        CHECK(eden_worst_region(pc).records == brute_worst_region(pc, W),
+              "worst region: matches the brute-force definition");
+    }
+
+    // Wide and sparse: one chunk per column across the whole coordinate space. This is
+    // the shape that made the old rescan quadratic; it must now finish instantly and
+    // still see the 29-column window.
+    std::vector<std::pair<std::pair<int, int>, size_t>> wide;
+    for (int i = 0; i < 20000; ++i) wide.push_back({{i * 2, 7}, 1});
+    CHECK(eden_worst_region(wide).records == 15, "worst region: wide sparse world (15 of every 29 columns)");
 }
 
 static void test_worst_region_uses_records_not_cells() {
@@ -617,6 +662,7 @@ int main() {
     test_diff_carved_counts();
     test_record_cost_matches_the_wire();
     test_worst_region_window();
+    test_worst_region_matches_brute_force();
     test_worst_region_uses_records_not_cells();
     test_sentinel_and_paint_flags();
     test_sign_rename_and_grammar();

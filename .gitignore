@@ -17,6 +17,7 @@ LatestREF/
 /out_queue_test
 /protocol_test
 /matchmaker_test
+/durable_write_test
 /control_test
 /worldedit_test
 /eden_names_test
@@ -25,6 +26,10 @@ LatestREF/
 /eden_import_test
 /eden_export
 /eden_export_test
+/zones_test
+/auth_test
+/topmap_test
+/world_store_test
 *.o
 *.obj
 
@@ -38,6 +43,8 @@ LatestREF/
 /eden_world.edits
 /eden_bans.txt
 /eden_ops.txt
+/eden_zones.txt
+/eden_auth.txt
 /edenserver.sock
 
 # --- Logs ---
@@ -56,3 +63,6 @@ TCPServer/
 
 # --- OS cruft ---
 .DS_Store
+
+# --- Claude Code local state (worktrees, session files) ---
+/.claude/

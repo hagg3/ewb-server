@@ -164,6 +164,7 @@ Your position is remembered by username, so rejoining puts you back where you le
 | `[Server] client #N (<ip>) sent no JOIN within 15s; dropping.` | A connection opened but never sent `JOIN` inside the handshake window. Usually a port scanner. Tune with `--handshake-timeout`. |
 | Bind fails on startup | Another process holds the port. |
 | Edits vanish on rejoin | The per-connection edit budget dropped them. Raise `--action-rate` / `--action-burst`. |
+| `[Server] That explosion chain was too big to finish` (and TNT is back after a rejoin) | A single detonation chained past `--burn-max-cells`, the budget that stops one packet holding the world lock. Raise it if it happens in ordinary play. |
 
 ## What this does not cover
 

@@ -230,6 +230,20 @@ public:
         return true;
     }
 
+    /// `push_reply` for a blob the caller shares rather than owns (stage 7.30): the
+    /// `SIGNQ` burst is one immutable string every client is answered from, so a
+    /// request costs a refcount bump instead of a copy of up to a few hundred KB.
+    /// Same admission rule and accounting as the `std::string` overload.
+    bool push_reply(const std::shared_ptr<const std::string>& blob) {
+        if (!blob || blob->empty()) return true;
+        if (lo_bytes_ + blob->size() > lim_.lo_max_bytes) return false;
+        lo_bytes_ += blob->size();
+        Slot s; s.kind = Slot::Kind::Shared; s.shared_blob = blob;
+        lo_.push_back(std::move(s));
+        note_peak();
+        return true;
+    }
+
     /// Queue a `REGION` reply for lazy encoding. False means this client already
     /// has `max_region_jobs` in flight: refuse the request, the same answer the
     /// 750 ms gap limiter gives. Region jobs are bounded by count (and, in the

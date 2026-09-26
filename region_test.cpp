@@ -79,7 +79,7 @@ static void test_region_box() {
     const ewb::RegionBox origin = ewb::region_box(0, 0);
     CHECK(origin.x0 == -224 && origin.z0 == -224, "box at the origin floors below zero");
 
-    // VuencLink's lattice: consecutive stride-spaced boxes must not leave a gap.
+    // Reference test client's lattice: consecutive stride-spaced boxes must not leave a gap.
     const int stride = 2 * ewb::REGION_RADIUS;
     for (int c = 65000; c < 65000 + 3 * stride; c += stride) {
         const ewb::RegionBox a = ewb::region_box(c, 0);

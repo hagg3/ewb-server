@@ -42,6 +42,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <sys/random.h>   // getentropy — PINs and salts (stage 8.6)
 #include <netinet/in.h>
 #include <netinet/tcp.h>   // TCP_NODELAY — disables Nagle on client sockets (stage 7.11)
 #include <arpa/inet.h>
@@ -73,6 +74,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cmath>          // lroundf — Tier 2 positions are floats on the wire
+#include <climits>        // LLONG_MAX — /zone create takes a selection of any size
 #include <ctime>          // gmtime_r/strftime — the audit log's UTC stamp (stage 3.4)
 
 #include "region_query.h"   // REGION reply geometry + Cell -> record table (stage 1.1)
@@ -86,6 +88,12 @@
 #include "worldedit.h"      // Tier 2 player command surface              (stage 3.3)
 #include "explode.h"        // TNT/paint explosion chain, bounded fan-out (stage 7.7)
 #include "world_store.h"    // 16^3 chunk store + EDMB format + text load (stage 7.6)
+#include "durable_write.h"  // temp + fsync + rename + dir fsync          (stage 7.29)
+#include "zones.h"          // eden_zones.txt: protected boxes             (stage 8.1)
+#include "zone_guard.h"     // restore wire, revert queue, audit folding   (stage 8.2)
+#include "auth.h"           // eden_auth.txt: per-name PINs, /login        (stage 8.6)
+#include "topmap.h"         // topmap: bounded top-down height map          (stage 8.5)
+#include "base_profile.h"   // the terrain the client draws for itself
 
 typedef int SOCKET;
 constexpr SOCKET INVALID_SOCKET = -1;
@@ -102,6 +110,10 @@ struct PlayerInfo {
     float posX = 0, posY = 0, posZ = 0;
     float velX = 0, velY = 0, velZ = 0;
     std::string ip;                 // peer address, for `who` and IP bans (stage 3.2)
+    // Logged in with this name's PIN (stage 8.6). Written under clientsMutex by
+    // `/login` and cleared by `passwd`/`unpasswd`; read by the level and zone
+    // checks. Always false for a name with no PIN.
+    bool verified = false;
 };
 
 std::vector<SOCKET> clients;
@@ -189,6 +201,22 @@ size_t      g_weUndoBudget = ewb::WE_UNDO_BUDGET_BYTES;  // per-player undo+redo
 double      g_weCellRate   = ewb::WE_CELL_RATE;          // cells/sec a player may spend; 0 = unlimited (--we-rate)
 double      g_weCellBurst  = ewb::WE_CELL_BURST;         // cells they may spend at once (--we-burst)
 
+// Work one BURN's explosion chain may do, in cells read, before it is truncated
+// (stage 7.19, --burn-max-cells). This is a *lock-hold* bound: simAction holds
+// g_worldMtx for the whole chain, so it is the one thing one packet can make every
+// other player wait for. See explode.h for how the budget is spent.
+size_t      g_burnMaxCells = ewb::EXPLODE_DEFAULT_MAX_VISITS;
+
+// --- Protected zones (stage 8.2) ---------------------------------------------
+std::string g_zonesFile  = "";                    // eden_zones.txt; empty -> derived from the world dir (--zones-file)
+// How long after a refused edit the restore is sent (--zone-revert-delay-ms). 0 sends
+// it at once. ⚠️ The default is a placeholder: whether the retail client needs the
+// restore to trail its own handling of the edit is not yet measured.
+int         g_zoneRevertDelayMs = ewb::ZONE_REVERT_DEFAULT_DELAY_MS;
+
+// --- Player identity (stage 8.6) ---------------------------------------------
+std::string g_authFile   = "";                    // eden_auth.txt; empty -> derived from the world dir (--auth-file)
+
 // Per-client output queue bounds (stage 7.3). The policy these feed lives in
 // out_queue.h; these are the numbers an operator can move. See docs/configuration.md.
 size_t      g_outboxMax     = 1u << 20;      // --client-outbox-max: movement/chat backlog bytes
@@ -235,10 +263,10 @@ static const int    SV_MAX_CLIENTS    = 64;        // reject connections beyond 
 
 // REGION is the single most expensive thing a client can ask for and a trivial
 // amplification vector (a ~20-byte request producing megabytes of reply), so it is
-// paced per connection. 750 ms matches VuencLink's `net::region::REGION_MIN_GAP`
-// and the session cap its `MAX_REGIONS_PER_SESSION`. ⚠️ These are *our* limits, not
-// client etiquette — VuencLink imposes the same numbers on itself, but a hostile or
-// buggy client has no such scruples.
+// paced per connection. 750 ms matches a reference test client's own
+// `net::region::REGION_MIN_GAP` and the session cap its `MAX_REGIONS_PER_SESSION`.
+// ⚠️ These are *our* limits, not client etiquette — the reference client imposes
+// the same numbers on itself, but a hostile or buggy client has no such scruples.
 static const long SV_REGION_MIN_GAP_MS = 750;
 static const int  SV_MAX_REGIONS_PER_SESSION = 256;
 
@@ -258,11 +286,11 @@ static const double SV_SIGNP_RATE  = 1.0;
 
 // Per-connection ACTION budget (stage 1.7, retuned by 1.8 rung 2/3).
 // ⚠️ The original 8/s + 64 burst was sized for a *human* placing blocks by hand. It
-// silently shreds a legitimate bulk edit: VuencLink's "arm interact + fill a box"
-// drains its own queue at ~500 lines/s (default `net::queue` rate), so a 1728-cell
-// box arrived as ~96 scattered survivors and the rest were dropped at ingest —
-// exactly the "most of my box is gone on reconnect" bug 1.8 found. The defaults now
-// accommodate VuencLink's default drain rate; a public operator can tighten them
+// silently shreds a legitimate bulk edit: a reference test client's "arm interact
+// + fill a box" drains its own queue at ~500 lines/s (default `net::queue` rate), so
+// a 1728-cell box arrived as ~96 scattered survivors and the rest were dropped at
+// ingest — exactly the "most of my box is gone on reconnect" bug 1.8 found. The
+// defaults now accommodate that client's default drain rate; a public operator can tighten them
 // with --action-rate / --action-burst (0 = unlimited). ⚠️ BURN still costs far more
 // because one ACTION can write hundreds of cells server-side: simExplode's radius-6
 // sphere, times its chain depth.
@@ -366,9 +394,84 @@ std::string detectLanIP() {
 // table at the top of world_store.h. Nothing in this file may see a 254.
 using Cell = ewb::WorldCell;
 static ewb::WorldStore g_world;
-static std::mutex g_worldMtx;        // lock order: before g_signMtx, never after it (see Signs)
+// ⚠️ Lock order: g_zonesMtx is taken and **released** before g_worldMtx — an edit path
+// copies the zone snapshot out first, then locks the world. Nothing holds g_zonesMtx
+// while taking any other lock, so it can never sit inside g_worldMtx.
+static std::mutex g_worldMtx;        // lock order: after g_zonesMtx (released), before g_signMtx, never after it (see Signs)
 static std::mutex g_saveMtx;         // serializes on-disk writes (world + players)
 std::atomic<bool> editsDirty{false};
+
+// Protected zones (stage 8.2; model in zones.h). The set is immutable once published:
+// a change swaps in a new one, so a hot path copies the pointer under g_zonesMtx and
+// reads the set with no lock at all — the zone lock is never held across a world edit.
+static std::mutex                           g_zonesMtx;   // guards the pointer only
+static std::shared_ptr<const ewb::ZoneSet>  g_zones = std::make_shared<const ewb::ZoneSet>();
+// Serializes the control socket's zone:* writers against each other (stage 8.3):
+// each one reads a snapshot, mutates a private copy, saves it, then swaps the
+// pointer under g_zonesMtx above. Without this, two concurrent zone edits could
+// both read the same snapshot and one's write would silently lose the other's.
+// Never held across g_worldMtx or a broadcast — control commands only.
+static std::mutex                           g_zonesEditMtx;
+
+static std::shared_ptr<const ewb::ZoneSet> zonesSnapshot() {
+    std::lock_guard<std::mutex> lk(g_zonesMtx);
+    return g_zones;
+}
+
+// One edit's view of the zones: the snapshot, taken before g_worldMtx, and who is
+// asking. `level` is the editor's zone-bypass level (auth.h): their op level only if
+// they have logged in with a PIN this session (stage 8.6), otherwise -1, which
+// bypasses nothing. A claimed name is not an identity, so an op who has not logged
+// in is held by every zone like anyone else.
+struct ZoneCheck {
+    std::shared_ptr<const ewb::ZoneSet> zones;
+    int level = -1;
+};
+static int sessionLevel(const std::string& name, bool verified);   // after the ops file
+
+// Whether this connection has logged in, and under which name. False for a socket
+// not in the roster. Takes clientsMutex only.
+static bool sessionIdentity(SOCKET s, std::string& name) {
+    std::lock_guard<std::mutex> lk(clientsMutex);
+    auto it = playerInfoMap.find(s);
+    if (it == playerInfoMap.end()) return false;
+    name = it->second.username;
+    return it->second.verified;
+}
+
+// The zone view for an edit by the player on `s`. Who is asking is only looked up
+// when some enforcing zone names a bypass level — otherwise nobody bypasses
+// anything and the answer is -1 for free. Never call with clientsMutex held.
+static ZoneCheck zoneCheck(SOCKET s) {
+    ZoneCheck zc{zonesSnapshot(), -1};
+    if (zc.zones && zc.zones->hasBypassLevels()) {
+        std::string name;
+        if (sessionIdentity(s, name))
+            zc.level = ewb::auth_zone_bypass_level(sessionLevel(name, true), true);
+    }
+    return zc;
+}
+
+// **The** zone predicate — every player edit path asks this and nothing else: ACTION
+// build/mine/paint/burn, the explosion chain, a player's sign write and every WorldEdit
+// write. The control socket never asks: it is the operator.
+static const ewb::Zone* zoneDenies(const ZoneCheck& zc, int x, int y, int z) {
+    return zc.zones ? zc.zones->blocking(x, y, z, zc.level) : nullptr;
+}
+
+// The zones that meet a box, as a smaller check of their own; empty when none do,
+// which is the common case and costs one pass over the set. The explosion chain
+// asks per cell, up to --burn-max-cells times, so it asks this instead of the whole set.
+static ZoneCheck zoneCheckNear(const ZoneCheck& zc, int x0, int y0, int z0, int x1, int y1, int z1) {
+    ZoneCheck near{nullptr, zc.level};
+    if (!zc.zones || !zc.zones->intersects(x0, y0, z0, x1, y1, z1)) return near;
+    auto sub = std::make_shared<ewb::ZoneSet>();
+    for (const ewb::Zone& zn : zc.zones->zones())
+        if (zn.enforced && !zn.bypassedBy(zc.level) && zn.overlaps(x0, y0, z0, x1, y1, z1)) sub->add(zn);
+    if (sub->size() == 0) return near;   // every zone in reach is one this editor bypasses
+    near.zones = std::move(sub);
+    return near;
+}
 
 // Block constants mirrored from the game's Constants.h.
 enum { SV_AIR=0, SV_BEDROCK=1, SV_TNT=9, SV_FIREWORK=65, SV_STEEL=74, SV_PAINTED_BASE=255 };
@@ -417,7 +520,12 @@ static void removeSignsOnBlock(uint64_t k);
 // the sign hook lives here: every edit that turns a cell to air — mine, burn, a blast,
 // setblock/fill, every WorldEdit command, //paste, //undo, //redo — passes through it.
 // A cell the cap refuses is left alone, and so are its signs.
+//
+// A coordinate outside the world (ewb::ws_in_world) is refused before the cap
+// check, which would otherwise test an aliased cell (ROADMAP-SERVER 7.22). Every
+// caller validates first; this is the backstop, and it is not a cap refusal.
 static bool worldSet(int x,int y,int z,int type,int color){
+    if(!ewb::ws_in_world(x,y,z)) return false;
     uint64_t k = wkey(x,y,z);
     // Cap the number of distinct edited cells so a malicious/buggy client can't
     // grow the map (and the on-disk save) without bound. Updates to existing
@@ -440,7 +548,7 @@ static bool worldSet(int x,int y,int z,int type,int color){
         }
         return false;
     }
-    g_world.set(x, y, z, (unsigned char)type, (unsigned char)color);
+    if(!g_world.set(x, y, z, (unsigned char)type, (unsigned char)color)) return false;
     editsDirty = true;
     // A sign hangs on a block; a block that is now air has no face left to hang one on.
     if(type==SV_AIR) removeSignsOnBlock(k);
@@ -451,42 +559,93 @@ static bool worldGet(int x,int y,int z, Cell& out){
 }
 
 // Simulate a TNT / paint explosion centred on (x,y,z). The algorithm itself
-// (worklist, chain cap, depth guard — ROADMAP-SERVER 7.7) lives in explode.h so
-// it can be unit-tested offline; this just wires it to g_world. Caller holds
-// g_worldMtx. Cells the cap refuses, and chain links dropped once
-// ewb::EXPLODE_MAX_CHAIN explosions have been processed, are added to `refused`.
-static void simExplode(int cx,int cy,int cz, size_t& refused){
-    ewb::ExplodeWorld w;
-    w.get = [](int x,int y,int z, ewb::ExplodeCell& out) -> bool {
-        Cell c; if(!worldGet(x,y,z,c)) return false;
-        out.type = c.type; out.color = c.color; return true;
-    };
-    w.set = [](int x,int y,int z,int type,int color) -> bool {
-        return worldSet(x,y,z,type,color);
-    };
-    w.airType = SV_AIR; w.tntType = SV_TNT; w.fireworkType = SV_FIREWORK;
-    w.bedrockType = SV_BEDROCK; w.steelType = SV_STEEL; w.paintedBaseType = SV_PAINTED_BASE;
-    w.yMin = 0; w.yMax = 1024;
-    refused += ewb::simExplode(w, cx, cy, cz);
+// (worklist, depth guard, cell-visit budget — ROADMAP-SERVER 7.7 / 7.19) lives in
+// explode.h so it can be unit-tested offline; this just wires it to g_world.
+// Caller holds g_worldMtx.
+//
+// The accessors are plain member functions, not std::function: a chain reads up to
+// --burn-max-cells cells, and every one of them was an indirect call (7.19).
+//
+// The blast sphere reaches EXPLODE_RADIUS past its centre, so a TNT at the edge of
+// the world reaches outside it. y is clipped by yMin/yMax inside the algorithm;
+// x/z (only reachable from a TNT within 5 blocks of x or z = 0 / 0xFFFFFF) are
+// clipped here: outside the world there is nothing to read, and nothing to write —
+// which is not a cap refusal, so `set` reports success (ROADMAP-SERVER 7.22).
+//
+// Protected zones (stage 8.2): `zb`, when set, carries the zones within the chain's
+// reach, and every cell the blast was refused is collected into it for the restore.
+// Every client simulated the blast itself and did destroy those cells.
+struct ZoneBlast {
+    ZoneCheck near;                               // zones within EXPLODE_REACH of the root
+    ewb::ZoneCellSet hit{ewb::ZONE_BURN_RESTORE_MAX};   // cells to put back, deduplicated
+    std::vector<ewb::RevertCell> explosives;      // protected TNT/fireworks: clients chain these
+    std::string zone;                             // the first zone the blast hit, for the notice
+    int fx = 0, fy = 0, fz = 0;                   // ...and where
+};
+
+struct SvExplodeWorld {
+    ZoneBlast* zb = nullptr;
+    // Caller holds g_worldMtx. Called before the cell is read, once per sample.
+    bool protectedAt(int x, int y, int z) const {
+        if (!zb || !zb->near.zones) return false;
+        const ewb::Zone* zn = zoneDenies(zb->near, x, y, z);
+        if (!zn) return false;
+        if (zb->hit.empty()) { zb->zone = zn->name; zb->fx = x; zb->fy = y; zb->fz = z; }
+        if (zb->hit.add(x, y, z)) {
+            Cell c;
+            if (worldGet(x, y, z, c) && (c.type == SV_TNT || c.type == SV_FIREWORK))
+                zb->explosives.push_back({x, y, z});
+        }
+        return true;
+    }
+    bool get(int x, int y, int z, ewb::ExplodeCell& out) const {
+        if (!ewb::ws_in_world(x, y, z)) return false;
+        Cell c;
+        if (!worldGet(x, y, z, c)) return false;
+        out.type = c.type; out.color = c.color;
+        return true;
+    }
+    bool set(int x, int y, int z, int type, int color) const {
+        if (!ewb::ws_in_world(x, y, z)) return true;
+        return worldSet(x, y, z, type, color);
+    }
+    int airType = SV_AIR, tntType = SV_TNT, fireworkType = SV_FIREWORK;
+    int bedrockType = SV_BEDROCK, steelType = SV_STEEL, paintedBaseType = SV_PAINTED_BASE;
+    int yMin = 0;
+    // Exclusive. Was 1024: a TNT at y 255 wrote y 256..260 into chunks no REGION
+    // reply ever reads, counted against the cap and saved forever (7.22).
+    int yMax = SV_WORLD_HEIGHT;
+};
+static_assert(SvExplodeWorld{}.yMax == ewb::WS_WORLD_HEIGHT,
+              "the blast must clip at the height the chunk store's box sweep covers");
+
+static ewb::ExplodeResult simExplode(int cx,int cy,int cz, ZoneBlast* zb){
+    SvExplodeWorld w;
+    w.zb = zb;
+    return ewb::simExplode(w, cx, cy, cz, g_burnMaxCells);
 }
 
 // Apply one terrain action to the model. mode: 0 build 1 mine 2 burn 3 paint.
-// Returns how many cells the world cell cap refused; 0 means the whole action landed.
-static size_t simAction(int mode,int x,int y,int z,int extra){
+// `refused` counts cells the world cell cap refused; the rest of the result is a
+// BURN's chain accounting (stage 7.19) and is zero for every other mode.
+//
+// The caller has already refused an edit *on* a protected cell (stage 8.2); `zb` is
+// only for a burn, whose blast can reach into a zone from outside it.
+static ewb::ExplodeResult simAction(int mode,int x,int y,int z,int extra, ZoneBlast* zb){
     std::lock_guard<std::mutex> lk(g_worldMtx);
-    size_t refused = 0;
+    ewb::ExplodeResult res;
     switch(mode){
-        case 0: if(!worldSet(x,y,z, extra, 0)) ++refused; break;  // BUILD (extra=type)
-        case 1: if(!worldSet(x,y,z, SV_AIR, 0)) ++refused; break; // MINE
+        case 0: if(!worldSet(x,y,z, extra, 0)) ++res.refused; break;  // BUILD (extra=type)
+        case 1: if(!worldSet(x,y,z, SV_AIR, 0)) ++res.refused; break; // MINE
         case 3: { Cell c; bool have=worldGet(x,y,z,c);            // PAINT (extra=color)
-                  if(!worldSet(x,y,z, have? c.type : SV_PAINTED_BASE, extra)) ++refused;
+                  if(!worldSet(x,y,z, have? c.type : SV_PAINTED_BASE, extra)) ++res.refused;
                   break; }
         case 2: { Cell c; bool have=worldGet(x,y,z,c);            // BURN
-                  if(have && (c.type==SV_TNT || c.type==SV_FIREWORK)) simExplode(x,y,z,refused);
+                  if(have && (c.type==SV_TNT || c.type==SV_FIREWORK)) res = simExplode(x,y,z, zb);
                   else if(have && c.type!=SV_AIR) worldSet(x,y,z, SV_AIR, 0);
                   break; }
     }
-    return refused;
+    return res;
 }
 
 // Read the world file. **Both formats load** (stage 7.6): the first four bytes
@@ -521,6 +680,14 @@ void loadWorld() {
         std::cerr << "[Server] warning: " << g_world.reserved_coerced()
                   << " cell(s) in " << g_worldFile << " used the reserved block type 254"
                      " and were loaded as mined air (see world_store.h)." << std::endl;
+    // A cell outside the world (y >= 256 — which a pre-7.22 server's TNT could write
+    // and save — or y/x/z negative or past 24 bits in a hand-made file) was never
+    // visible to any client and cannot be edited by any player. Dropped, not aliased.
+    if (g_world.out_of_range())
+        std::cerr << "[Server] warning: dropped " << g_world.out_of_range()
+                  << " cell(s) in " << g_worldFile << " outside the world (y 0.."
+                  << (SV_WORLD_HEIGHT - 1) << ", x/z 0..16777215); the next save omits them."
+                  << std::endl;
     std::cout << "[Server] Loaded " << g_world.size() << " world cells from " << g_worldFile
               << " (" << (binary ? "EDMB" : "legacy text") << ", " << g_world.chunk_count()
               << " chunks)" << std::endl;
@@ -554,23 +721,19 @@ void saveWorld() {
         g_saveLockMicros.fetch_add(us, std::memory_order_relaxed);
         bumpMax(g_saveLockMaxMicros, us);
     }
-    // Atomic, serialized write: fill a temp file then rename() over the real one,
-    // so a crash/kill mid-write can never leave a truncated world, and two
-    // concurrent saves (disconnect + timer) can't interleave.
+    // Atomic, durable, serialized write (stage 7.29): temp file -> fsync -> rename() over
+    // the real one -> fsync the directory, so neither a crash mid-write nor a power loss
+    // right after the rename can leave a truncated world, and two concurrent saves
+    // (disconnect + timer) can't interleave. This runs outside g_worldMtx, so the fsyncs
+    // delay other saves, never a player's ACTION; their cost is logged below.
     std::lock_guard<std::mutex> save(g_saveMtx);
-    std::string tmp = g_worldFile + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::trunc | std::ios::binary);
-        if(!f){ std::cerr << "[Server] save: cannot open " << tmp << std::endl; editsDirty = true; return; }
-        f.write(blob.data(), (std::streamsize)blob.size());
-        f.flush();
-        if(!f){ std::cerr << "[Server] save: write error to " << tmp << std::endl; editsDirty = true; return; }
-        g_saveBytes.store((uint64_t)blob.size(), std::memory_order_relaxed);
-    }
-    if(std::rename(tmp.c_str(), g_worldFile.c_str()) != 0){
-        std::cerr << "[Server] save: rename " << tmp << " -> " << g_worldFile << " failed" << std::endl;
+    std::string err;
+    uint64_t syncUs = 0;
+    if (!ewb::write_file_durable(g_worldFile, blob, err, &syncUs)) {
+        std::cerr << "[Server] save: " << err << std::endl;
         editsDirty = true; return;
     }
+    g_saveBytes.store((uint64_t)blob.size(), std::memory_order_relaxed);
     const uint64_t writeUs = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                                  std::chrono::steady_clock::now() - tSave1).count();
     g_saveCount.fetch_add(1, std::memory_order_relaxed);
@@ -578,7 +741,8 @@ void saveWorld() {
     std::cout << "[Server] Saved world (" << cells << " cells, cap " << g_maxWorldCells
               << ", " << g_saveBytes.load(std::memory_order_relaxed) << " B, snapshot "
               << (std::chrono::duration_cast<std::chrono::microseconds>(tSave1 - tSave0).count() / 1000)
-              << " ms under lock, write " << (writeUs / 1000) << " ms)." << std::endl;
+              << " ms under lock, write " << (writeUs / 1000) << " ms, of which fsync "
+              << (syncUs / 1000) << " ms)." << std::endl;
 }
 
 // --- Player position persistence ----------------------------------------------
@@ -702,37 +866,25 @@ void savePlayerPos() {
         snap.reserve(g_playerPos.size());
         g_playerPos.for_each([&](const std::string& k, const SavedPos& v) { snap.emplace_back(k, v); });
     }
-    std::lock_guard<std::mutex> save(g_saveMtx);   // atomic temp+rename, serialized
-    std::string tmp = g_posFile + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::trunc);
-        if(!f){ std::cerr << "[Server] save: cannot open " << tmp << std::endl; g_posDirty = true; return; }
-        for (const auto& kv : snap)
-            f << kv.first << ":" << kv.second.x << ":" << kv.second.y << ":" << kv.second.z << "\n";
-        f.flush();
-        if(!f){ std::cerr << "[Server] save: write error to " << tmp << std::endl; g_posDirty = true; return; }
-    }
-    if(std::rename(tmp.c_str(), g_posFile.c_str()) != 0){
-        std::cerr << "[Server] save: rename " << tmp << " -> " << g_posFile << " failed" << std::endl;
-        g_posDirty = true; return;
+    std::ostringstream body;
+    for (const auto& kv : snap)
+        body << kv.first << ":" << kv.second.x << ":" << kv.second.y << ":" << kv.second.z << "\n";
+    std::lock_guard<std::mutex> save(g_saveMtx);   // durable temp+rename, serialized
+    std::string err;
+    if (!ewb::write_file_durable(g_posFile, body.str(), err)) {
+        std::cerr << "[Server] save: " << err << std::endl;
+        g_posDirty = true;
     }
 }
 
-// Write `content` to `path` atomically (temp file + rename), serialized on
-// g_saveMtx like the world/player writes so a crash mid-write can't truncate a
-// sidecar and two writers can't interleave. Returns false on error.
+// Write `content` to `path` atomically and durably (temp file + fsync + rename + directory
+// fsync, stage 7.29), serialized on g_saveMtx like the world/player writes so a crash
+// mid-write can't truncate a sidecar and two writers can't interleave. Returns false on error.
 static bool writeFileAtomic(const std::string& path, const std::string& content) {
     std::lock_guard<std::mutex> save(g_saveMtx);
-    const std::string tmp = path + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::trunc);
-        if (!f) { std::cerr << "[Server] write: cannot open " << tmp << std::endl; return false; }
-        f << content;
-        f.flush();
-        if (!f) { std::cerr << "[Server] write: error writing " << tmp << std::endl; return false; }
-    }
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-        std::cerr << "[Server] write: rename " << tmp << " -> " << path << " failed" << std::endl;
+    std::string err;
+    if (!ewb::write_file_durable(path, content, err)) {
+        std::cerr << "[Server] write: " << err << std::endl;
         return false;
     }
     return true;
@@ -793,6 +945,19 @@ static std::mutex    g_opsMtx;
 static ewb::AuthFailureLimiter g_authFail;
 static std::mutex              g_authFailMtx;
 
+// Per-name PINs (stage 8.6; model in auth.h). ⚠️ Lock order: g_authMtx may be taken
+// *before* clientsMutex (a login publishes `verified` under both, so a concurrent
+// `passwd` cannot slip between the check and the flag), never after it — nothing
+// that holds clientsMutex takes g_authMtx. g_authEditMtx serializes the control
+// socket's passwd/unpasswd writers, like g_zonesEditMtx.
+static ewb::AuthFile g_auth;
+static std::mutex    g_authMtx;
+static std::mutex    g_authEditMtx;
+// Failed `/login`s per IP: the same escalating lockout as the JOIN password
+// (stage 1.10), in its own table so a typo'd PIN never locks an IP out of joining.
+static ewb::AuthFailureLimiter g_loginFail;
+static std::mutex              g_loginFailMtx;
+
 void loadBans() {
     std::ifstream f(g_banFile);
     if (!f) return;
@@ -820,6 +985,115 @@ void saveOps() {
     writeFileAtomic(g_opsFile, ss.str());
 }
 
+// eden_zones.txt (stage 8.2; grammar in zones.h). No file is the normal case: no zones,
+// nothing said. A file that fails to parse is a **refusal to start**, not a warning —
+// the loader is all-or-nothing, so carrying on would silently open every zone the
+// operator meant to protect. Returns false with `err` set.
+static bool loadZones(std::string& err) {
+    std::ifstream f(g_zonesFile);
+    if (!f) return true;
+    ewb::ZoneSet set;
+    std::string why;
+    int line = 0;
+    if (!ewb::ZoneSet::load(f, set, &why, &line)) {
+        err = g_zonesFile + ":" + std::to_string(line) + ": " + why;
+        return false;
+    }
+    bool anyPins;
+    { std::lock_guard<std::mutex> lk(g_authMtx); anyPins = !g_auth.empty(); }
+    size_t enforced = 0;
+    for (const ewb::Zone& z : set.zones()) {
+        if (z.enforced) ++enforced;
+        if (z.enforced && z.hasLevel && !anyPins)
+            std::cerr << "[Server] zone '" << z.name << "' is bypassed by players logged in at level "
+                      << z.level << "+, but no name has a PIN yet, so nobody can bypass it"
+                         " (edenctl passwd <name>)." << std::endl;
+    }
+    const size_t n = set.size();
+    {
+        std::lock_guard<std::mutex> lk(g_zonesMtx);
+        g_zones = std::make_shared<const ewb::ZoneSet>(std::move(set));
+    }
+    std::cout << "[Server] Loaded " << n << " zone(s) from " << g_zonesFile << " (" << enforced
+              << " enforced)." << std::endl;
+    return true;
+}
+
+// Save `next` durably and publish it as the live set (stage 8.3; shared with the
+// in-game /zone of 8.7). The caller holds g_zonesEditMtx and built `next` from the
+// current snapshot, so no concurrent zone edit is lost.
+static bool zonePublish(ewb::ZoneSet&& next, std::string& err) {
+    if (!ewb::zone_save_file(g_zonesFile, next, err)) return false;
+    std::lock_guard<std::mutex> lk(g_zonesMtx);
+    g_zones = std::make_shared<const ewb::ZoneSet>(std::move(next));
+    return true;
+}
+
+// eden_auth.txt (stage 8.6; grammar in auth.h). No file is normal: no PINs, and
+// every name behaves as it did before 8.6. A file that fails to parse refuses the
+// start, like eden_zones.txt: running on without it would hand every PIN-protected
+// name's op level back to whoever claims the name.
+static bool loadAuth(std::string& err) {
+    std::ifstream f(g_authFile);
+    if (!f) return true;
+    ewb::AuthFile set;
+    std::string why;
+    int line = 0;
+    if (!ewb::AuthFile::load(f, set, &why, &line)) {
+        err = g_authFile + ":" + std::to_string(line) + ": " + why;
+        return false;
+    }
+    struct stat st;
+    if (::stat(g_authFile.c_str(), &st) == 0 && (st.st_mode & 077))
+        std::cerr << "[Server] warning: " << g_authFile << " is readable by other users (mode "
+                  << std::oct << (st.st_mode & 0777) << std::dec
+                  << "); it holds PIN hashes — chmod 600 it." << std::endl;
+    const size_t n = set.size();
+    { std::lock_guard<std::mutex> lk(g_authMtx); g_auth = std::move(set); }
+    if (n) std::cout << "[Server] Loaded " << n << " login PIN(s) from " << g_authFile << "." << std::endl;
+    return true;
+}
+
+// Write `next` as the auth file, 0600, durably. The caller holds g_authEditMtx.
+static bool saveAuth(const ewb::AuthFile& next, std::string& err) {
+    std::lock_guard<std::mutex> save(g_saveMtx);
+    return ewb::write_file_durable(g_authFile, next.serialize(), err, nullptr, 0600);
+}
+
+// Random bytes for PINs and salts: the kernel CSPRNG. getentropy() takes at most
+// 256 bytes a call; /dev/urandom is the fallback for a libc without it.
+static bool randomBytes(uint8_t* p, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        const size_t take = n - off < 256 ? n - off : 256;
+        if (getentropy(p + off, take) != 0) break;
+        off += take;
+    }
+    if (off == n) return true;
+    std::ifstream u("/dev/urandom", std::ios::binary);
+    return u && u.read(reinterpret_cast<char*>(p + off), (std::streamsize)(n - off)) && u.gcount() == (std::streamsize)(n - off);
+}
+
+static bool nameHasPin(const std::string& name) {
+    std::lock_guard<std::mutex> lk(g_authMtx);
+    return g_auth.has(name);
+}
+static bool nameHasAnyPin() {
+    std::lock_guard<std::mutex> lk(g_authMtx);
+    return !g_auth.empty();
+}
+
+// The op level a session actually gets (auth.h `auth_effective_level`): a name
+// with a PIN is held to --default-level (or its own level, if lower) until it
+// logs in. Re-read per use, so an `op`, `deop` or `passwd` applies on the next
+// command, not the next session.
+static int sessionLevel(const std::string& name, bool verified) {
+    const bool pin = nameHasPin(name);
+    int file;
+    { std::lock_guard<std::mutex> lk(g_opsMtx); file = g_ops.level_of(name, g_defaultLevel); }
+    return ewb::auth_effective_level(file, g_defaultLevel, pin, verified);
+}
+
 // Record a player's latest position (by username).
 //
 // The bound is re-checked here, not only at ingest (stage 7.16): this map is
@@ -843,7 +1117,10 @@ static void rememberPos(const std::string& name, float x, float y, float z){
 // g_signMtx under the world lock when it stores air on a signed block, so nothing that
 // holds g_signMtx may take g_worldMtx.
 static std::vector<ewb::Sign> g_signs;
-static std::string            g_signBlob;
+// Shared, not copied per SIGNQ (stage 7.30): the burst is up to a few hundred KB and a
+// client asks for it up to SV_MAX_SIGNQ_PER_SESSION times. Immutable once built — a
+// change swaps in a new blob, so a queued reply keeps the one it was handed.
+static std::shared_ptr<const std::string> g_signBlob;
 static std::mutex             g_signMtx;
 
 // The blocks that carry at least one sign, keyed by wkey(). This is what keeps
@@ -908,7 +1185,7 @@ void loadSigns() {
     {
         std::lock_guard<std::mutex> lk(g_signMtx);
         g_signs = std::move(signs);
-        g_signBlob = std::move(blob);
+        g_signBlob = std::make_shared<const std::string>(std::move(blob));
         g_signBurstStale = false;
         rebuildSignIndexLocked();
     }
@@ -927,7 +1204,7 @@ static std::mutex        g_signSaveMtx;   // holds saveSigns()' snapshot + write
 // saveSigns(). Caller holds g_signMtx.
 static void signsChangedLocked() {
     rebuildSignIndexLocked();
-    g_signBlob = ewb::format_sign_burst(g_signs);
+    g_signBlob = std::make_shared<const std::string>(ewb::format_sign_burst(g_signs));
     g_signBurstStale = false;
     g_signsDirty = true;
 }
@@ -959,7 +1236,7 @@ static void removeSignsOnBlock(uint64_t k) {
 // Rebuild a burst removeSignsOnBlock() left stale. Caller holds g_signMtx.
 static void refreshSignBurstLocked() {
     if (!g_signBurstStale) return;
-    g_signBlob = ewb::format_sign_burst(g_signs);
+    g_signBlob = std::make_shared<const std::string>(ewb::format_sign_burst(g_signs));
     g_signBurstStale = false;
 }
 
@@ -1264,14 +1541,16 @@ static void pushWorld(const std::shared_ptr<ClientOut>& o,
 // The answer to a request the client made and can make again: the SIGNQ burst.
 // False means refuse the request — the client re-asks, and nothing about the world
 // is lost. (The legacy snapshot is *not* one of these: it is unsolicited, so it
-// goes through pushWorld.)
-static bool pushReply(const std::shared_ptr<ClientOut>& o, std::string blob) {
-    if (!o) return false;
+// goes through pushWorld.) The blob is shared rather than owned (stage 7.30): the
+// SIGNQ burst is one immutable string every client is answered from.
+static bool pushReply(const std::shared_ptr<ClientOut>& o,
+                      const std::shared_ptr<const std::string>& blob) {
+    if (!o || !blob) return false;
     bool ok;
     {
         std::lock_guard<std::mutex> lk(o->m);
         if (o->closing || o->dead || o->tooSlow) return false;
-        ok = o->q.push_reply(std::move(blob));
+        ok = o->q.push_reply(blob);
     }
     if (ok) o->cv.notify_one();
     return ok;
@@ -1659,20 +1938,20 @@ static void serveSigns(SOCKET clientSocket, const std::string& who, BurstLimiter
                   SV_MAX_SIGNQ_PER_SESSION, "SIGNQ", who))
         return;
 
-    std::string blob;
+    std::shared_ptr<const std::string> blob;
     size_t count;
     {
         std::lock_guard<std::mutex> lk(g_signMtx);
         refreshSignBurstLocked();   // an edit may have just taken signs off a block
-        blob  = g_signBlob;      // copy out; the send happens with no lock held
+        blob  = g_signBlob;      // a refcount bump; the send happens with no lock held
         count = g_signs.size();
     }
-    if (blob.empty()) {
+    if (!blob || blob->empty()) {
         if (g_verbose) std::cout << "[Server] SIGNQ from " << who << ": no signs." << std::endl;
         return;
     }
-    const size_t blobBytes = blob.size();
-    if (!pushReply(outFor(clientSocket), std::move(blob))) {
+    const size_t blobBytes = blob->size();
+    if (!pushReply(outFor(clientSocket), blob)) {
         // Backpressure, not an error: this client is still working through an
         // earlier burst. Refusing is what the REGION path does too — they re-ask.
         if (g_verbose) std::cout << "[Server] SIGNQ from " << who
@@ -1688,8 +1967,8 @@ static void serveSigns(SOCKET clientSocket, const std::string& who, BurstLimiter
 // ⚠️ **The world lock is held for the scan only.** Matching records are copied into
 // a local vector under `g_worldMtx`; sorting, deflate, base64 and send() all happen
 // after it is released. The real server appears to hold its world locked for the
-// full ~1 s a region takes — that is precisely the behaviour VuencLink's
-// `net/region.rs` etiquette rules exist to avoid triggering, and reproducing it
+// full ~1 s a region takes — that is precisely the behaviour a reference test
+// client's `net/region.rs` etiquette rules exist to avoid triggering, and reproducing it
 // would make every other player's edits queue behind one player's walk.
 //
 // ⚠️ **The scan is chunk-indexed** (stage 7.6). It used to be a filtered pass over
@@ -1778,7 +2057,7 @@ static void serveRegion(SOCKET clientSocket, const std::string& who, int cx, int
     job.recs = makePendingRecs(std::move(recs));   // counts itself as pending from here
     // An unbuilt region has no records. We answer with an explicit `SNAPZ:0:`
     // (a well-formed frame that decodes to zero records) — 1.8 rung 2/3 showed
-    // VuencLink needs a real frame back: it treats one as "answered" (resetting
+    // a reference test client needs a real frame back: it treats one as "answered" (resetting
     // its ABORT_AFTER_EMPTY counter) where silence leaves it stuck on "waiting
     // for the world snapshot" and aborts a ring sweep after 3 empty points.
     // --no-region-empty-frame restores pre-1.8 silence to A/B test the real
@@ -1853,14 +2132,15 @@ void broadcastMessage(const std::string& message, SOCKET senderSocket) {
 // which queue it lands in. World state shares one ordered stream per client so an
 // edit can never overtake the bulk reply it belongs after, and a client too far
 // behind to hold it is disconnected rather than quietly diverged (out_queue.h).
-void broadcastWorld(const std::string& blob, SOCKET senderSocket) {
+void broadcastWorld(std::string blob, SOCKET senderSocket) {
     if (blob.empty()) return;
     const auto targets = outSnapshot(senderSocket);
     if (targets.empty()) return;
-    // Stage 7.13: one copy into the shared blob, then every target's enqueue is a
-    // refcount bump instead of a copy of the whole thing — this used to copy
-    // `blob` once per client (megabytes x N for a `//set` burst).
-    const auto shared = std::make_shared<const std::string>(blob);
+    // Stage 7.13: one shared blob, then every target's enqueue is a refcount bump
+    // instead of a copy of the whole thing — this used to copy `blob` once per client
+    // (megabytes x N for a `//set` burst). Stage 7.30: taken by value and moved in, so
+    // a caller's local is not copied even once.
+    const auto shared = std::make_shared<const std::string>(std::move(blob));
     for (const auto& o : targets) pushWorld(o, shared);
 }
 
@@ -1927,19 +2207,13 @@ static std::string ctlKick(const std::string& name, const std::string& reason) {
 }
 
 // One `x:y:z:type[:color]` edit relayed to every client with the reserved
-// `server` sender (mine -> build -> paint, matching the legacy snapshot: `mode 0`
-// alone does not overwrite an occupied cell on a peer). Shared by Tier 1
-// (setblock/fill) and Tier 2 (every WorldEdit command), so there is one relay
-// shape to get right. The caller writes the model; this only builds the wire.
+// `server` sender. Shared by Tier 1 (setblock/fill) and Tier 2 (every WorldEdit
+// command), so there is one relay shape to get right; the shape itself — mine ->
+// build -> paint, or a lone paint for a painted-base cell — is
+// `ewb::we_emit_edit_wire`, unit-tested in worldedit_test. The caller writes the
+// model; this only builds the wire.
 static void emitEditWire(std::string& wire, int x, int y, int z, int type, int color) {
-    char line[96];
-    const std::string c = std::to_string(x) + ":" + std::to_string(y) + ":" + std::to_string(z);
-    wire.append(line, snprintf(line, sizeof(line), "ACTION:server:0:%s:1\n", c.c_str()));   // mine
-    if (type != SV_AIR) {
-        wire.append(line, snprintf(line, sizeof(line), "ACTION:server:0:%s:0:%d\n", c.c_str(), type));
-        if (color != 0 && color <= (int)ewb::CELL_MAX_PAINT)
-            wire.append(line, snprintf(line, sizeof(line), "ACTION:server:0:%s:3:%d\n", c.c_str(), color));
-    }
+    ewb::we_emit_edit_wire(wire, x, y, z, type, color);
 }
 
 // The whole relay for an applied batch. **Call this after releasing g_worldMtx.**
@@ -1987,8 +2261,8 @@ static ewb::CtlFillResult ctlFillBox(int x0, int y0, int z0, int x1, int y1, int
                     batch.push_back({x, y, z, 0, 0, (unsigned char)type, (unsigned char)color});
                 }
     }
-    const std::string wire = emitEditBatch(batch);   // formatting, outside the lock
-    if (!wire.empty()) broadcastWorld(wire, INVALID_SOCKET);
+    std::string wire = emitEditBatch(batch);   // formatting, outside the lock
+    if (!wire.empty()) broadcastWorld(std::move(wire), INVALID_SOCKET);
     res.applied = (long long)batch.size();
     return res;
 }
@@ -1996,6 +2270,151 @@ static ewb::CtlFillResult ctlFillBox(int x0, int y0, int z0, int x1, int y1, int
 // " (refused N at the world cell cap)" for an audit line, or "" when nothing was.
 static std::string ctlRefusedNote(const ewb::CtlFillResult& r) {
     return r.refused ? " (refused " + std::to_string(r.refused) + " at the world cell cap)" : "";
+}
+
+// --- Protected zones: the visible undo (stage 8.2) ---------------------------
+//
+// A refused player edit has usually already happened on that player's screen — the
+// client draws a mine, a build or a blast before it tells the server — so refusing it
+// in the model is only half the job. The other half is a **restore**: the
+// `ACTION:server:0:…` lines that redraw each refused cell as the model holds it
+// (`ewb::zone_restore_wire`), then the `SIGNP` of any sign on a restored block,
+// since a client hides a sign while its block is air.
+//
+// The restore is built when it is *sent*, from the model as it is then, not when the
+// edit was refused: a control-socket `setblock` that lands in between is what the
+// player should see, and a restore built earlier would paint over it.
+//
+// It is sent --zone-revert-delay-ms after the refusal, by one thread draining a
+// RevertQueue (zone_guard.h), coalesced per (client, cell). With a delay of 0 there is
+// no queue: the restore goes straight onto the refusing thread's output. Either way it
+// is world state — the ordered stream — so it lands after anything the same thread
+// queued before it, which for a burn is the relay that makes every peer run the blast.
+
+// RevertQueue target for "every connected client" (a burn restore). Per-client
+// targets are ClientOut::id + 1, so they never collide with it.
+static constexpr uint64_t ZONE_TARGET_ALL = 0;
+
+struct RevertTo { std::weak_ptr<ClientOut> out; };   // expired = that client left
+static std::mutex                          g_revertMtx;   // guards g_revertQ; takes no other lock
+static std::condition_variable             g_revertCv;
+static ewb::RevertQueue<RevertTo>          g_revertQ;
+static std::atomic<uint64_t>               g_revertDropped{0};
+
+// The restore for `cells`, built from the model now. Cell values are read under
+// g_worldMtx and formatted after it (the "decide under the lock, format outside it"
+// rule every relay here follows); signs are gathered under g_signMtx afterwards.
+static std::string buildRestore(const std::vector<ewb::RevertCell>& cells) {
+    struct Now { bool present; Cell c; };
+    std::vector<Now> now(cells.size());
+    {
+        std::lock_guard<std::mutex> lk(g_worldMtx);
+        for (size_t i = 0; i < cells.size(); ++i)
+            now[i].present = worldGet(cells[i].x, cells[i].y, cells[i].z, now[i].c);
+    }
+    std::string wire;
+    wire.reserve(cells.size() * 72);
+    for (size_t i = 0; i < cells.size(); ++i)
+        ewb::zone_restore_wire(wire, cells[i].x, cells[i].y, cells[i].z, now[i].present,
+                               now[i].c.type, now[i].c.color);
+    if (g_signBlockCount.load(std::memory_order_relaxed) == 0) return wire;
+    std::lock_guard<std::mutex> lk(g_signMtx);
+    std::unordered_set<uint64_t> signed_;
+    for (const ewb::RevertCell& c : cells) {
+        const uint64_t k = wkey(c.x, c.y, c.z);
+        if (g_signBlocks.count(k)) signed_.insert(k);
+    }
+    if (signed_.empty()) return wire;
+    for (const ewb::Sign& s : g_signs)
+        if (signed_.count(wkey(s.x, s.y, s.z))) wire += ewb::format_signp(s);
+    return wire;
+}
+
+static void sendRestore(uint64_t target, const RevertTo& to, const std::vector<ewb::RevertCell>& cells) {
+    std::string wire = buildRestore(cells);
+    if (wire.empty()) return;
+    if (target == ZONE_TARGET_ALL) broadcastWorld(std::move(wire), INVALID_SOCKET);
+    else if (auto o = to.out.lock()) pushWorld(o, std::move(wire));
+}
+
+// Restore `cells` on one client's screen (`to`), or on everyone's (`to` null).
+static void scheduleRestore(const std::shared_ptr<ClientOut>& to, const std::vector<ewb::RevertCell>& cells) {
+    if (cells.empty()) return;
+    const uint64_t target = to ? (uint64_t)to->id + 1 : ZONE_TARGET_ALL;
+    if (g_zoneRevertDelayMs <= 0) { sendRestore(target, RevertTo{to}, cells); return; }
+    size_t dropped = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_revertMtx);
+        g_revertQ.push(monoSeconds() + g_zoneRevertDelayMs / 1000.0, target, RevertTo{to}, cells, &dropped);
+    }
+    g_revertCv.notify_one();
+    if (dropped) {
+        // A flood of refusals across many clients. The model is right either way;
+        // what is lost is the redraw, which those players get back on rejoin.
+        static std::mutex gateMtx;
+        static ewb::TokenBucket gate(1.0, 1.0 / 60.0);
+        const uint64_t total = g_revertDropped.fetch_add(dropped) + dropped;
+        std::lock_guard<std::mutex> lk(gateMtx);
+        if (gate.allow(monoSeconds()))
+            std::cerr << "[Server] zone restore queue full (" << ewb::ZONE_REVERT_MAX_PENDING
+                      << " cells); " << total << " restore(s) dropped so far. The world is intact;"
+                         " affected players see it correctly on rejoin." << std::endl;
+    }
+}
+
+// The one thread that sends delayed restores (started only when the delay is > 0).
+static void revertThread() {
+    std::unique_lock<std::mutex> lk(g_revertMtx);
+    while (serverRunning) {
+        if (g_revertQ.empty()) { g_revertCv.wait_for(lk, std::chrono::seconds(1)); continue; }
+        const double now = monoSeconds(), due = g_revertQ.next_due();
+        if (due > now) {
+            g_revertCv.wait_for(lk, std::chrono::duration<double>(due - now));
+            continue;
+        }
+        ewb::RevertQueue<RevertTo>::Job job;
+        if (!g_revertQ.pop_due(now, job)) continue;
+        lk.unlock();                                    // never hold it into g_worldMtx
+        sendRestore(job.target, job.payload, job.cells);
+        lk.lock();
+    }
+}
+
+// Aggregated audit of refusals: one line per player per zone per 10 s (zone_guard.h).
+static std::mutex         g_zoneAuditMtx;   // guards g_zoneAudit; takes no other lock
+static ewb::ZoneAuditAgg  g_zoneAudit;
+
+static void zoneAudit(const std::string& player, const std::string& zone, const std::string& verb,
+                      int x, int y, int z) {
+    std::string line;
+    bool write;
+    {
+        std::lock_guard<std::mutex> lk(g_zoneAuditMtx);
+        write = g_zoneAudit.note(monoSeconds(), player, zone, verb, x, y, z, line);
+    }
+    if (write) auditLog("player:" + player, line);
+}
+
+// Write the counts folded into closed windows. From the autosave tick.
+static void flushZoneAudit() {
+    std::vector<std::pair<std::string, std::string>> lines;
+    {
+        std::lock_guard<std::mutex> lk(g_zoneAuditMtx);
+        lines = g_zoneAudit.flush(monoSeconds());
+    }
+    for (const auto& pl : lines) auditLog("player:" + pl.first, pl.second);
+}
+
+// A refused edit, from the refusing player's side: the chat notice (paced by the
+// connection's own `notice` bucket — the capNotice shape) and the audit line.
+static void zoneRefused(SOCKET s, ewb::TokenBucket& notice, const std::string& player,
+                        const std::string& zone, const char* verb, int x, int y, int z) {
+    if (g_verbose)
+        std::cout << "[" << player << "] " << verb << " at (" << x << "," << y << "," << z
+                  << ") refused: protected zone " << zone << std::endl;
+    if (notice.allow(monoSeconds()))
+        sendLine(s, "[Server] This area is protected ('" + zone + "').\n");
+    zoneAudit(player, zone, verb, x, y, z);
 }
 
 // Handle one complete control line. `reply` is sent back (a trailing '\n' is
@@ -2020,12 +2439,18 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
     if (verb == "help") { reply = ewb::ctl_help_text(); return; }
 
     if (verb == "who") {
+        // PIN holders first, before clientsMutex (g_authMtx is never taken inside it).
+        std::set<std::string> pinNames;
+        { std::lock_guard<std::mutex> ak(g_authMtx); for (const auto& n : g_auth.names()) pinNames.insert(n); }
         std::lock_guard<std::mutex> lock(clientsMutex);
         std::ostringstream ss;
         ss << playerInfoMap.size() << " player(s):\n";
         for (const auto& kv : playerInfoMap) {
             const PlayerInfo& p = kv.second;
-            int lvl; { std::lock_guard<std::mutex> ol(g_opsMtx); lvl = g_ops.level_of(p.username, g_defaultLevel); }
+            const bool pin = pinNames.count(p.username) > 0;
+            int file; { std::lock_guard<std::mutex> ol(g_opsMtx); file = g_ops.level_of(p.username, g_defaultLevel); }
+            // The level this session actually has (stage 8.6), not the file's.
+            const int lvl = ewb::auth_effective_level(file, g_defaultLevel, pin, p.verified);
             ss << "  " << p.username << " (T" << p.characterType << ") "
                << p.ip << "  @ " << (int)p.posX << "," << (int)p.posY << "," << (int)p.posZ
                << "  level " << lvl;
@@ -2040,6 +2465,10 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
                 if (o->q.dropped_lines())
                     ss << " dropped " << o->q.dropped_lines() << " stale line(s)";
             }
+            // Last on the row, so a parser anchored on "  level " / "queued " keeps
+            // working. verified = logged in; unverified = has a PIN, not logged in
+            // (held to --default-level); none = no PIN (level is by name alone).
+            ss << "  auth " << (p.verified ? "verified" : pin ? "unverified" : "none");
             ss << "\n";
         }
         reply = ss.str();
@@ -2195,6 +2624,216 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
         return;
     }
 
+    if (verb == "zones") {
+        auto zs = zonesSnapshot();
+        if (!zs || zs->zones().empty()) { reply = "no protected zones"; return; }
+        std::ostringstream ss;
+        ss << zs->size() << " zone(s):\n";
+        for (const ewb::Zone& z : zs->zones()) {
+            const long long cells = ewb::ctl_fill_volume(z.x0, z.y0, z.z0, z.x1, z.y1, z.z1);
+            ss << "  " << z.name << "  (" << z.x0 << "," << z.y0 << "," << z.z0 << ")..("
+               << z.x1 << "," << z.y1 << "," << z.z1 << ")  " << (z.enforced ? "all" : "off")
+               << "  level " << (z.hasLevel ? std::to_string(z.level) : std::string("-"))
+               << "  " << cells << " cell(s)\n";
+        }
+        reply = ss.str();
+        return;
+    }
+
+    // topmap (stage 8.5; grammar and reply in topmap.h). The world lock is taken
+    // once per 16x16 chunk column the samples fall in and released between them,
+    // so a full 256x256 map is thousands of microsecond-long holds, never one long
+    // one — a player's REGION or ACTION waits for at most one chunk column.
+    if (verb == "topmap") {
+        ewb::TopmapReq req;
+        std::string err;
+        if (!ewb::topmap_parse(ewb::ctl_fields(rest, 0), req, err)) { reply = "error: " + err; return; }
+        static const ewb::BaseProfile kBase = ewb::eden_default_profile();
+        ewb::TopmapGrid grid(req, kBase);
+        const auto t0 = std::chrono::steady_clock::now();
+        ewb::topmap_for_each_chunk_column(req, [&](int, int, const std::vector<ewb::TopmapSample>& batch) {
+            std::lock_guard<std::mutex> lk(g_worldMtx);
+            for (const ewb::TopmapSample& t : batch)
+                g_world.for_each_in_column(t.x, t.z, [&](int y, unsigned char type, unsigned char color) {
+                    grid.feed(t.i, t.j, y, type, color);
+                });
+        });
+        reply = grid.render();
+        if (g_verbose)
+            std::cout << "[Server] control topmap " << req.w << "x" << req.h << " step " << req.step << " in "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - t0).count()
+                      << " ms (" << reply.size() << " B)" << std::endl;
+        return;
+    }
+
+    // passwd / unpasswd / pins (stage 8.6). The PIN is generated here, stored only as
+    // a salted hash (eden_auth.txt, 0600) and appears in exactly one place: this
+    // reply. It is never audited or logged. Any live session under the name is
+    // logged out, so a re-issued PIN takes effect at once.
+    if (verb == "passwd" || verb == "unpasswd") {
+        const std::string name = ewb::ctl_fields(rest, 1)[0];
+        if (ewb::validate_username(name) != ewb::NameVerdict::Ok) {
+            reply = "error: '" + name + "' is not a valid player name"; return;
+        }
+        std::lock_guard<std::mutex> editLk(g_authEditMtx);
+        ewb::AuthFile next;
+        { std::lock_guard<std::mutex> ak(g_authMtx); next = g_auth; }
+        const bool had = next.has(name);
+        std::string pin;
+        if (verb == "passwd") {
+            ewb::AuthRecord rec;
+            if (!ewb::auth_make_pin(randomBytes, pin) || !ewb::auth_make_record(pin, randomBytes, rec)) {
+                reply = "error: no random source available; PIN not issued"; return;
+            }
+            next.set(name, rec);
+        } else if (!next.erase(name)) {
+            reply = "error: '" + name + "' has no PIN"; return;
+        }
+        std::string err;
+        if (!saveAuth(next, err)) { reply = "error: save failed: " + err; return; }
+        std::vector<SOCKET> loggedOut;
+        {
+            std::lock_guard<std::mutex> ak(g_authMtx);
+            g_auth = std::move(next);
+            std::lock_guard<std::mutex> lk(clientsMutex);
+            for (auto& kv : playerInfoMap)
+                if (kv.second.username == name && kv.second.verified) {
+                    kv.second.verified = false;
+                    loggedOut.push_back(kv.first);
+                }
+        }
+        for (SOCKET ls : loggedOut)
+            sendLine(ls, verb == "passwd"
+                             ? "[Server] Your PIN was changed by the operator; /login again with the new one.\n"
+                             : "[Server] Your PIN was removed by the operator.\n");
+        if (verb == "passwd") {
+            auditLog("control", "passwd " + name + (had ? " (replaced)" : " (issued)") +
+                                    (loggedOut.empty() ? "" : ", logged out the live session"));
+            reply = "ok: PIN for " + name + ": " + pin + "  (shown once; the player types /login " + pin + ")";
+        } else {
+            auditLog("control", "unpasswd " + name + (loggedOut.empty() ? "" : ", logged out the live session"));
+            reply = "ok: removed the PIN for " + name + "; the name is claimed by name alone again";
+        }
+        return;
+    }
+
+    if (verb == "pins") {
+        std::vector<std::string> names;
+        { std::lock_guard<std::mutex> ak(g_authMtx); names = g_auth.names(); }
+        if (names.empty()) { reply = "no names have a PIN"; return; }
+        std::map<std::string, bool> online;   // name -> logged in
+        {
+            std::lock_guard<std::mutex> lk(clientsMutex);
+            for (const auto& kv : playerInfoMap) online[kv.second.username] = kv.second.verified;
+        }
+        std::ostringstream ss;
+        ss << names.size() << " name(s) with a PIN:\n";
+        for (const std::string& n : names) {
+            auto it = online.find(n);
+            ss << "  " << n << "  " << (it == online.end() ? "offline" : it->second ? "online verified" : "online unverified") << "\n";
+        }
+        reply = ss.str();
+        return;
+    }
+
+    // zone:add|set|flags|rm|reload — the stage 8.3 control verbs. Each mutating
+    // subcommand reads a snapshot, edits a private copy, saves it to
+    // g_zonesFile, then swaps the pointer under g_zonesMtx — g_zonesEditMtx
+    // serializes these against each other (see its declaration). Effective on
+    // the next edit, no restart. The control socket itself is never subject to
+    // a zone (zoneDenies is never asked here) — it *is* the operator.
+    if (verb == "zone") {
+        const auto f = ewb::ctl_fields(rest, 0);
+        const std::string sub = f.empty() ? "" : f[0];
+
+        if (sub == "reload") {
+            std::lock_guard<std::mutex> editLk(g_zonesEditMtx);
+            std::string err;
+            if (!loadZones(err)) { reply = "error: " + err; return; }
+            const size_t n = zonesSnapshot()->size();
+            auditLog("control", "zone reload (" + std::to_string(n) + " zone(s))");
+            reply = "ok: reloaded " + std::to_string(n) + " zone(s) from " + g_zonesFile;
+            return;
+        }
+
+        if (sub == "rm") {
+            if (f.size() != 2) { reply = "usage: " + std::string(spec->usage); return; }
+            const std::string name = f[1];
+            std::lock_guard<std::mutex> editLk(g_zonesEditMtx);
+            ewb::ZoneSet next = *zonesSnapshot();
+            if (!next.remove(name)) { reply = "error: no zone named '" + name + "'"; return; }
+            std::string saveErr;
+            if (!zonePublish(std::move(next), saveErr)) { reply = "error: save failed: " + saveErr; return; }
+            auditLog("control", "zone rm " + name);
+            reply = "ok: removed zone '" + name + "'";
+            return;
+        }
+
+        if (sub == "add" || sub == "set" || sub == "flags") {
+            const size_t p = rest.find(':');
+            if (p == std::string::npos) { reply = "usage: " + std::string(spec->usage); return; }
+            const std::string tail = rest.substr(p + 1);
+            const auto tf = ewb::ctl_fields(tail, 0);
+
+            std::lock_guard<std::mutex> editLk(g_zonesEditMtx);
+            ewb::ZoneSet next = *zonesSnapshot();
+            std::string name, err, line;
+            ewb::Zone z;
+
+            if (sub == "add") {
+                if (tf.size() < 7 || tf.size() > 9) { reply = "usage: " + std::string(spec->usage); return; }
+                name = tf[0];
+                line = tail;
+                if (tf.size() == 7) line += ":all";   // flags default to enforced
+                if (!ewb::zone_parse_line(line, z, &err)) { reply = "error: " + err; return; }
+                if (!next.add(z, &err)) { reply = "error: " + err; return; }
+            } else if (sub == "set") {
+                if (tf.size() != 7) { reply = "usage: " + std::string(spec->usage); return; }
+                name = tf[0];
+                const ewb::Zone* existing = next.find(name);
+                if (!existing) { reply = "error: no zone named '" + name + "'"; return; }
+                line = tail;
+                line += existing->enforced ? ":all" : ":off";
+                if (existing->hasLevel) line += ":" + std::to_string(existing->level);
+                next.remove(name);
+                if (!ewb::zone_parse_line(line, z, &err)) { reply = "error: " + err; return; }
+                if (!next.add(z, &err)) { reply = "error: " + err; return; }
+            } else {   // flags
+                if (tf.size() < 2 || tf.size() > 3) { reply = "usage: " + std::string(spec->usage); return; }
+                name = tf[0];
+                const ewb::Zone* existing = next.find(name);
+                if (!existing) { reply = "error: no zone named '" + name + "'"; return; }
+                line = name + ":" +
+                    std::to_string(existing->x0) + ":" + std::to_string(existing->y0) + ":" + std::to_string(existing->z0) + ":" +
+                    std::to_string(existing->x1) + ":" + std::to_string(existing->y1) + ":" + std::to_string(existing->z1) + ":" +
+                    tf[1];
+                if (tf.size() == 3) line += ":" + tf[2];
+                else if (existing->hasLevel) line += ":" + std::to_string(existing->level);
+                next.remove(name);
+                if (!ewb::zone_parse_line(line, z, &err)) { reply = "error: " + err; return; }
+                if (!next.add(z, &err)) { reply = "error: " + err; return; }
+            }
+
+            std::string saveErr;
+            if (!zonePublish(std::move(next), saveErr)) { reply = "error: save failed: " + saveErr; return; }
+
+            auditLog("control", "zone " + sub + " " + name);
+            const std::string verbed = sub == "add" ? "added" : sub == "set" ? "resized" : "flags updated";
+            std::string note;
+            if (z.hasLevel) {
+                note = " (bypassed by players logged in at level " + std::to_string(z.level) + "+";
+                if (!nameHasAnyPin()) note += "; no name has a PIN yet, so nobody can: edenctl passwd <name>";
+                note += ")";
+            }
+            reply = "ok: zone '" + name + "' " + verbed + note;
+            return;
+        }
+
+        reply = "usage: " + std::string(spec->usage);
+        return;
+    }
+
     if (verb == "signs") {
         const auto f = ewb::ctl_fields(rest, 0);
         const std::string sub = f.empty() ? "" : f[0];
@@ -2225,18 +2864,30 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
             if (!ewb::parse_sign_line(rest.substr(p + 1), s, skip)) {
                 reply = "error: malformed sign line"; return;
             }
+            // The same door a player's sign write goes through (stage 7.30): the cap
+            // applies, and a sign for a slot that already holds one replaces it rather
+            // than sitting beside it as a duplicate a later player edit would prune.
             size_t total = 0;
+            ewb::SignUpsert r;
             {
                 std::lock_guard<std::mutex> lk(g_signMtx);
-                g_signs.push_back(s);
-                signsChangedLocked();
+                r = ewb::upsert_sign(g_signs, s, SV_MAX_SIGNS);
+                if (r == ewb::SignUpsert::Added || r == ewb::SignUpsert::Replaced) signsChangedLocked();
                 total = g_signs.size();
             }
+            const std::string at = std::to_string(s.x) + "," + std::to_string(s.y) + "," + std::to_string(s.z);
+            if (r == ewb::SignUpsert::Full) {
+                reply = "error: sign cap reached (" + std::to_string(SV_MAX_SIGNS) + "); sign not added";
+                return;
+            }
+            if (r == ewb::SignUpsert::Unchanged) {
+                reply = "ok: sign at " + at + " already present (" + std::to_string(total) + " total)";
+                return;
+            }
             saveSigns();
-            auditLog("control", "signs add " + std::to_string(s.x) + "," + std::to_string(s.y) +
-                                "," + std::to_string(s.z));
-            reply = "ok: added sign at " + std::to_string(s.x) + "," + std::to_string(s.y) + "," + std::to_string(s.z) +
-                    " (" + std::to_string(total) + " total)";
+            auditLog("control", std::string(r == ewb::SignUpsert::Added ? "signs add " : "signs replace ") + at);
+            reply = std::string(r == ewb::SignUpsert::Added ? "ok: added sign at " : "ok: replaced sign at ") +
+                    at + " (" + std::to_string(total) + " total)";
             return;
         }
         if (sub == "rm") {
@@ -2387,7 +3038,15 @@ static void handleControlClient(int fd) {
             handleControlLine(line, reply, stopServer);
             if (!reply.empty()) {
                 if (reply.back() != '\n') reply += '\n';
-                send(fd, reply.c_str(), reply.size(), 0);
+                // A reply can be large (a full `topmap` is ~700 KB), and one send()
+                // on a stream socket may take only part of it.
+                size_t off = 0;
+                while (off < reply.size()) {
+                    const ssize_t n = send(fd, reply.data() + off, reply.size() - off, 0);
+                    if (n < 0 && errno == EINTR) continue;
+                    if (n <= 0) break;
+                    off += (size_t)n;
+                }
             }
             if (stopServer) break;
         }
@@ -2506,9 +3165,22 @@ static const int SV_WE_PLATFORM_BLOCK = 58;
 static std::map<std::string, std::string> g_lastWhisper;
 static std::mutex                         g_whisperMtx;
 
+// The cells one command left alone because a protected zone covers them (stage 8.2).
+// WorldEdit is server-authoritative — nothing was drawn before the server decided — so
+// a skipped cell needs no restore, only a line in the reply.
+struct WeZoneSkip {
+    size_t cells = 0;
+    std::string zone;      // the first zone that refused a cell
+    int x = 0, y = 0, z = 0;
+    void note(const ewb::Zone& zn, int cx, int cy, int cz) {
+        if (cells++ == 0) { zone = zn.name; x = cx; y = cy; z = cz; }
+    }
+};
+
 // Everything else a connection remembers between commands. One instance per
 // `handleClient` frame; freed with the connection, no cleanup path to forget.
 struct WeSession {
+    WeZoneSkip                zoneSkip; // reset by every commit; read by the reply
     ewb::Selection            sel;
     std::vector<ewb::ClipCell> clip;
     ewb::UndoStore            hist;
@@ -2526,10 +3198,12 @@ static void weSay(SOCKET s, const std::string& text) {
 }
 
 // A player's permission level right now — re-read per command, so a `deop` from
-// the control socket takes effect on the next line, not the next session.
-static int weLevel(const std::string& name) {
-    std::lock_guard<std::mutex> lk(g_opsMtx);
-    return g_ops.level_of(name, g_defaultLevel);
+// the control socket takes effect on the next line, not the next session. A name
+// with a PIN gets its level only once this connection has logged in (stage 8.6).
+static int weLevel(SOCKET s, const std::string& name) {
+    std::string rosterName;
+    const bool verified = sessionIdentity(s, rosterName);
+    return sessionLevel(name, verified);
 }
 
 // Read a connected player's position. `find`, never `operator[]` — plan §0.5.7
@@ -2578,39 +3252,98 @@ static bool weBoxOk(SOCKET s, long long volume) {
     return false;
 }
 
+// Read a cell the way every WorldEdit command sees it: a stored cell as stored, an
+// absent one as the natural block every client draws there (`ewb::we_base_at`,
+// stage 3.7). Returns whether the cell is stored. Caller holds g_worldMtx.
+//
+// Reading an absent cell as its natural block rather than as air is what makes
+// the undo record right: the "before" half of a `//set` over untouched ground is
+// grass, so `//undo` puts grass back (3.7 G; it used to put air).
+static bool weRead(int x, int y, int z, int& type, int& color) {
+    Cell cur{0, 0};
+    if (worldGet(x, y, z, cur)) { type = cur.type; color = cur.color; return true; }
+    const ewb::BaseVoxel b = ewb::we_base_at(y);
+    type = b.type;
+    color = b.paint;
+    return false;
+}
+
+// The world cell cap, checked once for a whole decided batch before any of it is
+// written. `fresh` is how many of its cells the world does not hold yet — the only
+// ones the cap can refuse. (3.7 C: this used to charge the box's whole volume, so
+// a near-full world refused edits that stored nothing new.) Refuse rather than
+// truncate: a partially applied edit is worse than a refused one, and the player
+// can see why. Caller holds g_worldMtx.
+static bool weCapAllows(size_t fresh, SOCKET s) {
+    if (g_world.size() + fresh <= g_maxWorldCells) return true;
+    weSay(s, "The world is at its edited-cell limit; that edit was refused.");
+    return false;
+}
+
+// Write a decided batch. The caller holds g_worldMtx and has passed weCapAllows,
+// so worldSet has no reason to refuse; a cell it refuses anyway is dropped, so what
+// is relayed and recorded for undo is exactly what was written.
+static void weWriteLocked(std::vector<ewb::WeEdit>& batch) {
+    size_t kept = 0;
+    for (size_t i = 0; i < batch.size(); ++i) {
+        const ewb::WeEdit e = batch[i];
+        if (worldSet(e.x, e.y, e.z, e.newType, e.newColor)) batch[kept++] = e;
+    }
+    batch.resize(kept);
+}
+
 // Write a decided set of cells into the model and relay them.
 //
 // `edits` supplies x/y/z and the new type/colour; the old values are filled in
 // here, under the same lock as the write, so an undo record can never disagree
-// with what was actually overwritten. No-ops and out-of-range cells are dropped.
+// with what was actually overwritten. Cells that would not change
+// (`ewb::we_edit_changes`) and out-of-range cells are dropped. The batch is
+// decided first and written second, so the cap is checked against the cells it
+// actually adds.
+//
 // The lock covers deciding and writing the batch and nothing else — formatting
 // the relay (the larger half, see `emitEditBatch`) and sending it both happen
 // after it is released, so a large batch never blocks another player's REGION
 // behind string building or a socket write.
-static std::vector<ewb::WeEdit> weCommit(const std::vector<ewb::WeEdit>& edits, SOCKET s) {
+//
+// Protected zones (stage 8.2): a cell a zone covers is skipped and counted in `skip`,
+// and the rest of the batch applies. The zone snapshot is taken before g_worldMtx; the
+// per-cell check only runs when the batch's bounding box meets a zone at all, and only
+// on cells that would actually change.
+static std::vector<ewb::WeEdit> weCommit(const std::vector<ewb::WeEdit>& edits, SOCKET s,
+                                         WeZoneSkip& skip) {
     std::vector<ewb::WeEdit> batch;
     batch.reserve(edits.size());
+    skip = WeZoneSkip{};
+    ZoneCheck zc = zoneCheck(s);
+    if (edits.empty() || zc.zones->size() == 0) {
+        zc.zones.reset();
+    } else {
+        int x0 = edits[0].x, y0 = edits[0].y, z0 = edits[0].z, x1 = x0, y1 = y0, z1 = z0;
+        for (const ewb::WeEdit& e : edits) {
+            x0 = std::min(x0, e.x); y0 = std::min(y0, e.y); z0 = std::min(z0, e.z);
+            x1 = std::max(x1, e.x); y1 = std::max(y1, e.y); z1 = std::max(z1, e.z);
+        }
+        zc = zoneCheckNear(zc, x0, y0, z0, x1, y1, z1);
+    }
     {
         std::lock_guard<std::mutex> lock(g_worldMtx);
-        // Refuse rather than truncate: a partially applied edit is worse than a
-        // refused one, and the player can see why.
-        if (g_world.size() + edits.size() > g_maxWorldCells) {
-            weSay(s, "The world is at its edited-cell limit; that edit was refused.");
-            return batch;
-        }
+        size_t fresh = 0;
         for (const ewb::WeEdit& e : edits) {
             if (!weCellInRange(e.x, e.y, e.z)) continue;
-            Cell cur{0, 0};
-            const bool have = worldGet(e.x, e.y, e.z, cur);
-            const unsigned char oldType  = have ? cur.type  : (unsigned char)SV_AIR;
-            const unsigned char oldColor = have ? cur.color : 0;
-            if (have && oldType == e.newType && oldColor == e.newColor) continue;
-            worldSet(e.x, e.y, e.z, e.newType, e.newColor);
-            batch.push_back({e.x, e.y, e.z, oldType, oldColor, e.newType, e.newColor});
+            int ct, cc;
+            const bool have = weRead(e.x, e.y, e.z, ct, cc);
+            if (!ewb::we_edit_changes(have, ct, cc, e.newType, e.newColor)) continue;
+            if (const ewb::Zone* zn = zoneDenies(zc, e.x, e.y, e.z)) { skip.note(*zn, e.x, e.y, e.z); continue; }
+            if (!have) ++fresh;
+            batch.push_back({e.x, e.y, e.z, (unsigned char)ct, (unsigned char)cc,
+                             e.newType, e.newColor});
         }
+        if (!weCapAllows(fresh, s)) { batch.clear(); return batch; }
+        weWriteLocked(batch);
     }
-    const std::string wire = emitEditBatch(batch);   // formatting, outside the lock
-    if (!wire.empty()) broadcastWorld(wire, INVALID_SOCKET);
+    std::string wire = emitEditBatch(batch);   // formatting, outside the lock
+    if (!wire.empty()) broadcastWorld(std::move(wire), INVALID_SOCKET);
     return batch;
 }
 
@@ -2619,41 +3352,56 @@ static std::vector<ewb::WeEdit> weCommit(const std::vector<ewb::WeEdit>& edits, 
 // returns false to leave a cell alone.
 //
 // `present` distinguishes "a player carved this to air" (`type 0`) from "nobody
-// has touched this cell" (absent — deterministic base terrain the server never
-// stored). The patch this replaces conflated the two, so `//replace 0 <block>`
-// silently filled every untouched cell in the box with a placed block. Its own
-// help text promised the opposite ("WorldEdit only detects player-made blocks").
+// has touched this cell" (absent). The patch this replaces conflated the two, so
+// `//replace 0 <block>` silently filled every untouched cell in the box with a
+// placed block. Its own help text promised the opposite ("WorldEdit only detects
+// player-made blocks"). For an absent cell `curType`/`curColor` are the natural
+// block (`weRead`), so a callback that reads them sees what the player sees.
+//
+// A cell whose answer changes nothing is skipped (`ewb::we_edit_changes`): that is
+// what keeps `//set 0` in open sky from storing thousands of air cells (3.7 B).
 //
 // The caller has already volume-checked the box and charged the budget.
+//
+// Protected cells are skipped into `skip`, exactly as in weCommit.
 template <typename F>
-static std::vector<ewb::WeEdit> weEditBox(const ewb::WeBox& box, F&& want, SOCKET s) {
+static std::vector<ewb::WeEdit> weEditBox(const ewb::WeBox& box, F&& want, SOCKET s, WeZoneSkip& skip) {
     std::vector<ewb::WeEdit> batch;
+    skip = WeZoneSkip{};
+    const ZoneCheck zc = zoneCheckNear(zoneCheck(s), box.x0, box.y0, box.z0, box.x1, box.y1, box.z1);
     {
         std::lock_guard<std::mutex> lock(g_worldMtx);
-        const long long vol = ewb::we_box_volume(box);
-        if (g_world.size() + (size_t)vol > g_maxWorldCells) {
-            weSay(s, "The world is at its edited-cell limit; that edit was refused.");
-            return batch;
-        }
+        size_t fresh = 0;
         for (int x = box.x0; x <= box.x1; ++x)
             for (int z = box.z0; z <= box.z1; ++z)
                 for (int y = box.y0; y <= box.y1; ++y) {
                     if (!weCellInRange(x, y, z)) continue;
-                    Cell cur{0, 0};
-                    const bool have = worldGet(x, y, z, cur);
-                    const int curType  = have ? cur.type  : SV_AIR;
-                    const int curColor = have ? cur.color : 0;
+                    int curType, curColor;
+                    const bool have = weRead(x, y, z, curType, curColor);
                     int newType = curType, newColor = curColor;
                     if (!want(x, y, z, have, curType, curColor, newType, newColor)) continue;
-                    if (have && newType == curType && newColor == curColor) continue;
-                    worldSet(x, y, z, newType, newColor);
+                    if (!ewb::we_edit_changes(have, curType, curColor, newType, newColor)) continue;
+                    if (const ewb::Zone* zn = zoneDenies(zc, x, y, z)) { skip.note(*zn, x, y, z); continue; }
+                    if (!have) ++fresh;
                     batch.push_back({x, y, z, (unsigned char)curType, (unsigned char)curColor,
                                      (unsigned char)newType, (unsigned char)newColor});
                 }
+        if (!weCapAllows(fresh, s)) { batch.clear(); return batch; }
+        weWriteLocked(batch);
     }
-    const std::string wire = emitEditBatch(batch);   // formatting, outside the lock
-    if (!wire.empty()) broadcastWorld(wire, INVALID_SOCKET);
+    std::string wire = emitEditBatch(batch);   // formatting, outside the lock
+    if (!wire.empty()) broadcastWorld(std::move(wire), INVALID_SOCKET);
     return batch;
+}
+
+// Tell the player (always — it is the reply to their command) and the audit channel
+// (folded, like every zone refusal) about cells the last commit skipped. Call it before
+// the command's completion line: docs/commands.md promises that line comes last.
+static void weZoneReport(WeSession& we, SOCKET s, const std::string& username, const std::string& verb) {
+    const WeZoneSkip& k = we.zoneSkip;
+    if (!k.cells) return;
+    weSay(s, std::to_string(k.cells) + " cell(s) skipped: protected area '" + k.zone + "'.");
+    zoneAudit(username, k.zone, verb + " (" + std::to_string(k.cells) + " cell(s))", k.x, k.y, k.z);
 }
 
 // Record an applied batch for undo and tell the player what happened.
@@ -2671,6 +3419,7 @@ static void weFinish(WeSession& we, SOCKET s, const std::string& username,
         auditLog("player:" + username, verb + ": " + std::to_string(n) + " cell(s)");
         drainSignRemovals();   // signs on blocks this edit turned to air
     }
+    weZoneReport(we, s, username, verb);   // before the completion line, which is always last
     weSay(s, verb + ": " + std::to_string(n) + " block(s) changed.");
 }
 
@@ -2697,6 +3446,87 @@ static void weTeleport(SOCKET s, const std::string& username, float x, float y, 
     sendLine(s, spawnLine(x, y, z));
 }
 
+// `/login <pin>` (stage 8.6). Called from the MSG handler *before* the WorldEdit
+// dispatcher, and before its "commands are disabled" check — identity is not
+// WorldEdit — so the line never reaches anything that logs, audits or echoes a
+// command. ⚠️ Nothing here may print `line` or the PIN: failures log the name and
+// the address only.
+//
+// Cost control, cheapest first: a malformed PIN, a name with no PIN, an IP inside
+// its lockout and this connection's own attempt budget are all refused before the
+// (deliberately slow) hash runs, so a /login flood costs the server a token-bucket
+// check per line, not a PBKDF2 each.
+static void handleLogin(SOCKET s, const std::string& username, const std::string& ip,
+                        const std::string& line, ewb::TokenBucket& attempts) {
+    const std::vector<std::string> tok = ewb::we_split_args(line);
+    if (tok.size() != 2) { weSay(s, "Usage: /login <pin>"); return; }
+    const std::string& pin = tok[1];
+    // Free to refuse: nothing is hashed, nothing counted against the budget below.
+    if (!ewb::auth_pin_wellformed(pin)) {
+        weSay(s, "Wrong PIN. A PIN is " + std::to_string(ewb::AUTH_PIN_DIGITS) + " digits.");
+        return;
+    }
+
+    std::string rosterName;
+    if (sessionIdentity(s, rosterName)) { weSay(s, "You are already logged in."); return; }
+    ewb::AuthRecord rec;
+    {
+        std::lock_guard<std::mutex> lk(g_authMtx);
+        const ewb::AuthRecord* r = g_auth.find(username);
+        if (!r) { weSay(s, "The name " + username + " has no PIN, so there is nothing to log in to."); return; }
+        rec = *r;
+    }
+    const double now = monoSeconds();
+    {
+        std::lock_guard<std::mutex> lk(g_loginFailMtx);
+        if (g_loginFail.blocked(ip, now)) {
+            weSay(s, "Too many wrong PINs from your address; try again later.");
+            return;
+        }
+    }
+    if (!attempts.allow(now)) { weSay(s, "Too many login attempts; wait a few seconds."); return; }
+
+    if (!ewb::auth_verify(rec, pin)) {   // slow on purpose; no lock held
+        size_t inWindow;
+        bool locked;
+        {
+            std::lock_guard<std::mutex> lk(g_loginFailMtx);
+            inWindow = g_loginFail.record_failure(ip, monoSeconds());
+            locked = g_loginFail.blocked(ip, monoSeconds());
+        }
+        std::cout << "[Server] failed /login for " << username << " from " << ip;
+        if (inWindow) std::cout << " (" << inWindow << " in window)";
+        std::cout << "." << std::endl;
+        if (locked)
+            auditLog("player:" + username, "/login locked out " + ip + " after " +
+                                               std::to_string(inWindow) + " wrong PIN(s)");
+        weSay(s, "Wrong PIN.");
+        return;
+    }
+
+    // Publish under g_authMtx -> clientsMutex (the declared order): if an operator
+    // re-issued or removed the PIN while the hash ran, the record we checked is no
+    // longer the live one and the login must not count.
+    bool stale = false, gone = false;
+    {
+        std::lock_guard<std::mutex> ak(g_authMtx);
+        const ewb::AuthRecord* r = g_auth.find(username);
+        if (!r || r->hash != rec.hash || r->salt != rec.salt) {
+            stale = true;
+        } else {
+            std::lock_guard<std::mutex> lk(clientsMutex);
+            auto it = playerInfoMap.find(s);
+            if (it == playerInfoMap.end() || it->second.username != username) gone = true;
+            else it->second.verified = true;
+        }
+    }
+    if (gone) return;
+    if (stale) { weSay(s, "Your PIN was changed a moment ago; ask the operator for the new one."); return; }
+    const int lvl = sessionLevel(username, true);
+    auditLog("player:" + username, "logged in from " + ip + " (level " + std::to_string(lvl) + ")");
+    weSay(s, "Logged in as " + username + ". Your level is " + std::to_string(lvl) + ".");
+}
+
 // One complete Tier 2 command line (the chat text, '/'-prefixed and already
 // sanitised). `regionLimiter` is the connection's REGION pacing — `/resync` is a
 // REGION by another name and is paced by the same budget, so it cannot be used
@@ -2708,6 +3538,9 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
     if (tok.empty()) return;
     const std::string verb = tok[0];
     const int argc = (int)tok.size() - 1;
+    // `/login` never gets here (the MSG handler takes it first, see handleLogin).
+    // If it ever did, drop it rather than let the audit below see a PIN.
+    if (verb == "/login") return;
 
     if (!we.cmds.allow(monoSeconds())) return;   // command spam; silent, costs nothing
 
@@ -2719,7 +3552,7 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
 
     // ⚠️ The permission gate. It is here, once, before dispatch — not in each
     // handler, which is how the patch this replaces came to have none at all.
-    const int level = weLevel(username);
+    const int level = weLevel(s, username);
     const int need = (verb == "/tp") ? ewb::we_tp_required_level(argc) : spec->min_level;
     if (level < need) {
         weSay(s, "You do not have permission for that (level " + std::to_string(need) + " required).");
@@ -2886,11 +3719,108 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
         return;
     }
 
+    // --- protected zones (stage 8.7) ------------------------------------------
+    //
+    // Level 2 (the table's floor, checked above) **and** logged in with a PIN: a
+    // zone is the one thing that stops other players, so an operator's claimed name
+    // is not enough to make or remove one. Every change goes through the same
+    // snapshot-copy-save-swap as the control socket's zone:* verbs (zonePublish),
+    // and is audited by the gate above with the command line.
+    if (verb == "/zone") {
+        std::string rosterName;
+        if (!sessionIdentity(s, rosterName)) {
+            weSay(s, "Zone commands need you to be logged in: /login <pin>.");
+            return;
+        }
+        if (!ewb::we_zone_args_ok(tok)) { weSay(s, "Usage: " + std::string(spec->usage)); return; }
+        const std::string& sub = tok[1];
+        auto boxText = [](const ewb::Zone& z) {
+            return "(" + std::to_string(z.x0) + "," + std::to_string(z.y0) + "," + std::to_string(z.z0) +
+                   ")..(" + std::to_string(z.x1) + "," + std::to_string(z.y1) + "," + std::to_string(z.z1) + ")";
+        };
+
+        if (sub == "list") {
+            int page = 1;
+            if (tok.size() == 3 && !ewb::we_parse_int(tok[2], page)) page = 1;
+            const auto zs = zonesSnapshot();
+            if (!zs || zs->size() == 0) { weSay(s, "No protected zones."); return; }
+            const int per = 5;
+            const int pages = ((int)zs->size() + per - 1) / per;
+            if (page < 1 || page > pages) { weSay(s, "Page must be 1.." + std::to_string(pages) + "."); return; }
+            weSay(s, "--- zones " + std::to_string(page) + "/" + std::to_string(pages) + " (" +
+                         std::to_string(zs->size()) + ") ---");
+            for (int i = (page - 1) * per; i < (int)zs->size() && i < page * per; ++i) {
+                const ewb::Zone& z = zs->zones()[(size_t)i];
+                weSay(s, z.name + " " + boxText(z) + (z.enforced ? "" : " off") +
+                             (z.hasLevel ? " level " + std::to_string(z.level) : ""));
+            }
+            return;
+        }
+
+        if (sub == "here") {
+            int fx, fy, fz;
+            if (!weFeet(s, fx, fy, fz)) { weSay(s, "The server does not have your position yet."); return; }
+            const auto zs = zonesSnapshot();
+            std::string hit;
+            for (const ewb::Zone& z : zs->zones())
+                if (z.contains(fx, fy, fz))
+                    hit += (hit.empty() ? "" : ", ") + z.name + (z.enforced ? "" : " (off)");
+            weSay(s, hit.empty() ? "You are not in a protected zone." : "You are in: " + hit + ".");
+            return;
+        }
+
+        std::lock_guard<std::mutex> editLk(g_zonesEditMtx);
+        ewb::ZoneSet next = *zonesSnapshot();
+        std::string err;
+
+        if (sub == "rm") {
+            if (!next.remove(tok[2])) { weSay(s, "There is no zone named '" + tok[2] + "'."); return; }
+            if (!zonePublish(std::move(next), err)) { weSay(s, "Could not save the zones: " + err); return; }
+            weSay(s, "Removed zone '" + tok[2] + "'.");
+            return;
+        }
+
+        // create: the //pos1..//pos2 box. A zone is about stopping edits, and a
+        // selection is usually drawn on the surface, so by default it covers the
+        // whole column (bedrock to sky, as a map-drawn zone does) — `exact` keeps
+        // the selection's own heights.
+        if (!we.sel.complete()) { weSay(s, "Set //pos1 and //pos2 first."); return; }
+        ewb::WeBox box;
+        long long vol = 0;
+        we.sel.box(box, LLONG_MAX, vol);
+        const bool exact = tok.size() == 4;
+        const int y0 = exact ? box.y0 : 0, y1 = exact ? box.y1 : SV_WORLD_HEIGHT - 1;
+        const std::string zl = tok[2] + ":" + std::to_string(box.x0) + ":" + std::to_string(y0) + ":" +
+                               std::to_string(box.z0) + ":" + std::to_string(box.x1) + ":" +
+                               std::to_string(y1) + ":" + std::to_string(box.z1) + ":all";
+        ewb::Zone z;
+        if (!ewb::zone_parse_line(zl, z, &err)) { weSay(s, "Cannot make that zone: " + err + "."); return; }
+        if (!next.add(z, &err)) { weSay(s, "Cannot make that zone: " + err + "."); return; }
+        if (!zonePublish(std::move(next), err)) { weSay(s, "Could not save the zones: " + err); return; }
+        weSay(s, "Protected zone '" + z.name + "' " + boxText(z) + " created. Nobody can edit inside it in game.");
+        return;
+    }
+
     // --- selection -----------------------------------------------------------
 
     if (verb == "//pos1" || verb == "//pos2") {
-        int x, y, z;
-        if (!weFeet(s, x, y, z)) { weSay(s, "The server does not have your position yet."); return; }
+        // No arguments: your feet. Three: an explicit corner (stage 3.7), in the
+        // `/tp` grammar with `~` relative to your feet — so `//pos1 ~ ~ ~` is
+        // `//pos1`, and a corner given in absolute numbers needs no position at
+        // all, which is what lets a tool set a selection without walking to it.
+        if (!ewb::we_pos_args_ok(argc)) { weSay(s, "Usage: " + std::string(spec->usage)); return; }
+        int x = 0, y = 0, z = 0;
+        const bool relative = argc == 0 || ewb::we_coord_relative(tok[1]) ||
+                              ewb::we_coord_relative(tok[2]) || ewb::we_coord_relative(tok[3]);
+        if (relative && !weFeet(s, x, y, z)) { weSay(s, "The server does not have your position yet."); return; }
+        if (argc == 3) {
+            if (!ewb::we_parse_cell(tok[1], x, x) || !ewb::we_parse_cell(tok[2], y, y) ||
+                !ewb::we_parse_cell(tok[3], z, z)) {
+                weSay(s, "Usage: " + verb + " <x> <y> <z>  (~ is your feet)");
+                return;
+            }
+            if (!weCellInRange(x, y, z)) { weSay(s, "That corner is outside the world."); return; }
+        }
         if (verb == "//pos1") we.sel.set1(x, y, z); else we.sel.set2(x, y, z);
         std::string msg = verb.substr(2) + " = " + std::to_string(x) + ", " +
                           std::to_string(y) + ", " + std::to_string(z);
@@ -2920,7 +3850,7 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
             if (walls && x != box.x0 && x != box.x1 && z != box.z0 && z != box.z1) return false;
             nt = type; nc = color;
             return true;
-        }, s);
+        }, s, we.zoneSkip);
         weFinish(we, s, username, verb, std::move(batch));
         return;
     }
@@ -2938,13 +3868,17 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
         if (!weSelection(we, s, box)) return;
         // Painting an untouched cell records it as SV_PAINTED_BASE: "the natural
         // block that was here, now painted". That sentinel is exactly what the
-        // ACTION paint path and the SNAPZ encoder already agree on.
+        // ACTION paint path and the SNAPZ encoder already agree on, and it is
+        // relayed as a lone paint (ewb::we_emit_edit_wire). An untouched cell
+        // arrives here as its natural block, so `ct == SV_AIR` is carved air *or*
+        // open sky — neither has anything to paint (3.7 A: every sky cell in the
+        // box used to become a painted-base cell).
         auto batch = weEditBox(box, [&](int, int, int, bool have, int ct, int, int& nt, int& nc) {
-            if (have && ct == SV_AIR) return false;      // don't paint carved air
+            if (ct == SV_AIR) return false;              // nothing to paint
             nt = have ? ct : SV_PAINTED_BASE;
             nc = color;
             return true;
-        }, s);
+        }, s, we.zoneSkip);
         weFinish(we, s, username, verb, std::move(batch));
         return;
     }
@@ -2964,7 +3898,7 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
             if (colorFilter >= 0 && cc != colorFilter) return false;
             nt = to; nc = color;
             return true;
-        }, s);
+        }, s, we.zoneSkip);
         weFinish(we, s, username, verb, std::move(batch));
         return;
     }
@@ -2996,7 +3930,7 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
             if (colorFilter >= 0 && cc != colorFilter) return false;
             nt = to; nc = color;
             return true;
-        }, s);
+        }, s, we.zoneSkip);
         weFinish(we, s, username, verb, std::move(batch));
         return;
     }
@@ -3040,7 +3974,7 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
             if (!in) return false;
             nt = type; nc = color;
             return true;
-        }, s);
+        }, s, we.zoneSkip);
         weFinish(we, s, username, verb, std::move(batch));
         return;
     }
@@ -3062,7 +3996,8 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
                     for (int y = box.y0; y <= box.y1; ++y) {
                         Cell c;
                         if (!worldGet(x, y, z, c)) continue;   // untouched cells aren't ours to copy
-                        clip.push_back({x - fx, y - fy, z - fz, c.type, c.color});
+                        ewb::ClipCell cell{x - fx, y - fy, z - fz, 0, 0};
+                        if (ewb::we_clip_cell(y, c.type, c.color, cell)) clip.push_back(cell);
                     }
         }
         we.clip.swap(clip);
@@ -3079,7 +4014,7 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
         want.reserve(we.clip.size());
         for (const ewb::ClipCell& c : we.clip)
             want.push_back({fx + c.rx, fy + c.ry, fz + c.rz, 0, 0, c.type, c.color});
-        weFinish(we, s, username, verb, weCommit(want, s));
+        weFinish(we, s, username, verb, weCommit(want, s, we.zoneSkip));
         return;
     }
 
@@ -3103,26 +4038,33 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
 
     if (verb == "//undo" || verb == "//redo") {
         const bool undo = (verb == "//undo");
-        std::vector<ewb::WeEdit> batch;
-        if (!(undo ? we.hist.take_undo(batch) : we.hist.take_redo(batch))) {
+        const auto& stack = undo ? we.hist.undo : we.hist.redo;
+        if (stack.empty()) {
             weSay(s, undo ? "Nothing to undo." : "Nothing to redo.");
             return;
         }
-        if (!weCharge(we, s, (long long)batch.size())) return;
+        // Charged before the batch moves stacks: a refused //undo used to move
+        // it to the redo stack unapplied, silently skipping it (stage 3.7).
+        if (!weCharge(we, s, (long long)stack.back().size())) return;
+        std::vector<ewb::WeEdit> batch;
+        if (undo) we.hist.take_undo(batch); else we.hist.take_redo(batch);
         // Undo replays the batch backwards. A cell nobody had touched before the
-        // edit is restored to `type 0` (air), not to an erased entry: `erase`
-        // means "fall back to base terrain" in the model but there is no wire
-        // message that says that, so erasing would desync every client that saw
-        // the edit — plan §0.5.7 defect 4, in reverse.
+        // edit was recorded as its natural block (weRead), so that is what comes
+        // back — written as an explicit block and relayed as a build, which every
+        // client applies. It is not restored by erasing the entry: `erase` means
+        // "fall back to base terrain" in the model but there is no wire message
+        // that says that, so it would desync every client that saw the edit —
+        // plan §0.5.7 defect 4, in reverse. (Before 3.7 G the record said air.)
         const std::vector<ewb::WeEdit> apply = undo ? ewb::we_invert(batch) : batch;
         std::vector<ewb::WeEdit> want;
         want.reserve(apply.size());
         for (const ewb::WeEdit& e : apply)
             want.push_back({e.x, e.y, e.z, 0, 0, e.newType, e.newColor});
-        const auto done = weCommit(want, s);
+        const auto done = weCommit(want, s, we.zoneSkip);
         if (!done.empty())
             auditLog("player:" + username, verb + ": " + std::to_string(done.size()) + " cell(s)");
         drainSignRemovals();   // an undone build or a redone mine can remove signs
+        weZoneReport(we, s, username, verb);
         weSay(s, std::string(undo ? "Undid " : "Redid ") + std::to_string(done.size()) + " block(s).");
         return;
     }
@@ -3143,7 +4085,7 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
         const std::vector<ewb::WeEdit> want = {
             {fx, destY - 1, fz, 0, 0, (unsigned char)SV_WE_PLATFORM_BLOCK, 0}
         };
-        auto batch = weCommit(want, s);
+        auto batch = weCommit(want, s, we.zoneSkip);
         if (!batch.empty()) {
             we.hist.record(std::move(batch));
             editsDirty = true;
@@ -3151,6 +4093,7 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
                                            std::to_string(destY - 1) + "," + std::to_string(fz));
         }
         weTeleport(s, username, (float)fx, (float)(destY + 1), (float)fz);
+        weZoneReport(we, s, username, verb);   // a teleport is not an edit; the platform is
         weSay(s, "Whoosh.");
         return;
     }
@@ -3166,11 +4109,28 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
 // The sign goes into its slot — same block, same face (sign_store.h) — replacing
 // what was there. The list and the SIGNQ burst change at once; the sidecar follows
 // on the next save, like the world.
-static void handleSignWrite(SOCKET s, const std::string& who, const std::string& line) {
+static void handleSignWrite(SOCKET s, const std::string& who, const std::string& line,
+                            ewb::TokenBucket& zoneNotice) {
     ewb::Sign sign;
     if (!ewb::parse_client_signp(line, sign)) {
         if (g_verbose) std::cout << "[Server] malformed SIGNP from " << who << ": "
                                  << line.substr(0, 64) << std::endl;
+        return;
+    }
+    // A sign on a protected block (stage 8.2): not stored, not relayed. If the slot
+    // already held a sign, the writer's client is now showing their edit over it, so
+    // the original is sent back. A brand-new sign has nothing to send back and no line
+    // we know of un-draws it; nobody else ever sees it, and its writer loses it on
+    // their next join (LIVE-FINDINGS 8.0 E4).
+    if (const ewb::Zone* zn = zoneDenies(zoneCheck(s), sign.x, sign.y, sign.z)) {
+        std::string back;
+        {
+            std::lock_guard<std::mutex> lk(g_signMtx);
+            for (const ewb::Sign& cur : g_signs)
+                if (ewb::same_sign_slot(cur, sign)) back += ewb::format_signp(cur);
+        }
+        if (!back.empty()) sendWorldTo(s, back);
+        zoneRefused(s, zoneNotice, who, zn->name, "sign", sign.x, sign.y, sign.z);
         return;
     }
     ewb::SignUpsert r;
@@ -3211,9 +4171,14 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
     ewb::TokenBucket chatBucket(SV_CHAT_BURST, SV_CHAT_RATE);   // stage 7.14: MSG
     ewb::TokenBucket chatThrottleNotice(1.0, 1.0 / 10.0);   // tell the player, but <= 1 per 10 s
     WeSession we;                 // Tier 2 selection / clipboard / undo (stage 3.3)
+    ewb::TokenBucket loginAttempts(3.0, 1.0 / 10.0);   // /login: 3 at once, then 1 per 10 s (stage 8.6)
     ewb::TokenBucket signWriteBucket(SV_SIGNP_BURST, SV_SIGNP_RATE);   // player SIGNP writes
     bool signWarned = false;      // log the first sign-write refusal, not each one
     ewb::TokenBucket capNotice(1.0, 1.0 / 30.0);   // "world is full" to this player, <= 1 per 30 s
+    ewb::TokenBucket burnTruncNotice(1.0, 1.0 / 30.0);  // "that chain was too big" (stage 7.19)
+    ewb::TokenBucket burnTruncLog(1.0, 1.0 / 30.0);     // ...and the operator's copy of it
+    ewb::TokenBucket zoneNotice(1.0, 1.0 / 10.0);   // "this area is protected", <= 1 per 10 s (stage 8.2)
+    ewb::TokenBucket zoneTruncNotice(1.0, 1.0 / 30.0);  // "too much of that blast to put back"
     // "Invalid POS/VEL/POSVEL/ACTION message" were unconditional and per-malformed-
     // packet, so a garbage-packet flood was an unthrottled journal flood too
     // (stage 7.12). Same shape as capNotice: <= 1 line per 30 s per connection.
@@ -3500,10 +4465,57 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                             std::cout << "[" << username << "] Unknown action mode: " << mode << std::endl;
                             continue;
                     }
+                    // Protected zones (stage 8.2). Here — after the edit budget, so a
+                    // refused edit still spends its tokens and hammering a protected
+                    // wall is paced like any other editing; before simAction, so the
+                    // model is never touched. Not relayed: no peer ever sees it. The
+                    // sender already drew it, so they get the cell put back.
+                    const ZoneCheck zc = zoneCheck(clientSocket);
+                    if (const ewb::Zone* zn = zoneDenies(zc, x, y, z)) {
+                        static const char* const kVerb[] = {"build", "mine", "burn", "paint"};
+                        ewb::ZoneCellSet back;
+                        back.add(x, y, z);
+                        // A burn on a protected TNT or firework: the sender's client set it
+                        // off — and its sphere with it — before asking. Put that sphere back
+                        // too. (Links it chained from there are not modelled; see
+                        // docs/protocol.md "Protected zones".)
+                        if (mode == 2) {
+                            Cell c;
+                            bool explosive;
+                            { std::lock_guard<std::mutex> lk(g_worldMtx);
+                              explosive = worldGet(x, y, z, c) && (c.type == SV_TNT || c.type == SV_FIREWORK); }
+                            if (explosive)
+                                ewb::explode_for_each_blast_cell(x, y, z, 0, SV_WORLD_HEIGHT,
+                                    [&](int bx, int by, int bz) {
+                                        if (ewb::ws_in_world(bx, by, bz)) back.add(bx, by, bz);
+                                    });
+                        }
+                        scheduleRestore(myOut, back.cells());
+                        zoneRefused(clientSocket, zoneNotice, username, zn->name, kVerb[mode], x, y, z);
+                        continue;
+                    }
+                    // A burn anywhere else can still reach into a zone: the chain is
+                    // told which zones are within its reach, and collects what it hit.
+                    ZoneBlast blast;
+                    if (mode == 2)
+                        blast.near = zoneCheckNear(zc, x - ewb::EXPLODE_REACH, y - ewb::EXPLODE_REACH,
+                                                   z - ewb::EXPLODE_REACH, x + ewb::EXPLODE_REACH,
+                                                   y + ewb::EXPLODE_REACH, z + ewb::EXPLODE_REACH);
+
                     // Simulate the action into the authoritative world model so the
                     // server always has an accurate picture (handles TNT/paint
                     // explosions and burning too).
-                    const size_t refused = simAction(mode, x, y, z, extra);
+                    const ewb::ExplodeResult act = simAction(mode, x, y, z, extra,
+                                                             blast.near.zones ? &blast : nullptr);
+                    const size_t refused = act.refused;
+                    // A chain is charged for the blasts it actually ran, over the flat
+                    // SV_ACTION_COST_BURN paid upfront (stage 7.19): the upfront cost
+                    // can't know how much of the world one BURN would touch, and
+                    // without this a player may hold g_worldMtx for a budgeted chain
+                    // eight times a second, indefinitely.
+                    if (SV_ACTION_RATE > 0.0 && act.explosions > (size_t)SV_ACTION_COST_BURN)
+                        actionBucket.charge(monoSeconds(),
+                                            (double)act.explosions - SV_ACTION_COST_BURN);
                     // A mine or a blast that took a sign's block took the sign. The client
                     // sends nothing for the sign itself (LIVE-FINDINGS 2026-09-11).
                     drainSignRemovals();
@@ -3530,12 +4542,54 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     // Relay the ORIGINAL action to everyone EXCEPT the sender (who
                     // already applied it locally). Peers re-simulate it themselves;
                     // the model above is what late joiners are snapshotted from.
-                    broadcastWorld(broadcastMsg, clientSocket);
-                    // A burn is relayed even when part of its blast was refused:
-                    // every client simulates the explosion itself regardless.
+                    broadcastWorld(std::move(broadcastMsg), clientSocket);
+                    // The blast reached into a zone. Every client — the sender and each
+                    // peer the relay just reached — runs the whole blast itself, zones
+                    // unknown to it, so every one of them gets the protected cells put
+                    // back, queued behind the relay. A protected TNT did not go off here
+                    // but will on every client, so its sphere is restored as well.
+                    if (!blast.hit.empty()) {
+                        for (const ewb::RevertCell& t : blast.explosives)
+                            ewb::explode_for_each_blast_cell(t.x, t.y, t.z, 0, SV_WORLD_HEIGHT,
+                                [&](int bx, int by, int bz) {
+                                    if (ewb::ws_in_world(bx, by, bz)) blast.hit.add(bx, by, bz);
+                                });
+                        scheduleRestore(nullptr, blast.hit.cells());
+                        zoneRefused(clientSocket, zoneNotice, username, blast.zone, "blast",
+                                    blast.fx, blast.fy, blast.fz);
+                        // Past ZONE_BURN_RESTORE_MAX the rest is intact on the server but
+                        // not redrawn; a rejoin shows it. Say so rather than leave a crater
+                        // that looks real.
+                        if (blast.hit.overflow() && zoneTruncNotice.allow(monoSeconds())) {
+                            sendLine(clientSocket, "[Server] That explosion hit a protected area. It is"
+                                                   " intact, but some of it may look damaged until you rejoin.\n");
+                            std::cerr << "[Server] BURN from " << username << " reached zone " << blast.zone
+                                      << ": restore capped at " << ewb::ZONE_BURN_RESTORE_MAX
+                                      << " cells; the rest is intact on the server but not redrawn." << std::endl;
+                        }
+                    }
+                    // A burn is relayed even when part of its blast was refused or the
+                    // chain was truncated: every client simulates the explosion itself
+                    // regardless, so the relay is what keeps the *other* players in step
+                    // with the sender. What the server keeps can differ — see below.
                     if (refused && capNotice.allow(monoSeconds()))
                         weSay(clientSocket, "This world is full, so part of that explosion was"
                                             " not saved. Please tell the server operator.");
+                    // Truncation is not a full world: the chain hit --burn-max-cells,
+                    // so the server stopped detonating while the clients did not. The
+                    // TNT the server did not reach is still in the saved world and will
+                    // be there again on the next join, which is worth saying plainly.
+                    if (act.truncated) {
+                        if (burnTruncNotice.allow(monoSeconds()))
+                            weSay(clientSocket, "That explosion chain was too big to finish;"
+                                                " some of the TNT is still there on the server.");
+                        if (burnTruncLog.allow(monoSeconds()))
+                            std::cerr << "[Server] BURN chain from " << username << " hit --burn-max-cells "
+                                      << g_burnMaxCells << " (" << act.explosions << " blasts, "
+                                      << act.visits << " cells read); " << act.truncated
+                                      << " link(s) dropped. Raise it if players report TNT"
+                                         " reappearing." << std::endl;
+                    }
                 } catch (...) {
                     if (invalidMsgNotice.allow(monoSeconds()))
                         std::cout << "[Server] Invalid ACTION message from " << username << std::endl;
@@ -3562,6 +4616,13 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                 // below applies only to actual broadcast chat, not commands.
                 // (Reaching here at all means JOIN succeeded — stage 7.17's gate.)
                 if (msgContent[0] == '/') {
+                    // /login first, and before the WorldEdit switch: identity is not
+                    // WorldEdit, and this keeps the PIN away from every path that logs.
+                    if (msgContent.compare(0, 6, "/login") == 0 &&
+                        (msgContent.size() == 6 || msgContent[6] == ' ' || msgContent[6] == '\t')) {
+                        handleLogin(clientSocket, username, clientIP, msgContent, loginAttempts);
+                        continue;
+                    }
                     if (!g_weEnabled) { weSay(clientSocket, "Commands are disabled on this server."); continue; }
                     handleWorldEditLine(clientSocket, username, msgContent, we, regionLimiter);
                     continue;
@@ -3730,10 +4791,15 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     { std::lock_guard<std::mutex> lk(g_motdMtx); motd = g_motdLines; }
                     for (const std::string& l : motd) sendLine(clientSocket, l);
                 }
+                // A PIN-protected name (stage 8.6): say how to claim it. Ordinary chat,
+                // like the MOTD, so the join sequence's wire shape is unchanged.
+                if (nameHasPin(username))
+                    sendLine(clientSocket, "[Server] The name " + username + " is protected. Type "
+                                           "/login <pin> to use its permissions.\n");
 
                 // 3. capability advertisement. This is what tells the client to ask
-                //    for terrain with REGION instead of expecting a push; VuencLink
-                //    will not send a REGION until it sees this line.
+                //    for terrain with REGION instead of expecting a push; the reference
+                //    test client will not send a REGION until it sees this line.
                 sendLine(clientSocket, "CAPS:region\n");
 
                 // 4. SPAWN — this name's saved position if it has one, otherwise
@@ -3802,14 +4868,14 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     }
                     continue;
                 }
-                handleSignWrite(clientSocket, username, message);
+                handleSignWrite(clientSocket, username, message, zoneNotice);
             }
             // PING -> PONG. Bare line, bare reply, no arguments echoed — this is what
             // the capture shows and it is what gives a client a real RTT.
             // ⚠️ Not the same thing as the *outbound* matchmaker `PING:<count>`
             // heartbeat in matchmakerThread(). Deliberately unlogged even under
-            // --verbose: it is per-client and frequent (VuencLink sends one every
-            // 10 s), and a log line per ping drowns everything else.
+            // --verbose: it is per-client and frequent (the reference test client
+            // sends one every 10 s), and a log line per ping drowns everything else.
             else if (command == "PING") {
                 // Short enough to live in the std::string's own storage, so the
                 // per-ping cost is the same as the deleted (SOCKET, char*, size_t)
@@ -3884,11 +4950,14 @@ int main(int argc, char* argv[]) {
     //   --matchmaker HOST[:PORT]
     //   --region-radius N  --no-region-sort  --no-region-empty-frame
     //   --action-rate N  --action-burst N   (0 = unlimited)
+    //   --burn-max-cells N  (cells one TNT chain may read before it is truncated)
     //   --move-rate N  --move-burst N   --chat-rate N  --chat-burst N   (0 = unlimited)
     //   --legacy-snapshot  --connect-limit N  --tcp-nodelay 0|1  (1 = default, disables Nagle)
     //   --auth-fail-limit N  --handshake-timeout N  --idle-timeout-conn N  (0 = off)
     //   --stale-session-secs N  (0 = never evict a same-address duplicate name)
     //   --control-rate N  --control-burst N  --control-max-conns N  --audit-file FILE
+    //   --zones-file FILE  --zone-revert-delay-ms N  (0 = restore refused edits at once)
+    //   --auth-file FILE   (login PINs; default <worlddir>/eden_auth.txt)
     // A bare leading number is still accepted as the port (back-compat).
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -3967,17 +5036,23 @@ int main(int argc, char* argv[]) {
         // --we-rate 0 disables the cell budget but the per-command cap stands.
         else if (a == "--no-worldedit")      g_weEnabled      = false;
         else if (a == "--we-max-cells")      g_weMaxCells     = std::atoll(next("131072").c_str());
+        else if (a == "--burn-max-cells")    g_burnMaxCells   = (size_t)std::atoll(next("1048576").c_str());
+        // Protected zones (stage 8.2).
+        else if (a == "--zones-file")        g_zonesFile      = next("");
+        // Player identity (stage 8.6).
+        else if (a == "--auth-file")         g_authFile       = next("");
+        else if (a == "--zone-revert-delay-ms") g_zoneRevertDelayMs = std::atoi(next("1000").c_str());
         else if (a == "--we-undo-budget")    g_weUndoBudget   = (size_t)std::atoll(next("2097152").c_str());
         else if (a == "--we-rate")           g_weCellRate     = std::atof(next("32768").c_str());
         else if (a == "--we-burst")          g_weCellBurst    = std::atof(next("262144").c_str());
         // REGION tuning. --region-radius exists because hosting our own server is
         // the only place the derived R = 224 can be varied experimentally without
         // burning someone else's CPU (plan §1.1); leave it alone for normal hosting,
-        // since VuencLink's coverage lattice is built around 224.
+        // since the reference test client's coverage lattice is built around 224.
         else if (a == "--region-radius") g_regionRadius = std::atoi(next("224").c_str());
         else if (a == "--no-region-sort") g_regionSort = false;
         // Empty regions are answered with a well-formed `SNAPZ:0:` by default (1.8
-        // rung 2/3: VuencLink counts a real frame as "answered" and resets its
+        // rung 2/3: the reference test client counts a real frame as "answered" and resets its
         // consecutive-empty abort; with silence it hangs on "waiting for the world
         // snapshot" and a 9-region sweep aborts three points in). --no-region-empty-frame
         // restores pre-1.8 silence for A/B testing against the real client (1.9).
@@ -4059,7 +5134,7 @@ int main(int argc, char* argv[]) {
     }
     if (g_regionRadius != ewb::REGION_RADIUS)
         std::cout << "[Server] REGION radius " << g_regionRadius
-                  << " (non-default — VuencLink's coverage lattice assumes "
+                  << " (non-default — the reference test client's coverage lattice assumes "
                   << ewb::REGION_RADIUS << ")" << std::endl;
 
     // Runtime edited-cell ceiling (stage 5.3). A value below 1 is a typo, not a
@@ -4188,6 +5263,27 @@ int main(int argc, char* argv[]) {
                          : g_worldFile.substr(0, slash + 1) + "eden_motd.txt";
     }
 
+    // Protected zones (stage 8.2): <worlddir>/eden_zones.txt, the same rule again.
+    if (g_zonesFile.empty()) {
+        const size_t slash = g_worldFile.find_last_of('/');
+        g_zonesFile = (slash == std::string::npos)
+                          ? std::string("eden_zones.txt")
+                          : g_worldFile.substr(0, slash + 1) + "eden_zones.txt";
+    }
+    // Login PINs (stage 8.6): <worlddir>/eden_auth.txt, the same rule.
+    if (g_authFile.empty()) {
+        const size_t slash = g_worldFile.find_last_of('/');
+        g_authFile = (slash == std::string::npos)
+                         ? std::string("eden_auth.txt")
+                         : g_worldFile.substr(0, slash + 1) + "eden_auth.txt";
+    }
+    if (g_zoneRevertDelayMs < 0 || g_zoneRevertDelayMs > ewb::ZONE_REVERT_MAX_DELAY_MS) {
+        std::cerr << "[Server] --zone-revert-delay-ms " << g_zoneRevertDelayMs << " out of range (0.."
+                  << ewb::ZONE_REVERT_MAX_DELAY_MS << "); using " << ewb::ZONE_REVERT_DEFAULT_DELAY_MS
+                  << "." << std::endl;
+        g_zoneRevertDelayMs = ewb::ZONE_REVERT_DEFAULT_DELAY_MS;
+    }
+
     // Default the player-position file to <worlddir>/eden_players.txt, the same
     // directory the world/spawn files live in. 5.3 did this for the spawn sidecar
     // and missed this one, so every world hosted from one cwd shared a single
@@ -4271,6 +5367,25 @@ int main(int argc, char* argv[]) {
     loadBans();
     loadOps();
     {
+        // Before the zones, so a levelled zone can say whether anyone could bypass it.
+        std::string err;
+        if (!loadAuth(err)) {
+            std::cerr << "[Server] " << err << "\n[Server] Refusing to start with login PINs"
+                         " unreadable: fix or remove the line (every PIN-protected name's op level would"
+                         " otherwise go to whoever claims it)." << std::endl;
+            return 2;
+        }
+    }
+    {
+        std::string err;
+        if (!loadZones(err)) {
+            std::cerr << "[Server] " << err << "\n[Server] Refusing to start with protected zones"
+                         " unreadable: fix or remove the line (every zone on file would otherwise be"
+                         " unprotected)." << std::endl;
+            return 2;
+        }
+    }
+    {
         // eden_motd.txt: the welcome message shown on join. Absent is normal and
         // silent (the `--signs` convention); a present one is worth a line,
         // because "why don't players see my MOTD" is otherwise unanswerable.
@@ -4288,6 +5403,7 @@ int main(int argc, char* argv[]) {
     if (g_connectLimit <= 0)
         std::cout << "[Server] --connect-limit 0: per-IP connect pacing disabled." << std::endl;
     g_authFail.set_threshold((size_t)std::max(g_authFailLimit, 0));
+    g_loginFail.set_threshold((size_t)std::max(g_authFailLimit, 0));   // /login, same policy (8.6)
     if (g_authFailLimit <= 0)
         std::cout << "[Server] --auth-fail-limit 0: per-IP wrong-password lockout disabled." << std::endl;
     if (g_handshakeTimeout <= 0)
@@ -4297,11 +5413,19 @@ int main(int argc, char* argv[]) {
         std::cout << "[Server] --idle-timeout-conn 0: post-JOIN idle read timeout disabled." << std::endl;
     if (!g_regionEmptyFrame)
         std::cout << "[Server] --no-region-empty-frame: unbuilt regions answered with silence." << std::endl;
+    if (g_burnMaxCells < ewb::EXPLODE_VISITS_PER_BLAST) {
+        std::cerr << "[Server] --burn-max-cells " << g_burnMaxCells << " is below one blast ("
+                  << ewb::EXPLODE_VISITS_PER_BLAST << " cells); using that." << std::endl;
+        g_burnMaxCells = ewb::EXPLODE_VISITS_PER_BLAST;
+    }
     if (SV_ACTION_RATE <= 0.0)
         std::cout << "[Server] --action-rate 0: per-connection ACTION rate limit disabled." << std::endl;
     else
         std::cout << "[Server] ACTION budget: " << SV_ACTION_RATE << "/s, "
-                  << SV_ACTION_BURST << " burst (BURN costs " << SV_ACTION_COST_BURN << ")." << std::endl;
+                  << SV_ACTION_BURST << " burst (BURN costs " << SV_ACTION_COST_BURN
+                  << " upfront, then 1 per blast past that)." << std::endl;
+    std::cout << "[Server] BURN chain budget: " << g_burnMaxCells << " cells read (~"
+              << g_burnMaxCells / ewb::EXPLODE_VISITS_PER_BLAST << " blasts) per ACTION." << std::endl;
     if (SV_MOVE_RATE <= 0.0)
         std::cout << "[Server] --move-rate 0: per-connection movement rate limit disabled." << std::endl;
     else
@@ -4340,6 +5464,16 @@ int main(int argc, char* argv[]) {
     else
         std::cout << "[Server] Audit log: stdout and " << g_auditFile << "." << std::endl;
 
+    // Protected zones (stage 8.2). The restore thread only exists when there is a delay
+    // to wait out; with 0 a refusal's restore is sent by the thread that refused it.
+    {
+        const size_t nz = zonesSnapshot()->size();
+        if (nz)
+            std::cout << "[Server] Protected zones: " << nz << ". Refused edits are put back after "
+                      << g_zoneRevertDelayMs << " ms (--zone-revert-delay-ms)." << std::endl;
+        if (g_zoneRevertDelayMs > 0) std::thread(revertThread).detach();
+    }
+
     // Tier 1 operator control socket (stage 3.2).
     if (g_controlEnabled) {
         std::thread(controlThread).detach();
@@ -4353,6 +5487,7 @@ int main(int argc, char* argv[]) {
             saveWorld();
             savePlayerPos();
             saveSigns();
+            flushZoneAudit();   // denial counts folded into closed windows (stage 8.2)
             // Self-shutdown for on-demand hosted worlds: exit once we've had no
             // clients for --idle-timeout seconds (covers both "nobody ever joined"
             // and "everyone left"). The matchmaker then drops us from its list.

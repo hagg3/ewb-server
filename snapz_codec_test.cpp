@@ -10,8 +10,8 @@
 //   * every 5xLE-i32 record survives byte-for-byte, including negatives (air = -1)
 //   * base64 output carries no '=' padding
 //
-// The produced frame is additionally fed to VuencLink's
-// world::snapz::decode_frame by a #[test] in apps/vuenclink/src-tauri/src/world/snapz.rs
+// The produced frame is additionally cross-checked against a reference Rust
+// SNAPZ decoder (`decode_frame`) in a companion test client's own test suite
 // (see `accepts_a_cpp_encoded_frame`).
 
 #include <cstdio>
@@ -114,10 +114,38 @@ static void run_empty() {
     CHECK(raw.empty(), "empty burst inflates to 0 bytes");
 }
 
+// Stage 7.30: raw_inflate must throw on input that can never finish and on output past
+// its cap, rather than doubling its buffer forever.
+template <class F>
+static bool throws(F f) {
+    try { f(); } catch (const std::exception&) { return true; }
+    return false;
+}
+
+static void run_bounded_inflate() {
+    CHECK(throws([] { ewb::raw_inflate(nullptr, 0); }), "empty input throws instead of spinning");
+
+    const std::vector<uint8_t> zeros(1 << 20, 0);
+    const std::vector<uint8_t> packed = ewb::raw_deflate(zeros);
+    CHECK(ewb::raw_inflate(packed.data(), packed.size()).size() == zeros.size(),
+          "a well-formed stream still inflates under the default cap");
+
+    CHECK(throws([&] { ewb::raw_inflate(packed.data(), packed.size() / 2); }),
+          "a truncated stream throws");
+    CHECK(throws([&] { ewb::raw_inflate(packed.data(), packed.size(), 0, zeros.size() / 2); }),
+          "output past max_out throws (decompression bomb)");
+    CHECK(ewb::raw_inflate(packed.data(), packed.size(), 0, zeros.size()).size() == zeros.size(),
+          "output exactly at max_out is allowed");
+    CHECK(throws([] { const uint8_t junk[4] = {0xff, 0xff, 0xff, 0xff};
+                      ewb::raw_inflate(junk, sizeof junk); }),
+          "garbage throws");
+}
+
 int main(int argc, char** argv) {
     const bool emit = argc > 1 && std::strcmp(argv[1], "--emit") == 0;
     run_round_trip(emit);
     if (!emit) run_empty();
+    if (!emit) run_bounded_inflate();
     if (g_fail) {
         std::fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;

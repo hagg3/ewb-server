@@ -6,7 +6,7 @@
 // only sockets, threads, and the optional on-demand HOST spawn.
 //
 // Build:  part of build_server.sh  (also: c++ -std=c++17 -O2 -pthread edenmatch.cpp -o edenmatch)
-// Run:    ./edenmatch [--port 27020] [--advertise-ip IP] [--verbose]
+// Run:    ./edenmatch [--port 27020] [--advertise-ip IP] [--trust-advertise CIDR,...] [--verbose]
 //         SERVER: row width: default is the 7-field capture grammar; --prod-list emits the
 //                           6-field form, --short-list the 4-field sketch form (see matchmaker.h)
 //         on-demand hosting: --allow-host [--edenserver PATH] [--host-ports LO-HI] [--world DIR]
@@ -35,6 +35,7 @@
 #include <iostream>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
 
 using namespace edenmatch;
 
@@ -67,6 +68,21 @@ static std::string g_publicIp;                    // stage 2.4: address to adver
 static int         g_hostPortLo   = 27600;
 static int         g_hostPortHi   = 27699;
 static std::string g_registryFile = "eden_registry.txt";   // stage 2.2; empty disables persistence
+static TrustList   g_trust;                       // stage 7.20: peers allowed to advertise another address
+
+// Registration sockets by connection id, so a row taken over by a restarted
+// server can have its stale connection closed instead of left believing it is
+// still listed (stage 7.20). Only shutdown() is called from outside the owning
+// thread, and only under g_regFdsMtx, which the owner also holds when it
+// unregisters just before close() — so a reused fd number is never touched.
+static std::mutex                       g_regFdsMtx;
+static std::unordered_map<uint64_t, int> g_regFds;
+
+static void dropDisplaced(uint64_t conn) {
+    std::lock_guard<std::mutex> lk(g_regFdsMtx);
+    auto it = g_regFds.find(conn);
+    if (it != g_regFds.end()) shutdown(it->second, SHUT_RDWR);
+}
 
 static int64_t monoSeconds() {
     using namespace std::chrono;
@@ -243,7 +259,13 @@ static std::string handleHost(const std::string& line, const std::string& peerIp
     // Join-existing: a HOST for a name that's already live returns the
     // running server instead of spawning a duplicate that would fight it for
     // the same world file (stage 2.4).
-    if (const Registration* live = find_live_by_name(g_registry.snapshot(), name)) {
+    // Only rows registered from this host count: those are the servers that could
+    // share a world file with a spawn, and a remote peer must not be able to
+    // register a name first and have HOST hand requesters its address (7.20).
+    std::vector<Registration> local;
+    for (const auto& r : g_registry.snapshot())
+        if (is_loopback_ipv4(r.peer)) local.push_back(r);
+    if (const Registration* live = find_live_by_name(local, name)) {
         logline("HOST '" + name + "' -> joined existing " + live->ip + ":" +
                 std::to_string(live->port));
         return "HOSTED:" + live->ip + ":" + std::to_string(live->port);
@@ -289,7 +311,7 @@ static std::string handleHost(const std::string& line, const std::string& peerIp
     for (int i = 0; i < 60 && g_running; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         for (const auto& r : g_registry.snapshot())
-            if (r.port == port) {
+            if (r.port == port && is_loopback_ipv4(r.peer)) {   // our child, not a squatter (7.20)
                 logline("HOST '" + name + "' -> " + r.ip + ":" + std::to_string(port));
                 return "HOSTED:" + r.ip + ":" + std::to_string(port);
             }
@@ -331,24 +353,54 @@ static void handleConn(int fd, sockaddr_in peer) {
 
     // ---- game server: persistent registration ----
     if (line.rfind("REGISTER:", 0) == 0) {
+        const std::string useIp = g_advertiseIP.empty() ? ip : g_advertiseIP;
+        const bool trusted = g_trust.trusted(ip);
+        // Parse + ownership policy (stage 7.20). Returns the reply line, or "" for a
+        // line that is not a valid REGISTER at all.
+        auto doRegister = [&](const std::string& l, Registration& out, uint64_t* displaced) {
+            if (!parse_register(l, useIp, out)) return std::string();
+            std::string claimed = out.ip;
+            if (advertise_policy(out, ip, useIp, trusted))
+                logline("REGISTER '" + out.name + "' from " + ip + " advertised " + claimed +
+                        "; not a trusted peer, listing " + out.ip + " instead (see --trust-advertise)");
+            out.peer = ip;
+            switch (g_registry.add(out, id, monoSeconds(), displaced,
+                                   trusted ? 0 : MAX_REGISTRATIONS_PER_PEER)) {
+                case Registry::AddResult::Ok:        return std::string("REGISTERED");
+                case Registry::AddResult::Full:      return std::string("REGISTERFAIL:full");
+                case Registry::AddResult::Taken:     return std::string("REGISTERFAIL:taken");
+                case Registry::AddResult::PeerLimit: return std::string("REGISTERFAIL:limit");
+            }
+            return std::string("REGISTERFAIL:full");
+        };
+
         Registration reg;
-        std::string useIp = g_advertiseIP.empty() ? ip : g_advertiseIP;
-        if (!parse_register(line, useIp, reg)) {
+        uint64_t displaced = 0;
+        std::string reply = doRegister(line, reg, &displaced);
+        if (reply.empty()) {
             vlog("bad REGISTER from " + ip + ": " + line.substr(0, 80));
             close(fd);
             return;
         }
-        uint64_t displaced = 0;
-        if (!g_registry.add(reg, id, monoSeconds(), &displaced)) {
-            sendAll(fd, "REGISTERFAIL:full\n");
+        if (reply != "REGISTERED") {
+            logline(reply + " for '" + reg.name + "' " + reg.ip + ":" + std::to_string(reg.port) +
+                    " from " + ip);
+            sendAll(fd, reply + "\n");
             close(fd);
             return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_regFdsMtx);
+            g_regFds[id] = fd;
         }
         sendAll(fd, "REGISTERED\n");
         setRecvTimeout(fd, REGISTERED_TIMEOUT_SEC);   // registered: allowed to go quiet between heartbeats
         logline("REGISTER '" + reg.name + "' " + reg.ip + ":" + std::to_string(reg.port) +
                 (reg.hasPassword ? " [locked]" : "") + " (conn " + std::to_string(id) + ")");
-        if (displaced) vlog("  replaced stale conn " + std::to_string(displaced));
+        if (displaced) {
+            logline("  replaced conn " + std::to_string(displaced) + " from the same peer; closing it");
+            dropDisplaced(displaced);
+        }
 
         // Hold the connection open. Any line resets the TTL; PING is the expected
         // keep-alive but a re-REGISTER (e.g. a name change) is honoured too.
@@ -364,19 +416,26 @@ static void handleConn(int fd, sockaddr_in peer) {
             }
             if (line.rfind("REGISTER:", 0) == 0) {
                 Registration r2;
-                if (parse_register(line, useIp, r2)) {
-                    g_registry.add(r2, id, monoSeconds());
-                    sendAll(fd, "REGISTERED\n");
-                }
+                uint64_t d2 = 0;
+                std::string rep2 = doRegister(line, r2, &d2);
+                if (!rep2.empty()) sendAll(fd, rep2 + "\n");
+                if (rep2 == "REGISTERED") reg = r2;
+                if (d2) dropDisplaced(d2);
             }
             // anything else: ignored, connection stays up
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_regFdsMtx);
+            g_regFds.erase(id);
         }
         // Orphan, don't delist (stage 2.2): a brief hiccup on this socket
         // shouldn't drop a server that is plainly still up. The row survives
         // with no owning connection until the sweeper's probe decides its fate.
-        g_registry.orphan(id);
-        logline("orphan '" + reg.name + "' (conn " + std::to_string(id) +
-                " closed; awaiting probe/TTL)");
+        if (g_registry.orphan(id))
+            logline("orphan '" + reg.name + "' (conn " + std::to_string(id) +
+                    " closed; awaiting probe/TTL)");
+        else
+            logline("closed conn " + std::to_string(id) + " ('" + reg.name + "'; row owned elsewhere)");
         close(fd);
         return;
     }
@@ -408,6 +467,13 @@ static void parseArgs(int argc, char** argv) {
         };
         if      (a == "--port")          g_port        = std::atoi(next("27020").c_str());
         else if (a == "--advertise-ip")  g_advertiseIP = next("");
+        else if (a == "--trust-advertise") {
+            std::string spec = next("");
+            if (!g_trust.parse(spec)) {
+                std::cerr << "edenmatch: --trust-advertise: bad address or CIDR in '" << spec << "'\n";
+                std::exit(2);
+            }
+        }
         else if (a == "--short-list")    g_rowForm     = RowForm::Sketch4;
         else if (a == "--prod-list")     g_rowForm     = RowForm::Prod6;
         else if (a == "--verbose")       g_verbose     = true;
@@ -433,6 +499,19 @@ int main(int argc, char** argv) {
     std::cout << std::unitbuf;  // live logs under systemd/journald
     signal(SIGPIPE, SIG_IGN);
     parseArgs(argc, argv);
+
+    // Both end up verbatim in SERVER: rows / HOSTED replies; refuse a typo at startup
+    // rather than list junk (stage 7.20).
+    for (std::string* ipArg : {&g_advertiseIP, &g_publicIp}) {
+        if (ipArg->empty()) continue;
+        std::string canon;
+        if (!canonical_ipv4(*ipArg, canon)) {
+            std::cerr << "edenmatch: '" << *ipArg << "' is not an IPv4 address "
+                      << "(--advertise-ip / --publicip)\n";
+            return 2;
+        }
+        *ipArg = canon;
+    }
 
     // Resolve the edenserver path to absolute now — a HOST spawn chdir()s into
     // the world dir before exec, so a relative path would no longer resolve.

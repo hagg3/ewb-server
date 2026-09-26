@@ -27,6 +27,11 @@ Covers, defect by defect:
   B  the Tier 1 fill cap derives from --we-max-cells (one number, not two)
   C  audit completeness: every mutation logged without --verbose, to --audit-file
   D  command flooding and malformed-argument fuzzing leave the server serving
+
+...and stage 3.7 (group 14): explicit //pos1 / //pos2 corners, and untouched cells
+read as natural terrain — //paint skips open sky and relays a lone paint (A),
+//set 0 in open sky stores nothing (B), the cell cap charges only new cells (C),
+//undo puts natural ground back (G).
 """
 import os, random, shutil, socket, string, subprocess, sys, tempfile, threading, time
 
@@ -570,14 +575,117 @@ def group_world_spawn(server_dir):
         srv.stop()
 
 
+# --- group 14: stage 3.7 — explicit corners, untouched cells -----------------
+
+def saved_cells(srv):
+    """Stored-cell count, read from the `Saved world (N cells, ...)` line a
+    control `save` prints. None when there is no such line: `saveWorld` skips a
+    world nothing has dirtied since the last save."""
+    m = srv.mark()
+    ctl_cmd(srv.sock, "save")
+    for ln in srv.since(m, 0.4):
+        if "Saved world (" in ln:
+            return int(ln.split("Saved world (", 1)[1].split()[0])
+    return None
+
+
+def relays(lines):
+    return [ln for ln in lines if ln.startswith("ACTION:server:0:")]
+
+
+def group_absent_cells(server_dir):
+    print("\n[14] 3.7 — explicit //pos corners; untouched cells read as natural terrain")
+    # A tiny cell cap so the cap arithmetic (bug C) is reachable over a socket.
+    srv = Server(server_dir, "--max-world-cells", "200", "--we-max-cells", "200")
+    try:
+        c = Client(); c.join("Ivy")
+        ctl_cmd(srv.sock, "op:Ivy:1")
+
+        # Explicit corners. No POS has been sent: an absolute corner must not need one.
+        r = c.cmd("//pos1 65536 40 65536", 0.4)
+        check(said(r, "pos1 = 65536, 40, 65536"), "//pos1 x y z works before the server has a position")
+        # Until the first POS the server holds (0, 0, 0), so `~` resolves to feet
+        # y = -1 and the corner is refused as outside the world — never set.
+        r = c.cmd("//pos2 ~ ~ ~", 0.4)
+        check(not said(r, "pos2 =") and (said(r, "outside the world") or said(r, "position")),
+              "a ~ corner before any POS is refused, not set")
+        r = c.cmd("//pos2 65540 44 65540", 0.4)
+        check(said(r, "pos2 = 65540, 44, 65540") and said(r, "(125 cells)"),
+              "//pos2 x y z sets the corner and reports the box")
+        check(said(c.cmd("//pos1 1 2", 0.4), "Usage:"), "a half-given corner is refused with usage")
+        check(said(c.cmd("//pos1 65536 300 65536", 0.4), "outside the world"),
+              "a corner above the world is refused")
+        c.at(65536, 41, 65536)                           # feet at y 40
+        check(said(c.cmd("//pos1 ~ ~ ~4", 0.4), "pos1 = 65536, 40, 65540"), "~ is relative to your feet")
+        c.cmd("//pos1 65536 40 65536", 0.3)
+
+        # Bug B: //set 0 over open sky stores nothing and relays nothing.
+        r = c.cmd("//set 0", 0.6)
+        check(said(r, "//set: 0 block(s) changed"), "B: //set 0 in open sky changes nothing")
+        check(not relays(r), "B: ...and relays nothing")
+        check(saved_cells(srv) is None, "B: ...and stores nothing (the world is not even dirtied)")
+
+        r = c.cmd("//set 5", 0.6)
+        check(said(r, "//set: 125 block(s) changed"), "a real //set in the sky applies")
+        check(saved_cells(srv) == 125, "...and stores 125 cells")
+
+        # Bug C: 125 of 200 used. Re-setting the same 125 cells adds nothing new,
+        # so it must not be charged 125 more against the cap.
+        r = c.cmd("//set 6", 0.6)
+        check(said(r, "//set: 125 block(s) changed") and not said(r, "edited-cell limit"),
+              "C: an edit over already-stored cells passes a near-full cap")
+        c.cmd("//pos1 65560 40 65560", 0.3)
+        c.cmd("//pos2 65564 44 65564", 0.3)
+        r = c.cmd("//set 0", 0.6)
+        check(said(r, "//set: 0 block(s) changed") and not said(r, "edited-cell limit"),
+              "C: a no-op //set 0 is not refused at the cap")
+        r = c.cmd("//set 5", 0.6)
+        check(said(r, "edited-cell limit") and said(r, "0 block(s) changed"),
+              "a //set that really would add 125 new cells is still refused")
+        check(saved_cells(srv) == 125, "...and stores none of them")
+
+        # Bug A: paint a 3x3 column span from dirt (30, 31) through grass (32)
+        # into open sky (33..35). Only the 27 natural blocks take paint, and each
+        # is relayed as a lone paint — never a `build 255`.
+        c.cmd("//pos1 65600 30 65600", 0.3)
+        c.cmd("//pos2 65602 35 65602", 0.3)
+        r = c.cmd("//paint 5", 0.8)
+        rel = relays(r)
+        check(said(r, "//paint: 27 block(s) changed"), "A: //paint skips the 27 open-sky cells")
+        check(len(rel) == 27 and all(ln.endswith(":3:5") for ln in rel),
+              f"A: every relay is one lone paint line ({len(rel)} relayed)")
+        check(not any(":0:255" in ln for ln in r), "A: no relay builds block 255")
+        r = c.cmd("//unpaint", 0.8)
+        check(said(r, "//unpaint: 27 block(s) changed"), "//unpaint strips exactly the painted cells")
+        check(any(ln.endswith(":32:65601:0:8") for ln in relays(r)),
+              "//unpaint rebuilds the natural grass unpainted")
+
+        # Bug G: //set over dirt (31), grass (32) and sky (33), then //undo. The
+        # natural blocks come back as builds; the sky cell comes back as air.
+        c.cmd("//pos1 65610 31 65610", 0.3)
+        c.cmd("//pos2 65611 33 65610", 0.3)
+        check(said(c.cmd("//set 7", 0.6), "//set: 6 block(s) changed"), "a //set across the surface applies")
+        r = c.cmd("//undo", 0.8)
+        rel = relays(r)
+        check(said(r, "Undid 6 block(s)"), "//undo reverses all six")
+        check("ACTION:server:0:65610:32:65610:0:8" in rel, "G: //undo puts the grass back")
+        check("ACTION:server:0:65610:31:65610:0:3" in rel, "G: //undo puts the dirt back")
+        check(not any(":33:65610:0:" in ln for ln in rel), "G: the sky cell goes back to air, not a block")
+
+        check(srv.alive(), "server survived the 3.7 pass")
+        c.close()
+    finally:
+        srv.stop()
+
+
 # --- group 11 + 12: notes on what a socket test cannot reach -----------------
 
 def group_notes():
     print("\n[11] defect 3 — the edited-cell ceiling")
     print("     the edited-cell cap defaults to 4,000,000 (--max-world-cells); reaching it")
-    print("     over a socket means relaying ~250 MB of ACTION. The projection is checked before every")
-    print("     scan in weCommit/weEditBox and refuses rather than truncates; the")
-    print("     arithmetic is covered offline. Not exercised here on purpose.")
+    print("     over a socket means relaying ~250 MB of ACTION, so the default is not exercised.")
+    print("     weCommit/weEditBox check the new cells an edit would add before writing any,")
+    print("     and refuse rather than truncate — group 14 drives that path with a 200-cell cap.")
     print("\n[12] the control socket's 300 s idle timeout")
     print("     Correct to have, 300 s too slow to assert in a pass that already takes")
     print("     ~2 minutes. Verify by hand with: nc -U <world>/edenserver.sock")
@@ -617,7 +725,8 @@ def main():
             shutil.rmtree(b, ignore_errors=True)
 
         for prefix, group in (("edenphase3c_", group_fill_cap), ("edenphase3d_", group_audit),
-                              ("edenphase3e_", group_world_spawn)):
+                              ("edenphase3e_", group_world_spawn),
+                              ("edenphase3f_", group_absent_cells)):
             wd = tempfile.mkdtemp(prefix=prefix)
             try:
                 group(wd)

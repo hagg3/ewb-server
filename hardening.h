@@ -340,6 +340,25 @@ struct TokenBucket {
     /// bucket is dry, so a refused request costs the client its whole allowance
     /// rather than draining it partially.
     bool allow(double now, double cost = 1.0) {
+        refill(now);
+        if (tokens < cost) return false;
+        tokens -= cost;
+        return true;
+    }
+
+    /// Spend `cost` after the fact, even past empty — for work whose size is only
+    /// known once it has run (a BURN chain, stage 7.19). The debt is repaid by
+    /// refill before the next allow() succeeds, and bounded at one burst's worth
+    /// so a single charge can never lock a client out for longer than two bursts'
+    /// refill time.
+    void charge(double now, double cost) {
+        refill(now);
+        tokens -= cost;
+        if (tokens < -capacity) tokens = -capacity;
+    }
+
+  private:
+    void refill(double now) {
         if (!primed) {
             last = now;
             primed = true;
@@ -348,9 +367,6 @@ struct TokenBucket {
             if (tokens > capacity) tokens = capacity;
             last = now;
         }
-        if (tokens < cost) return false;
-        tokens -= cost;
-        return true;
     }
 };
 

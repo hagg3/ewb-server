@@ -79,6 +79,30 @@ static void test_permissions() {
         CHECK(line.rfind("//", 0) != 0, "visitor help lists no // command");
     CHECK(ewb::we_help_lines(ewb::WE_LEVEL_OPERATOR).size() > visitor.size(),
           "an operator sees more than a visitor");
+
+    // Stage 8.6 / 8.7.
+    CHECK(ewb::we_find("/login") && ewb::we_find("/login")->min_level == ewb::WE_LEVEL_VISITOR,
+          "/login is open to everyone (it is how a level is earned)");
+    CHECK(ewb::we_find("/zone") && ewb::we_find("/zone")->min_level == ewb::WE_LEVEL_OPERATOR,
+          "/zone needs operator");
+    bool loginListed = false;
+    for (const std::string& line : visitor) if (line.rfind("/login", 0) == 0) loginListed = true;
+    CHECK(loginListed, "a visitor's /help lists /login");
+}
+
+static void test_zone_args() {
+    using V = std::vector<std::string>;
+    CHECK(ewb::we_zone_args_ok(V{"/zone", "create", "spawn"}), "create <name>");
+    CHECK(ewb::we_zone_args_ok(V{"/zone", "create", "spawn", "exact"}), "create <name> exact");
+    CHECK(!ewb::we_zone_args_ok(V{"/zone", "create", "spawn", "full"}), "create's option must be 'exact'");
+    CHECK(!ewb::we_zone_args_ok(V{"/zone", "create"}), "create needs a name");
+    CHECK(ewb::we_zone_args_ok(V{"/zone", "rm", "spawn"}), "rm <name>");
+    CHECK(!ewb::we_zone_args_ok(V{"/zone", "rm"}), "rm needs a name");
+    CHECK(ewb::we_zone_args_ok(V{"/zone", "list"}) && ewb::we_zone_args_ok(V{"/zone", "list", "2"}), "list [page]");
+    CHECK(ewb::we_zone_args_ok(V{"/zone", "here"}), "here");
+    CHECK(!ewb::we_zone_args_ok(V{"/zone", "here", "x"}), "here takes nothing");
+    CHECK(!ewb::we_zone_args_ok(V{"/zone", "delete", "x"}), "unknown sub-command");
+    CHECK(!ewb::we_zone_args_ok(V{"/zone"}), "bare /zone");
 }
 
 static void test_arity() {
@@ -96,6 +120,17 @@ static void test_arity() {
     const ewb::WeSpec* msg = ewb::we_find("/msg");
     CHECK(ewb::we_args_ok(*msg, 9), "/msg is unbounded");
     CHECK(!ewb::we_args_ok(*msg, 1), "/msg needs a target and text");
+
+    // Stage 3.7: //pos1 / //pos2 take nothing (your feet) or a full corner. The
+    // table admits 0..3; the handler's second check refuses a half-given corner.
+    for (const char* v : {"//pos1", "//pos2"}) {
+        const ewb::WeSpec* pos = ewb::we_find(v);
+        CHECK(ewb::we_args_ok(*pos, 0) && ewb::we_pos_args_ok(0), "//posN with no argument is your feet");
+        CHECK(ewb::we_args_ok(*pos, 3) && ewb::we_pos_args_ok(3), "//posN x y z is an explicit corner");
+        CHECK(!ewb::we_pos_args_ok(1) && !ewb::we_pos_args_ok(2), "a partial corner is refused");
+        CHECK(!ewb::we_args_ok(*pos, 4), "four arguments are refused by the table");
+        CHECK(pos->min_level == ewb::WE_LEVEL_BUILDER, "an explicit corner keeps the builder floor");
+    }
 }
 
 // --- grammar -----------------------------------------------------------------
@@ -139,6 +174,90 @@ static void test_parse_coord() {
     CHECK(!ewb::we_parse_coord("~~1", 0.0f, out), "double tilde refused");
     CHECK(!ewb::we_parse_coord("abc", 0.0f, out), "name refused");
     CHECK(!ewb::we_parse_coord("1.2.3", 0.0f, out), "two dots refused");
+}
+
+static void test_parse_cell() {
+    int v = 0;
+    CHECK(ewb::we_parse_cell("65540", 0, v) && v == 65540, "absolute corner");
+    CHECK(ewb::we_parse_cell("~", 65536, v) && v == 65536, "~ is the feet cell");
+    CHECK(ewb::we_parse_cell("~4", 65536, v) && v == 65540, "~n offsets the feet cell");
+    CHECK(ewb::we_parse_cell("~-40", 33, v) && v == -7, "below zero parses; range is the caller's check");
+    CHECK(ewb::we_parse_cell("33.6", 0, v) && v == 34, "a fraction rounds to the nearest cell");
+    CHECK(ewb::we_parse_cell("16777215", 0, v) && v == 16777215, "the far edge of the key range is exact");
+    CHECK(!ewb::we_parse_cell("999999999999999999999", 0, v), "a huge value is refused, not overflowed");
+    CHECK(!ewb::we_parse_cell("~999999999999999999999", 0, v), "...and so is a huge offset");
+    CHECK(!ewb::we_parse_cell("nan", 0, v) && !ewb::we_parse_cell("inf", 0, v), "no nan/inf");
+    CHECK(!ewb::we_parse_cell("", 0, v) && !ewb::we_parse_cell("x", 0, v), "garbage refused");
+
+    CHECK(ewb::we_coord_relative("~") && ewb::we_coord_relative("~-3"), "~ forms are relative");
+    CHECK(!ewb::we_coord_relative("65536") && !ewb::we_coord_relative(""), "numbers are not");
+}
+
+// --- untouched cells (stage 3.7) ---------------------------------------------
+
+static void test_base_reading() {
+    // The measured retail-client terrain (docs/import.md).
+    CHECK(ewb::we_base_at(0).type == 1, "bedrock at 0");
+    CHECK(ewb::we_base_at(10).type == 2, "stone below 16");
+    CHECK(ewb::we_base_at(20).type == 3, "dirt below 32");
+    CHECK(ewb::we_base_at(32).type == 8, "grass at 32");
+    CHECK(ewb::we_base_at(33).type == 0 && ewb::we_base_at(255).type == 0, "air above");
+    CHECK(ewb::we_base_at(32).paint == 0, "natural terrain is unpainted");
+
+    const int PB = ewb::CELL_PAINTED_BASE;
+    const ewb::BaseVoxel sky = ewb::we_base_at(40), grass = ewb::we_base_at(32);
+
+    // Bug B: //set 0 over open sky changes nothing, so it stores nothing.
+    CHECK(!ewb::we_absent_edit_changes(sky, 0, 0), "B: air over natural air is not an edit");
+    CHECK(ewb::we_absent_edit_changes(grass, 0, 0), "air over natural grass is a mine");
+    CHECK(!ewb::we_absent_edit_changes(grass, 8, 0), "grass over natural grass is not an edit");
+    CHECK(ewb::we_absent_edit_changes(grass, 8, 5), "painted grass over grass is");
+    CHECK(ewb::we_absent_edit_changes(sky, 2, 0), "a block in the sky is");
+
+    // Bug A: paint needs a block to land on.
+    CHECK(!ewb::we_absent_edit_changes(sky, PB, 5), "A: painting natural air is not an edit");
+    CHECK(ewb::we_absent_edit_changes(grass, PB, 5), "painting natural grass is");
+    CHECK(!ewb::we_absent_edit_changes(grass, PB, 0), "unpainting unpainted grass is not");
+
+    // The combined rule: a stored cell compares to what is stored, an absent one
+    // to its natural block.
+    CHECK(!ewb::we_edit_changes(true, 2, 0, 2, 0), "stored, same: no change");
+    CHECK(ewb::we_edit_changes(true, 0, 0, 2, 0), "stored air to stone: change");
+    CHECK(!ewb::we_edit_changes(true, 0, 0, 0, 0), "stored air to air: no change");
+    CHECK(!ewb::we_edit_changes(false, sky.type, sky.paint, 0, 0), "absent sky to air: no change");
+    CHECK(ewb::we_edit_changes(false, grass.type, grass.paint, 0, 0), "absent grass to air: change");
+
+    // //copy of a painted-base cell keeps the block it shows, not the sentinel.
+    ewb::ClipCell c{0, 0, 0, 0, 0};
+    CHECK(ewb::we_clip_cell(32, (unsigned char)PB, 7, c) && c.type == 8 && c.color == 7,
+          "a painted-base cell copies as painted grass");
+    CHECK(!ewb::we_clip_cell(50, (unsigned char)PB, 7, c), "a painted-base cell in the sky is not copied");
+    CHECK(ewb::we_clip_cell(50, 4, 3, c) && c.type == 4 && c.color == 3, "a placed block copies verbatim");
+    CHECK(ewb::we_clip_cell(50, 0, 0, c) && c.type == 0, "carved air copies verbatim");
+}
+
+static void test_edit_wire() {
+    auto wire = [](int y, int type, int color) {
+        std::string w;
+        ewb::we_emit_edit_wire(w, 10, y, 20, type, color);
+        return w;
+    };
+    const int PB = ewb::CELL_PAINTED_BASE;
+    CHECK(wire(40, 0, 0) == "ACTION:server:0:10:40:20:1\n", "air is a mine");
+    CHECK(wire(40, 5, 0) == "ACTION:server:0:10:40:20:1\nACTION:server:0:10:40:20:0:5\n",
+          "a block is mine then build");
+    CHECK(wire(40, 5, 9) == "ACTION:server:0:10:40:20:1\nACTION:server:0:10:40:20:0:5\n"
+                            "ACTION:server:0:10:40:20:3:9\n", "a painted block is mine, build, paint");
+    // Bug A, relay half: a painted-base cell is a lone paint — never `build 255`.
+    CHECK(wire(32, PB, 9) == "ACTION:server:0:10:32:20:3:9\n", "A: painted base is a lone paint");
+    CHECK(wire(32, PB, 0) == "ACTION:server:0:10:32:20:1\nACTION:server:0:10:32:20:0:8\n",
+          "unpainted painted-base rebuilds the natural block");
+    CHECK(wire(50, PB, 0) == "ACTION:server:0:10:50:20:1\n", "...which in the sky is air");
+    for (int y : {0, 32, 50})
+        for (int c : {0, 9})
+            CHECK(wire(y, PB, c).find(":0:255") == std::string::npos, "no relay ever builds 255");
+    CHECK(wire(40, 5, 200) == "ACTION:server:0:10:40:20:1\nACTION:server:0:10:40:20:0:5\n",
+          "an out-of-palette colour is not relayed");
 }
 
 static void test_parse_block_color() {
@@ -355,10 +474,14 @@ static void test_rotate() {
 int main() {
     test_table();
     test_permissions();
+    test_zone_args();
     test_arity();
     test_split();
     test_parse_int();
     test_parse_coord();
+    test_parse_cell();
+    test_base_reading();
+    test_edit_wire();
     test_parse_block_color();
     test_volume();
     test_selection_cap();

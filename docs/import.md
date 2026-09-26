@@ -73,8 +73,9 @@ digits to round-trip exactly (the `pos` above is what `eden_spawn.txt` holds as 
 `base-profile` records `default`, `none`, or `custom` for a `--base-profile FILE` (the file itself
 is not copied). The grammar and every key are in [export.md](export.md#the-origin-sidecar).
 
-Everything is written with a temp file and a `rename()`, the same discipline the server's own
-saves use: a crash or a full disk mid-write cannot leave a truncated world.
+Everything is written with a temp file, an `fsync`, a `rename()` and a directory `fsync`, the
+same discipline the server's own saves use: a crash, a power loss or a full disk mid-write cannot
+leave a truncated world.
 
 ---
 
@@ -197,8 +198,9 @@ figure was 2× too large due to a capture-logger bug; corrected 2026-09-12.)
 | block type `> 127` | warning; kept verbatim. The client may know blocks this tool does not |
 | paint `> 54` | warning; kept in the model file. The server drops an out-of-palette colour on the wire, so the block renders unpainted |
 | a sign outside the server's coordinate range | dropped and counted |
+| a chunk directory of more than 4,000,000 rows (`EDEN_MAX_DIR_ENTRIES`) | warning: only the first 4,000,000 rows are read and the tool says chunks past that are missing, rather than dropping them silently. No real world comes near it — it is a corruption / hostile-file guard |
 
-`--strict` promotes the two warnings to errors.
+`--strict` promotes the warnings (unknown block id, out-of-range paint, truncated directory) to errors.
 
 ---
 

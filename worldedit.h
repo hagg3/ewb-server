@@ -32,6 +32,8 @@
 
 #pragma once
 
+#include <cmath>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -39,8 +41,10 @@
 #include <string>
 #include <vector>
 
+#include "base_profile.h" // eden_default_profile — what an untouched cell looks like (3.7)
 #include "eden_names.h"  // eden_block_id / eden_paint_id — the 3.6 name tables
 #include "hardening.h"   // MAX_BLOCK_TYPE, MAX_PAINT_INDEX
+#include "region_query.h" // CELL_AIR, CELL_PAINTED_BASE, CELL_MAX_PAINT
 
 namespace ewb {
 
@@ -119,10 +123,14 @@ inline const std::vector<WeSpec>& we_specs() {
         {"/searchblocks", WE_LEVEL_VISITOR,  1,  1, "/searchblocks <name>               - find a block by name"},
         {"/searchcolors", WE_LEVEL_VISITOR,  1,  1, "/searchcolors <name>               - find a color by name"},
         {"/resync",       WE_LEVEL_VISITOR,  0,  0, "/resync                            - resend the world around you"},
+        // Stage 8.6. Handled before this table's dispatcher ever sees the line, so
+        // the PIN is never logged, audited or echoed; the row is here for /help.
+        {"/login",        WE_LEVEL_VISITOR,  1,  1, "/login <pin>                       - prove this name is yours"},
         // --- level 1: bounded edits ------------------------------------------
         {"/tp",           WE_LEVEL_BUILDER,  1,  3, "/tp <x> <y> <z> | /tp <player>     - teleport (~ is relative)"},
-        {"//pos1",        WE_LEVEL_BUILDER,  0,  0, "//pos1                             - first selection corner"},
-        {"//pos2",        WE_LEVEL_BUILDER,  0,  0, "//pos2                             - second selection corner"},
+        // 0 or 3 arguments; the handler refuses 1 or 2 (`we_pos_args_ok`).
+        {"//pos1",        WE_LEVEL_BUILDER,  0,  3, "//pos1 [x y z]                     - first corner (default: your feet)"},
+        {"//pos2",        WE_LEVEL_BUILDER,  0,  3, "//pos2 [x y z]                     - second corner (~ is relative)"},
         {"//set",         WE_LEVEL_BUILDER,  1,  2, "//set <block> [color]              - fill the selection"},
         {"//walls",       WE_LEVEL_BUILDER,  1,  2, "//walls <block> [color]            - the selection's four sides"},
         {"//replace",     WE_LEVEL_BUILDER,  2,  4, "//replace <old> <new> [color] [oldColor]"},
@@ -140,6 +148,8 @@ inline const std::vector<WeSpec>& we_specs() {
         {"//hsphere",     WE_LEVEL_BUILDER,  2,  3, "//hsphere <radius> <block> [color] - hollow"},
         {"//cyl",         WE_LEVEL_BUILDER,  3,  4, "//cyl <radius> <height> <block> [color]"},
         {"//hcyl",        WE_LEVEL_BUILDER,  3,  4, "//hcyl <radius> <height> <block> [color] - hollow"},
+        // --- level 2 (and logged in with a PIN — stage 8.7) -----------------------
+        {"/zone",         WE_LEVEL_OPERATOR, 1,  3, "/zone create <name> [exact] | rm <name> | list [page] | here"},
     };
     return specs;
 }
@@ -155,12 +165,30 @@ inline bool we_args_ok(const WeSpec& s, int argc) {
     return argc >= s.min_args && (s.max_args < 0 || argc <= s.max_args);
 }
 
+/// `//pos1` / `//pos2` take no arguments (your feet) or all three coordinates;
+/// the table's 0..3 range cannot say "not 1 or 2".
+inline bool we_pos_args_ok(int argc) { return argc == 0 || argc == 3; }
+
 /// `/tp` is two commands sharing a name. Three arguments is a coordinate
 /// teleport — self-scoped, level 1. One argument is a player name, which
 /// discloses that player's exact position to whoever asks, so it is level 2
 /// (plan §0.5.7 defect 8).
 inline int we_tp_required_level(int argc) {
     return argc == 1 ? WE_LEVEL_OPERATOR : WE_LEVEL_BUILDER;
+}
+
+/// `/zone`'s sub-commands and their argument counts (after the sub-command):
+/// `create <name> [exact]`, `rm <name>`, `list [page]`, `here`. False for
+/// anything else, so the handler answers with the usage line.
+inline bool we_zone_args_ok(const std::vector<std::string>& tok) {
+    if (tok.size() < 2) return false;
+    const std::string& sub = tok[1];
+    const size_t n = tok.size() - 2;
+    if (sub == "create") return n == 1 || (n == 2 && tok[3] == "exact");
+    if (sub == "rm")     return n == 1;
+    if (sub == "list")   return n <= 1;
+    if (sub == "here")   return n == 0;
+    return false;
 }
 
 /// The `/help` body a player at `level` should see: rows above their level are
@@ -252,6 +280,24 @@ inline bool we_parse_coord(const std::string& tok, float current, float& out) {
         return true;
     }
     return to_float(tok, out);
+}
+
+/// Whether a coordinate token is `~`-relative, i.e. needs the player's position.
+inline bool we_coord_relative(const std::string& tok) {
+    return !tok.empty() && tok[0] == '~';
+}
+
+/// One explicit `//pos1 <x> <y> <z>` coordinate, as a cell: the `we_parse_coord`
+/// grammar, relative to `current` (the feet cell, so `//pos1 ~ ~ ~` is exactly
+/// `//pos1`), rounded to the nearest cell. A value outside ±2^30 is refused here,
+/// before rounding, so `lroundf` can never overflow; whether the cell is inside
+/// the world is the caller's check, as it is for `/tp`.
+inline bool we_parse_cell(const std::string& tok, int current, int& out) {
+    float v;
+    if (!we_parse_coord(tok, (float)current, v)) return false;
+    if (!(v > -1073741824.0f && v < 1073741824.0f)) return false;
+    out = (int)lroundf(v);
+    return true;
 }
 
 // --- block / colour arguments ------------------------------------------------
@@ -389,6 +435,87 @@ struct WeEdit {
     unsigned char oldType, oldColor, newType, newColor;
 };
 
+// --- untouched cells (stage 3.7) ---------------------------------------------
+//
+// The server stores edits over terrain every client draws for itself. A cell it
+// has no record of — *absent* — is not "air": it is whatever the base profile
+// (`base_profile.h`) puts at that height: bedrock, stone, dirt, grass at y <= 32,
+// air above. Every WorldEdit command reads an absent cell as that natural block,
+// so that:
+//
+//   * an edit that would leave an absent cell looking exactly as it does is not
+//     an edit — `//set 0` in open sky and `//unpaint` on bare ground store nothing,
+//     report nothing changed, and cost nothing against the world's cell cap;
+//   * paint needs a block to land on — `//paint` skips natural air instead of
+//     storing a painted-base cell there that no client can draw;
+//   * `//undo` puts back the natural block, not air, because the natural block is
+//     what the undo record says was there.
+//
+// The table is the measured retail-client default (docs/import.md). Absent cells
+// render the *client's* terrain whatever profile a world was imported against, so
+// the default is the right table here even for an imported world.
+
+/// What a client draws in a cell the server has never stored.
+inline BaseVoxel we_base_at(int y) {
+    static const BaseProfile profile = eden_default_profile();
+    return profile.at(y);
+}
+
+/// Whether writing (`newType`, `newColor`) into an absent cell whose natural block
+/// is `base` would change what any client draws there. `CELL_PAINTED_BASE` means
+/// "the natural block here, painted `newColor`", so it changes nothing over
+/// natural air and nothing if the colour is the one the block already has.
+inline bool we_absent_edit_changes(const BaseVoxel& base, int newType, int newColor) {
+    if (newType == CELL_PAINTED_BASE)
+        return base.type != CELL_AIR && newColor != base.paint;
+    return newType != base.type || newColor != base.paint;
+}
+
+/// The one "is this an edit" rule every WorldEdit write path applies. A stored cell
+/// changes when its (type, colour) does; an absent cell is passed in as its
+/// natural block (`cur` = `we_base_at(y)`) and changes per `we_absent_edit_changes`.
+/// A cell that does not change is not written, not relayed, not counted in the
+/// reply, not charged against the world's cell cap and not recorded for undo.
+inline bool we_edit_changes(bool present, int curType, int curColor, int newType, int newColor) {
+    if (present) return newType != curType || newColor != curColor;
+    return we_absent_edit_changes(BaseVoxel{(uint8_t)curType, (uint8_t)curColor}, newType, newColor);
+}
+
+/// The `ACTION:server:0:…` lines that make every client draw cell (x, y, z) as the
+/// model now stores it. Shared by Tier 1 (`setblock`/`fill`) and Tier 2 (every
+/// WorldEdit command), so there is one relay shape to get right.
+///
+///   air                 mine
+///   a block             mine -> build -> paint (if painted). `mode 0` alone does
+///                       not overwrite an occupied cell on a peer (plan §0.5.3), so
+///                       a server-pushed build always clears first.
+///   painted base        a lone paint: the natural block is already on every
+///                       client's screen, and mining it first would delete the very
+///                       block being recoloured. This used to take the block path
+///                       and relay `build 255` — a block id no client has (3.7 A).
+///                       With no paint left (`//unpaint`), the natural block is
+///                       rebuilt unpainted instead, which needs no assumption about
+///                       what a client makes of "paint colour 0".
+inline void we_emit_edit_wire(std::string& wire, int x, int y, int z, int type, int color) {
+    auto paintable = [](int c) { return c != 0 && c <= (int)CELL_MAX_PAINT; };
+    char line[96];
+    if (type == CELL_PAINTED_BASE) {
+        if (paintable(color)) {
+            wire.append(line, (size_t)std::snprintf(line, sizeof(line),
+                                                    "ACTION:server:0:%d:%d:%d:3:%d\n", x, y, z, color));
+            return;
+        }
+        const BaseVoxel b = we_base_at(y);   // never CELL_PAINTED_BASE itself
+        type = b.type;
+        color = b.paint;
+    }
+    wire.append(line, (size_t)std::snprintf(line, sizeof(line), "ACTION:server:0:%d:%d:%d:1\n", x, y, z));
+    if (type == CELL_AIR) return;
+    wire.append(line, (size_t)std::snprintf(line, sizeof(line), "ACTION:server:0:%d:%d:%d:0:%d\n", x, y, z, type));
+    if (paintable(color))
+        wire.append(line, (size_t)std::snprintf(line, sizeof(line), "ACTION:server:0:%d:%d:%d:3:%d\n", x, y, z, color));
+}
+
 /// Reverse of a batch: what you apply to put the world back.
 inline std::vector<WeEdit> we_invert(const std::vector<WeEdit>& in) {
     std::vector<WeEdit> out;
@@ -470,6 +597,21 @@ struct ClipCell {
     int           rx, ry, rz;
     unsigned char type, color;
 };
+
+/// What `//copy` puts in the clipboard for a stored cell at height `y`. A
+/// painted-base cell means "the natural block *here*, painted", which stops being
+/// true the moment it is pasted at another height — so it is copied as the block
+/// it actually shows (painted grass is grass, painted). A painted-base cell over
+/// natural air shows nothing and is not copied.
+inline bool we_clip_cell(int y, unsigned char type, unsigned char color, ClipCell& out) {
+    out.type = type;
+    out.color = color;
+    if (type != CELL_PAINTED_BASE) return true;
+    const BaseVoxel b = we_base_at(y);
+    if (b.type == CELL_AIR) return false;
+    out.type = b.type;
+    return true;
+}
 
 /// Rotate a ramp/wedge block id one 90° step.
 ///

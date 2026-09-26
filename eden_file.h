@@ -76,6 +76,8 @@ struct EdenWorld {
     std::vector<uint8_t>   dir_trailer;      // appended sign section, verbatim
     std::vector<EdenSign>  signs;            // decoded from dir_trailer (inline form)
     std::vector<uint8_t>   bytes;            // the decompressed file, owned
+    bool                   dir_truncated = false;   // the directory ran past EDEN_MAX_DIR_ENTRIES
+                                                    // rows and the rest was not read (stage 7.30)
 
     const uint8_t* data() const { return bytes.data(); }
     size_t         size() const { return bytes.size(); }
@@ -263,14 +265,21 @@ inline bool eden_is_chunk_coord(int32_t c) {
     return c >= 0 && c < EDEN_CHUNK_COORD_LIMIT;
 }
 
-// Every 16-byte row from `dir_offset` to EOF, decoded, no filtering.
+// Every 16-byte row from `dir_offset` to EOF, decoded, no filtering. Stops at
+// EDEN_MAX_DIR_ENTRIES; when rows remained past that, `*truncated` (if given) is set
+// so the caller can say chunks were left behind rather than losing them silently.
 inline std::vector<EdenDirEntry> eden_decode_directory(const uint8_t* b, size_t n,
-                                                       uint64_t dir_offset) {
+                                                       uint64_t dir_offset,
+                                                       bool* truncated = nullptr) {
     if (dir_offset < EDEN_HEADER_BYTES || dir_offset >= n)
         throw std::runtime_error("eden_file: chunk directory offset out of range");
+    if (truncated) *truncated = false;
     std::vector<EdenDirEntry> out;
-    for (size_t i = dir_offset; i + EDEN_DIR_ENTRY <= n && out.size() < EDEN_MAX_DIR_ENTRIES;
-         i += EDEN_DIR_ENTRY) {
+    for (size_t i = dir_offset; i + EDEN_DIR_ENTRY <= n; i += EDEN_DIR_ENTRY) {
+        if (out.size() >= EDEN_MAX_DIR_ENTRIES) {
+            if (truncated) *truncated = true;
+            break;
+        }
         out.push_back({rd_i32(b + i), rd_i32(b + i + 4), rd_u64(b + i + 8)});
     }
     return out;
@@ -444,7 +453,7 @@ inline EdenWorld eden_load(const uint8_t* raw, size_t raw_len,
     w.hdr = eden_parse_header(b, n);
 
     // Pass A: every raw directory row.
-    std::vector<EdenDirEntry> rows = eden_decode_directory(b, n, w.hdr.dir_offset);
+    std::vector<EdenDirEntry> rows = eden_decode_directory(b, n, w.hdr.dir_offset, &w.dir_truncated);
 
     // Pass A½: peel a trailing sign section off the real chunk rows. The trailer
     // is everything after the last coordinate-gated row; interior rows that fail

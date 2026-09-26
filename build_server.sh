@@ -96,10 +96,11 @@ echo "Built ./out_queue_test  —  output queue priority / overflow / frame inte
 # Offline sign + spawn + MOTD + hardening checks: eden_signs.txt / eden_spawn.txt
 # / eden_motd.txt parsing, SIGNP formatting, username/ACTION validation, token
 # bucket, connect limiter, constant-time password compare + failed-auth limiter
-# (ROADMAP-SERVER stages 1.5 + 1.7 + 1.10 + 5.3). No zlib needed.
+# (ROADMAP-SERVER stages 1.5 + 1.7 + 1.10 + 5.3), plus the explosion chain's zone hook
+# and the protected-zone restore / revert queue / audit folding (stage 8.2). No zlib needed.
 "$CXX" -std=c++17 -O2 -Wall protocol_test.cpp -o protocol_test
 ./protocol_test
-echo "Built ./protocol_test  —  signs / spawn / MOTD / names / rate limits"
+echo "Built ./protocol_test  —  signs / spawn / MOTD / names / rate limits / zone enforcement"
 
 # Offline control-surface checks: line grammar, the command table, the persisted
 # ban list + op-level files, fill volume arithmetic (ROADMAP-SERVER stage 3.2),
@@ -162,11 +163,42 @@ echo "Built ./eden_export  —  run with: ./eden_export <world-dir> --out <file.
 ./eden_export_test
 echo "Built ./eden_export_test  —  .eden writer / round-trip property / drops / signs"
 
+# Offline durable-write checks: replace-whole, no leftover temp file, shrink without a
+# stale tail, 5 MB binary round-trip, and that failure (missing directory, blocked
+# rename) leaves the old file alone (ROADMAP-SERVER stage 7.29). No zlib needed.
+"$CXX" -std=c++17 -O2 -Wall durable_write_test.cpp -o durable_write_test
+./durable_write_test
+echo "Built ./durable_write_test  —  fsync + rename + dir fsync writer"
+
 # Offline matchmaker checks: name sanitising, REGISTER parsing, SERVER: row /
 # LIST formatting, the TTL registry (ROADMAP-SERVER Phase 2). No zlib needed.
 "$CXX" -std=c++17 -O2 -Wall matchmaker_test.cpp -o matchmaker_test
 ./matchmaker_test
 echo "Built ./matchmaker_test  —  matchmaker REGISTER / LIST / registry"
+
+# Offline anti-grief zone checks: eden_zones.txt grammar, normalisation, the
+# ZONE_MAX cap, unknown-flag/duplicate-name rejection, blocking()/intersects()
+# against brute-force references over random boxes, and the round-trip property
+# (ROADMAP-SERVER stage 8.1). No zlib needed.
+"$CXX" -std=c++17 -O2 -Wall zones_test.cpp -o zones_test
+./zones_test
+echo "Built ./zones_test  —  zone grammar / caps / blocking / intersects / round-trip"
+
+# Offline player-identity checks: SHA-256 / HMAC-SHA-256 / PBKDF2-HMAC-SHA-256
+# against published vectors, PIN generation + shape, the eden_auth.txt grammar
+# (all-or-nothing load), and the effective-level / zone-bypass rules
+# (ROADMAP-SERVER stage 8.6). No zlib needed.
+"$CXX" -std=c++17 -O2 -Wall auth_test.cpp -o auth_test
+./auth_test
+echo "Built ./auth_test  —  hash vectors / PINs / eden_auth.txt / login levels"
+
+# Offline topmap checks: request parsing + the sample cap, the surface rule against
+# the base profile (mined grass, painted base, empty columns), the chunk-column walk
+# the server locks by, and the whole verb against a brute-force surface scan
+# (ROADMAP-SERVER stage 8.5). No zlib needed.
+"$CXX" -std=c++17 -O2 -Wall topmap_test.cpp -o topmap_test
+./topmap_test
+echo "Built ./topmap_test  —  topmap parse / surface rule / chunk walk / brute force"
 
 # edenadmin, the local operator GUI (ROADMAP-SERVER Phase 6). Opt-in: --with-admin.
 # Its own offline Go suite (quoting boundary, per-verb argv for both transports,
@@ -182,3 +214,6 @@ fi
 #   python3 phase3_live_test.py   —  adversarial pass at the Tier 1 + Tier 2 command
 #                                    surfaces: oversized selections, level escalation,
 #                                    undo growth, flooding, malformed arguments
+#   python3 phase7_live_test.py   —  the output path under a slow reader, shutdown, admission
+#   python3 phase8_live_test.py   —  protected zones: refused edits not relayed and put back,
+#                                    signs, burns at a zone edge, WorldEdit, control bypass

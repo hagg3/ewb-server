@@ -49,6 +49,10 @@ Covers:
          rejoin keeps the name and the saved position.
  11  7.18 — movement is re-formatted, not echoed: a field padded to a thousand
          characters reaches other players as a short two-decimal number.
+ 13  7.19 — one BURN cannot hold the world lock for as long as it likes: a TNT
+         chain stops at --burn-max-cells, says so, and a second player's edits
+         keep landing while a burst of them runs. The blasts a chain actually ran
+         are charged back to the sender's ACTION budget.
 
 Group 1 spends ~35 s deliberately reading at ~50 KB/s; the whole pass is ~1 min.
 """
@@ -821,6 +825,97 @@ def group11_movement_reformatted():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# --- group 13: the BURN chain work budget (stage 7.19) ------------------------
+
+def tnt_cube(sock, x0, y0, z0, n, block=9):
+    """Build an n^3 solid block of TNT with ACTION builds, inside the edit budget."""
+    for i in range(n):
+        for j in range(n):
+            for k in range(n):
+                sock.sendall(b"ACTION:%d:%d:%d:0:%d\n" % (x0 + i, y0 + j, z0 + k, block))
+        time.sleep(0.25)          # stay under --action-rate (512/s)
+
+
+def group13_burn_chain_budget():
+    print("\n[13] 7.19 — a BURN chain is bounded by work, not by explosion count")
+    d = tempfile.mkdtemp(prefix="ewb7-")
+    try:
+        open(os.path.join(d, "eden_world.model"), "w").close()
+        open(os.path.join(d, "eden_signs.txt"), "w").close()
+        # One blast's worth of budget: any chain at all is truncated.
+        srv = Server(d, "--burn-max-cells", "1037")
+        try:
+            p = join("burner")
+            read_for(p, 0.5)
+            tnt_cube(p, 65500, 40, 65500, 2)
+            mark = srv.mark()
+            p.sendall(b"ACTION:65500:40:65500:2\n")
+            got = read_for(p, 1.0)
+            check(b"too big to finish" in got, "the player is told the chain was truncated")
+            log = "\n".join(srv.since(mark))
+            check("--burn-max-cells" in log, "the operator sees the budget line in the log")
+            check(srv.alive(), "the server survived a truncated chain")
+            p.close()
+        finally:
+            srv.stop()
+
+        # Default budget: a small cluster finishes, and nobody is told anything.
+        srv = Server(d)
+        try:
+            p = join("burner")
+            read_for(p, 0.5)
+            obs = join("watcher")
+            read_for(obs, 0.5)
+            tnt_cube(p, 65500, 40, 65500, 3)
+            read_for(p, 0.3); read_for(obs, 0.3)
+            t0 = time.time()
+            p.sendall(b"ACTION:65501:41:65501:2\n")
+            got = read_for(p, 1.0)
+            check(b"too big to finish" not in got, "a 3x3x3 TNT block finishes inside the default budget")
+            check(b"ACTION:burner" not in got, "the sender is not echoed its own burn")
+
+            # The watcher's own edits keep landing while the burner detonates.
+            obs.sendall(b"ACTION:65400:40:65400:0:2\n")
+            seen = read_for(p, 1.0)
+            check(b"ACTION:watcher" in seen and time.time() - t0 < 3.0,
+                  "another player's edit is relayed while/after the chain runs")
+
+            # Work is charged back (7.19): a 5x5x5 block is ~860 blasts, far more
+            # than the flat 64 a BURN pays upfront, so the sender's ACTION budget
+            # is spent and their next edits are dropped until it refills. Before
+            # this, sixteen such chains back-to-back cost 64 tokens each.
+            big = join("bomber")           # a fresh ACTION budget to spend
+            read_for(big, 0.5)
+            tnt_cube(big, 65600, 40, 65600, 5)      # ~860 blasts each once lit
+            tnt_cube(big, 65700, 40, 65700, 5)
+            read_for(big, 0.3); read_for(obs, 0.3)
+            mark = srv.mark()
+            big.sendall(b"ACTION:65602:42:65602:2\n")
+            big.sendall(b"ACTION:65702:42:65702:2\n")
+            for i in range(5):
+                big.sendall(b"ACTION:%d:60:65600:0:2\n" % (65600 + i))
+            seen = read_for(obs, 1.0)
+            log = "\n".join(srv.since(mark, settle=0.6))
+            check(b"ACTION:bomber:17:65702:42:65702:2" in seen, "both chains ran and were relayed")
+            check(b"ACTION:bomber:17:65600:60:65600:0:2" not in seen,
+                  "edits right after two ~860-blast chains are dropped, not relayed")
+            check("exceeded the ACTION rate limit" in log,
+                  "the blasts a chain ran are charged back, throttling what follows")
+            # ...and the debt is bounded: a couple of seconds later they build again.
+            time.sleep(3.0)
+            big.sendall(b"ACTION:65300:40:65300:0:2\n")
+            seen = read_for(obs, 1.0)
+            check(b"ACTION:bomber:17:65300:40:65300:0:2" in seen,
+                  "the charge is a pause, not a lockout — edits land again shortly after")
+            big.close()
+            check(srv.alive(), "the server survived the burst")
+            p.close(); obs.close()
+        finally:
+            srv.stop()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def ctl_cmd(path, line, timeout=3.0):
     """One command over the operator control socket; returns the reply text."""
     c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -919,6 +1014,7 @@ def main():
     group10_duplicate_names()
     group11_movement_reformatted()
     group12_ctl_fill_at_cap()
+    group13_burn_chain_budget()
 
     print()
     if fails:

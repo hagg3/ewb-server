@@ -32,7 +32,7 @@ server. Unknown flags are ignored.
 
 **Where the password comes from.** In order: a non-empty `--password`, then `--password-file`, then the `EDEN_PASSWORD` environment variable (`--password ""` counts as "not given"). The startup log names the source (`Password: from --password-file.`, never the value). The environment is visible to the process's owner and root only, which is why the shipped systemd units use it: `EDEN_PASSWORD` in `/etc/edenserver.conf` reaches the server through the unit's `EnvironmentFile` and never touches the command line. ⚠️ A server older than this feature ignores the variable and starts **open**: upgrade the binary before installing a unit file that has dropped `--password ${EDEN_PASSWORD}`.
 | `--matchmaker HOST[:PORT]` | *(none)* | Register with a matchmaker at this address and hold the registration open (`REGISTER` → `REGISTERED`, then a bare `PING` keep-alive every 20 s). Port defaults to `27020`. Reconnects every ~5 s if the matchmaker is down. See [matchmaker.md](matchmaker.md). |
-| `--advertise IP` | auto-detected | The address clients should use to reach this server, as told to the matchmaker. When omitted and a matchmaker is configured, the server picks this machine's primary non-loopback LAN IPv4 (preferring `192.168.*`, `10.*`, `172.*`) so remote devices do not get handed `127.0.0.1`. |
+| `--advertise IP` | auto-detected | The address clients should use to reach this server, as told to the matchmaker. When omitted and a matchmaker is configured, the server picks this machine's primary non-loopback LAN IPv4 (preferring `192.168.*`, `10.*`, `172.*`) so remote devices do not get handed `127.0.0.1`. `edenmatch` lists it only when the server connects from that address, from the matchmaker's own host, or from a `--trust-advertise` range; otherwise it lists the address the server connects from ([matchmaker.md § Advertised addresses](matchmaker.md#advertised-addresses)). |
 | `--tcp-nodelay 0\|1` | `1` | Disables Nagle's algorithm (`TCP_NODELAY`) on every accepted client socket. The writer sends one `send()` per queued line and the hottest line is a ~60-byte `POSVEL` broadcast — exactly what Nagle coalesces — so with Nagle enabled other players' movement arrives in RTT-quantised jerks instead of as each update is sent. `0` restores Nagle if an operator ever wants it back. |
 
 ### Files
@@ -44,6 +44,8 @@ server. Unknown flags are ignored.
 | `--signs FILE` | `eden_signs.txt` | Sign sidecar. Read at startup, when signs on blocks the world stores as air are dropped (see [`eden_signs.txt`](#eden_signstxt)); the control socket's `signs add`/`rm`/`reload` also edit it. Absent is normal and silent. |
 | `--spawn-file FILE` | `eden_spawn.txt` beside `--world` | World default-spawn sidecar (one line `x:y:z`), as written by [`eden_import`](import.md). Read once at startup. Absent is normal and silent; a malformed line warns and is ignored. |
 | `--spawn x:y:z` | *(none)* | Set the world default spawn inline; overrides `--spawn-file` and skips reading it. |
+| `--zones-file FILE` | `eden_zones.txt` beside `--world` | Protected zones (see [`eden_zones.txt`](#eden_zonestxt) and [Protected zones](#protected-zones)). Read at startup; also read and written at runtime by the `zone:*` control verbs. Absent is normal and silent. **A file that does not parse stops the server** at startup (exit 2, naming the file, line and reason) or is refused by `zone reload` at runtime: the loader takes all of it or none. |
+| `--auth-file FILE` | `eden_auth.txt` beside `--world` | Login PINs (see [`eden_auth.txt`](#eden_authtxt) and [commands.md § Player identity](commands.md#player-identity-pins-and-login)). Read at startup; written by the `passwd` / `unpasswd` control verbs, always mode `0600`. Absent is normal: no name has a PIN. **A file that does not parse stops the server** (exit 2, naming the file, line and reason) — carrying on without it would hand every PIN-protected name's level back to whoever claims the name. |
 | `--players-file FILE` | `eden_players.txt` beside `--world` | Player-position store. Defaults to the same directory as `--world`, not the process cwd, so two differently-named worlds hosted from one directory no longer share (and silently teleport players between) one file. If a legacy `./eden_players.txt` already exists and the derived path is a different file, it is read instead, so nobody's saved position vanishes on upgrade. |
 
 All paths are resolved **relative to the process working directory** unless noted otherwise, so
@@ -123,6 +125,25 @@ default. Lower it on a small VPS; raise it if your builders complain that undo r
 The rate limit is charged in **cells, not commands**, and charged against the box a command will
 scan before any of it runs — one `//sphere 40 2` is a single chat line and roughly 268,000 cells.
 
+### Protected zones
+
+Boxes of the world no player may edit — the boxes themselves are listed in
+[`eden_zones.txt`](#eden_zonestxt) (`--zones-file`). What a refused edit looks like on the wire,
+for each edit path, is in [protocol.md § Protected zones](protocol.md#protected-zones). The
+control socket is not subject to zones.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--zone-revert-delay-ms N` | `1000` | How long after a refused edit the server sends the lines that put the cell back on the player's screen. `0` sends them at once, from the thread that refused the edit; anything above `0` hands them to one restore thread. Restores waiting out the delay are coalesced per player per cell, so a longer delay also means fewer restores for a player hammering one block. Clamped to `0..60000`; an out-of-range value falls back to the default with a warning. ⚠️ The default is a placeholder, not a measured value: whether the retail client needs the restore to trail its own handling of the edit is still to be tested over a real network link. |
+
+**Who may build inside one.** A zone with a `level` lets a player build inside it if they are
+**logged in with a PIN** ([commands.md § Player identity](commands.md#player-identity-pins-and-login))
+and their level is at least the zone's. Nobody else bypasses it, whatever their `eden_ops.txt`
+level: a level on a name with no PIN goes to whoever joins under that name, so it is never
+enough on its own. A zone with no `level` stops every player. Otherwise, toggle it `off` with
+`zone flags <name> off` (no restart needed — see [commands.md](commands.md#commands)), or make
+the edits through the control socket (`setblock` / `fill`), which is not subject to zones.
+
 ### Logging
 
 | Flag | Default | Meaning |
@@ -151,9 +172,24 @@ that tells you whether region serving is keeping up.
   changed, at every permission level. Plus any command that reaches across players (today only
   `/tp <player>`, which is audited on the way in because it edits nothing).
 
+- `player:<name> denied …` — an edit a [protected zone](#protected-zones) refused. These are the
+  one kind of refusal that is audited, because they are what a griefing attempt looks like, and
+  they are **folded** so an attempt cannot fill the disk: at most one line per player, per zone,
+  per 10 s. The first refusal in a quiet spell is written at once; later ones in the window are
+  counted and written as one line when it closes (on the next 15 s autosave tick):
+
+  ```
+  [Audit] 2026-09-25T10:00:01Z player:griefer denied mine in zone spawn at 65510,32,65510
+  [Audit] 2026-09-25T10:00:15Z player:griefer denied 97 more edit(s) in zone spawn (last: mine at 65510,32,65510)
+  ```
+
+  The verb is `build`, `mine`, `paint`, `burn` (on a protected cell), `blast` (a burn outside
+  whose blast reached in), `sign`, or the player command with the cells it skipped
+  (`//set (3 cell(s))`).
+
 Read-only commands (`who`, `banlist`, `region-stats`, `//pos1`, `/help`) are not audited: the
-channel is only useful if everything in it is a change. Refused commands are logged only under
-`--verbose` — a player can trigger a refusal far faster than they can trigger an edit, so
+channel is only useful if everything in it is a change. Other refused commands are logged only
+under `--verbose` — a player can trigger a refusal far faster than they can trigger an edit, so
 auditing them would let anyone who can chat fill your disk.
 
 `grep '\[Audit\]'` over the journal is the intended way to read it; `--audit-file` is for
@@ -164,20 +200,24 @@ keeping a copy that outlives `journalctl --vacuum`.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--max-saved-positions N` | `10000` | Ceiling on remembered player positions (the rows in `eden_players.txt`). Past it, the **least recently updated** row is evicted, so a client that joins under a fresh name over and over cannot grow the process — or the file, which is rewritten in full every 15 s — without bound. A returning name is refreshed, not duplicated. The file is written oldest-to-newest, so recency survives a restart, and a file with more rows than the cap is trimmed to the newest on load (logged). Size it above the number of distinct players you expect to *return*; an evicted player simply respawns at the world spawn. A value below `1` falls back to the default with a warning; a non-default value is logged at startup. |
-| `--max-world-cells N` | `4000000` | Ceiling on distinct edited world cells held in memory (and written to `eden_world.model`). At the cap, edits to cells the world already holds still apply but **every new cell is refused** — a block placed in open air, a natural block mined or painted — so from a player's seat some builds save and others vanish. **Size it above the world, never equal to it:** [`eden_import`](import.md)'s summary prints the value to use (the cell count plus a quarter, at least 1,000,000 more, rounded up to 100,000). The server warns at startup when the loaded world is at the cap or within a tenth of it, logs refusals at most once a minute (`world cell cap reached`), and tells the player whose edit was refused; every `Saved world` log line shows the cap. The operator `fill` / `setblock` verbs honour it too: a refused cell is not relayed, and the reply and audit line count it ([commands.md](commands.md)). Also the upper clamp for `--we-max-cells` and the derived `fill` cap. Your RAM is the real limit. A value below `1` falls back to the default with a warning; a non-default value is logged at startup. |
+| `--max-world-cells N` | `4000000` | Ceiling on distinct edited world cells held in memory (and written to `eden_world.model`). At the cap, edits to cells the world already holds still apply but **every new cell is refused** — a block placed in open air, a natural block mined or painted — so from a player's seat some builds save and others vanish. **Size it above the world, never equal to it:** [`eden_import`](import.md)'s summary prints the value to use (the cell count plus a quarter, at least 1,000,000 more, rounded up to 100,000). The server warns at startup when the loaded world is at the cap or within a tenth of it, logs refusals at most once a minute (`world cell cap reached`), and tells the player whose edit was refused; every `Saved world` log line shows the cap. The operator `fill` / `setblock` verbs honour it too: a refused cell is not relayed, and the reply and audit line count it ([commands.md](commands.md)). **A WorldEdit command is checked against the cap by the most it *could* add — its box's volume, or the number of cells it lists — not by how many new cells it would actually create:** near the cap it is refused (`The world is at its edited-cell limit; that edit was refused.`) even when every cell it touches already exists. That is deliberate — the server refuses a whole command rather than apply half of it — but it means a command can be refused while single-block edits still succeed; leave headroom (see above) or use a smaller box. Also the upper clamp for `--we-max-cells` and the derived `fill` cap. Your RAM is the real limit. A value below `1` falls back to the default with a warning; a non-default value is logged at startup. |
 | `--action-rate N` | `512` | Sustained terrain edits per second per connection. `0` disables the limit entirely. |
 | `--action-burst N` | `1024` | Edits a connection may spend at once before the sustained rate applies. |
 | `--move-rate N` | `40` | Sustained `POS`/`VEL`/`POSVEL` updates per second per connection. `0` disables the limit entirely. |
 | `--move-burst N` | `80` | Movement updates a connection may spend at once before the sustained rate applies. |
 | `--chat-rate N` | `0.5` | Sustained `MSG` (chat) lines per second per connection — i.e. one line every two seconds sustained. `0` disables the limit entirely. Does not apply to `/`-prefixed commands, which have their own budget (see [Player commands](#player-commands) above). |
 | `--chat-burst N` | `5` | Chat lines a connection may spend at once before the sustained rate applies. |
+| `--burn-max-cells N` | `1048576` | Cells one TNT/firework chain from a single `ACTION:...:2` may read before it is cut short. This is a **world-lock** budget, not a world-size one: `simAction()` holds the world lock for the whole chain, so it is the one thing one packet can make every other player wait for. The default is ~1 000 blasts (~1 M cell reads, measured ~7 ms; the 4 096-blast bound it replaced was ~23 ms) and finishes a solid 5×5×5 block of TNT. Values below one blast (1 037) are raised to it. Raise it if players report TNT surviving a big detonation and reappearing on rejoin; see [protocol.md](protocol.md). |
 | `--connect-limit N` | `10` | New connections allowed per source IP per 10 s window. `0` disables. ⚠️ It is per *source address*, so a whole LAN behind one NAT address shares the allowance — as does a test harness on loopback. |
-| `--auth-fail-limit N` | `5` | Wrong-password `JOIN` attempts allowed per source IP inside a 60 s window before that IP is locked out at `accept()`. The lockout starts at 60 s and **doubles** on every further failure, up to 1 h; an IP that stops guessing for an hour has its escalation reset. `0` disables. Per-IP only — a distributed guesser is not stopped by this (see below). |
+| `--auth-fail-limit N` | `5` | Wrong-password `JOIN` attempts allowed per source IP inside a 60 s window before that IP is locked out at `accept()`. The same count, in a separate table, applies to wrong `/login` PINs (that lockout refuses `/login` only, never the connection). The lockout starts at 60 s and **doubles** on every further failure, up to 1 h; an IP that stops guessing for an hour has its escalation reset. `0` disables. Per-IP only — a distributed guesser is not stopped by this (see below). |
 
 The defaults accommodate bulk editing by a scripted client draining a queue at several hundred
 edits per second. Tighten them if you host strangers. A refused edit is dropped, not fatal.
 Burn costs 64 against the budget rather than 1, because a single burn can write hundreds of
-cells via explosion simulation.
+cells via explosion simulation — and, once its chain has run, a further 1 per blast past that
+first 64, because the upfront charge cannot know how big the chain would turn out to be. That
+back-charge may push the budget below zero (bounded at one burst's worth), in which case the
+player's next edits are dropped until it refills. `--burn-max-cells` bounds the chain itself:
 
 `POS`/`VEL`/`POSVEL` and `MSG` fan out to every other connected client the same way `ACTION`
 does, but until stage 7.14 neither had a limiter — `--action-rate` bounded edits, not the update
@@ -257,7 +297,7 @@ in `server_posix.cpp` (and its headers) if you must.
 | Max chat message length | 256 bytes |
 | Max username length | 20 bytes |
 | Max distinct edited world cells | 4,000,000 by default — the value of `--max-world-cells` (see the server flag table) |
-| Max signs (loaded, or placed by players) | 20,000 |
+| Max signs (loaded, placed by players, or added with `signs add`) | 20,000 — past it a player's sign is refused with a notice and `signs add` answers `error: sign cap reached` |
 | Sign writes (`SIGNP`) per connection | 1/s sustained, burst of 8 |
 | Minimum gap between served `REGION`s | 750 ms |
 | `REGION`s served per session | 256 |
@@ -277,8 +317,15 @@ in `server_posix.cpp` (and its headers) if you must.
 | Block a player `//up` stands on | 58 |
 | Failed-auth counting window | 60 s |
 | Auth lockout: base / max / reset-after | 60 s / 1 h (doubling) / 1 h idle |
-| Max explosions chained from one `ACTION:...:2` (`EXPLODE_MAX_CHAIN`, `explode.h`) | 4,096 |
+| Cells one blast reads (`EXPLODE_VISITS_PER_BLAST`, `explode.h`) | 1,037 |
+| Explosions chained from one `ACTION:...:2` | `--burn-max-cells` / 1,037 (~1,011 by default) |
 | Explosion chain recursion-depth guard | 6 |
+| Furthest a chain can reach from its root (`EXPLODE_REACH`) | 42 cells per axis |
+| Protected zones on file | 256 |
+| "This area is protected" notice | once per 10 s per player |
+| Zone refusals audited | one line per player per zone per 10 s, with a count |
+| Cells one burn's restore may redraw | 16,384 — past it, the player is told it may look damaged until they rejoin |
+| Restore cells waiting out `--zone-revert-delay-ms`, all players | 1,048,576 — past it a restore is dropped (the world is intact; the player sees it on rejoin) and the drop logged at most once a minute |
 
 ## The systemd EnvironmentFile (`/etc/edenserver.conf`)
 
@@ -590,6 +637,21 @@ A truncated or corrupt `EDMB` file loads as far as it parses and warns loudly ra
 starting with an empty world; stop the server before it saves over the file if you want to keep
 the original.
 
+**Cells outside the world are dropped at load, in either format.** A row or chunk whose cell is
+not inside `x`/`z` `0 .. 16777215`, `y` `0 .. 255` is skipped, and the server says so once at
+startup:
+
+```
+[Server] warning: dropped N cell(s) in eden_world.model outside the world (y 0..255, x/z 0..16777215); the next save omits them.
+```
+
+No client could ever see such a cell and no player could edit it, but before this check it was
+still loaded, counted against `--max-world-cells` and saved again (a negative or over-range `x`/`z`
+instead wrapped onto a real cell at the far edge of the world). The usual source is a world saved
+by a server from before 2026-09-23, whose TNT blasts near the top of the world wrote cells at
+`y` 256–260. The file on disk keeps them until the first save that follows an edit (a load alone
+does not save); after that they are gone, so keep a copy first if you want the original.
+
 ### `eden_players.txt`
 
 One line per remembered player. Used to send `SPAWN` on rejoin.
@@ -670,10 +732,71 @@ split on its **last** `:`, so a name containing `:` still round-trips. The file 
 startup, and the level is consulted on **every** player command — an `op` or `deop` takes effect
 on that player's next line, with no reconnect. A name with no entry gets `--default-level`.
 
+⚠️ A level goes to whoever joins under the name, unless the name also has a PIN in
+[`eden_auth.txt`](#eden_authtxt): then a session gets the level only after `/login`, and until
+then has `--default-level` (or the name's own level, if lower).
+
 ```
 # edenserver op levels — <name>:<0..2> per line
 Alice:2
 ```
+
+### `eden_zones.txt`
+
+Protected zones: boxes of the world no player may edit ([Protected zones](#protected-zones),
+[protocol.md § Protected zones](protocol.md#protected-zones)). One zone per line, `#` comments
+and blank lines skipped:
+
+```
+# eden_zones.txt — protected boxes
+# name:x0:y0:z0:x1:y1:z1:flags[:level]
+spawn:65500:0:65500:65572:255:65572:all
+museum:65800:30:65400:65850:90:65460:off
+```
+
+- `name` — `A-Z a-z 0-9 _ -`, 1–32 characters, unique in the file.
+- `x0:y0:z0:x1:y1:z1` — two opposite corners, **inclusive**, in either order. `x`/`z` in
+  `0..16777215`, `y` in `0..255`. Use `0` and `255` for `y` to protect the whole column.
+- `flags` — `all` (refuse every player edit) or `off` (kept on file, not enforced — how an
+  operator builds inside a zone). Any other word is an error, not ignored: a typo must never
+  quietly mean "unprotected".
+- `level` — optional, `0..2`: the lowest level of a player **logged in with a PIN** who may edit
+  inside (so `0` means "any logged-in player"). Anything outside `0..2` is an error. With no
+  `level`, nobody bypasses the zone in game. If a zone names a level and no name has a PIN yet,
+  the server says so at startup.
+- At most 256 zones.
+
+Read at startup from `eden_zones.txt` beside the world file (or `--zones-file`). A missing
+file means no zones and is silent. Any malformed line, duplicate name, or a 257th zone **stops
+the server from starting**, naming the file, line and reason.
+
+The file is also read and written at runtime by the `zone add|set|flags|rm|reload` control verbs
+([commands.md](commands.md#commands)) — each mutating verb rewrites it atomically
+(`durable_write.h`) and swaps the change in immediately, no restart needed. Hand-editing while the
+server is running works too: `zone reload` re-reads it with the same all-or-nothing rule as
+startup (a malformed file is refused and the in-memory set is left untouched, not partially
+applied).
+
+### `eden_auth.txt`
+
+Login PINs, one name per line, written by `passwd` / `unpasswd`
+([commands.md § Player identity](commands.md#player-identity-pins-and-login)). The PIN itself is
+never stored:
+
+```
+# name:pbkdf2-sha256:<iterations>:<salt hex>:<hash hex>
+Alice:pbkdf2-sha256:100000:9f2c…(32 hex):4be1…(64 hex)
+```
+
+- `name` — a valid player name (the `JOIN` rules; it may contain spaces, never `:`).
+- The hash is PBKDF2-HMAC-SHA-256 of the 8-digit PIN with a 16-byte random salt and a 32-byte
+  output; `iterations` is stored per line (`1000..10000000`), so a future default only affects
+  PINs issued after it. One check costs a few tens of milliseconds.
+- Always written `0600`, atomically and durably. The server warns at startup if the file is
+  readable by anyone else: 8 digits is a small space to search offline, so treat the file like
+  the password file.
+- Any malformed line or duplicate name **stops the server from starting**. Hand-edit only to
+  remove a line (or use `unpasswd`); there is no reload verb — a restart re-reads it.
 
 ### `eden_spawn.txt`
 
@@ -723,5 +846,9 @@ world would be committed by a `git add -A`.
 
 ### Temporary files
 
-Saves write `<file>.tmp` next to the real file and rename over it. Seeing one linger means a
-save failed — the server logs why, and retries at the next interval.
+Saves write `<file>.tmp` next to the real file, `fsync` it, rename over the real file and `fsync`
+the directory, so a power loss leaves the old contents or the new, never a truncated file (see
+[architecture.md § Persistence](architecture.md)). Seeing a `.tmp` linger means a save failed —
+the server logs why, and retries at the next interval. The `Saved world` log line ends
+`write N ms, of which fsync M ms`; if `M` is large on your disk, that is the cost of the guarantee
+(it is paid outside the world lock, so it never delays a player's edit).
