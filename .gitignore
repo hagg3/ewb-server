@@ -30,6 +30,7 @@ LatestREF/
 /auth_test
 /topmap_test
 /world_store_test
+/burn_test
 *.o
 *.obj
 

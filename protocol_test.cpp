@@ -241,10 +241,13 @@ struct FakeWorld {
     }
 };
 
-static void test_explode_single_tnt_golden() {
+// One isolated TNT in an empty world at radius `r`: returns the result and the
+// number of set() calls (distinct cells touched).
+static ewb::ExplodeResult run_single_tnt(int r, size_t& setCalls) {
     FakeWorld fw;
-    size_t setCalls = 0;
+    setCalls = 0;
     ewb::ExplodeWorld w;
+    w.radius = r;
     w.get = [&](int x, int y, int z, ewb::ExplodeCell& out) -> bool {
         auto it = fw.cells.find(FakeWorld::key(x, y, z));
         if (it == fw.cells.end()) return false;
@@ -257,18 +260,33 @@ static void test_explode_single_tnt_golden() {
         return true;  // no cap in this test
     };
     fw.cells[FakeWorld::key(100, 100, 100)] = {(unsigned char)w.tntType, 0};
+    return ewb::simExplode(w, 100, 100, 100);
+}
 
-    const ewb::ExplodeResult r = ewb::simExplode(w, 100, 100, 100);
-    // Golden: an isolated TNT in an empty world, R=6 sphere, no chain — 923
-    // distinct cells touched (1 explicit center-consume call, then every other
-    // distinct cell the sphere's samples land on; repeat visits to an
-    // already-air cell are skipped). A change here means the destroyed-cell
-    // geometry changed, not just this refactor.
-    CHECK(r.refused == 0 && r.truncated == 0, "an unbounded single TNT refuses nothing");
-    CHECK(setCalls == 923, "an isolated TNT's blast touches the same cell count as before 7.7");
-    CHECK(r.explosions == 1, "one blast");
-    CHECK(r.visits == ewb::EXPLODE_VISITS_PER_BLAST && r.visits == 1037,
-          "one blast reads exactly EXPLODE_VISITS_PER_BLAST cells");
+static void test_explode_single_tnt_golden() {
+    // Golden: an isolated TNT in an empty world, no chain. Cells touched = 1
+    // explicit center-consume call, then every other distinct cell the sphere's
+    // samples land on (repeat visits to an already-air cell are skipped). R=6 is
+    // the pre-10.1 figure (923, kept from 7.7); a change here means the
+    // destroyed-cell geometry changed.
+    struct Row { int r; size_t sets, visits; } rows[] = {{4, 0, 0}, {5, 0, 0}, {6, 923, 1037}};
+    for (Row& row : rows) {
+        size_t setCalls = 0;
+        const ewb::ExplodeResult res = run_single_tnt(row.r, setCalls);
+        CHECK(res.refused == 0 && res.truncated == 0, "an unbounded single TNT refuses nothing");
+        CHECK(res.explosions == 1, "one blast");
+        CHECK(res.visits == ewb::explode_visits_per_blast(row.r),
+              "one blast reads exactly explode_visits_per_blast(radius) cells");
+        if (row.sets) CHECK(setCalls == row.sets, "radius 6 touches the same cell count as before 7.7");
+        if (row.visits) CHECK(res.visits == row.visits, "radius 6 reads 1037 cells");
+    }
+    size_t s4, s5, s6;
+    run_single_tnt(4, s4); run_single_tnt(5, s5); run_single_tnt(6, s6);
+    CHECK(s4 < s5 && s5 < s6, "a bigger radius destroys more cells");
+    CHECK(s5 == 513, "radius 5 (the game's) touches 513 cells");
+    CHECK(ewb::explode_visits_per_blast() == ewb::EXPLODE_VISITS_PER_BLAST &&
+          ewb::EXPLODE_RADIUS == 5, "the default radius is the game's 5");
+    CHECK(ewb::explode_reach(6) == 42 && ewb::explode_reach(5) == 35, "reach follows the radius");
 }
 
 // A dense field where every queried cell reports back another TNT block: the
@@ -441,7 +459,7 @@ static void test_explode_protected_tnt_does_not_chain() {
         b.fw.cells[FakeWorld::key(2004, 100, 2000)] = {9, 0};
         const ewb::ExplodeResult r = ewb::simExplode(b.w, 2000, 100, 2000);
         CHECK(r.explosions >= 2, "control: an unprotected TNT in the blast chains");
-        const ewb::ExplodeCell* far = b.at(2010, 100, 2000);   // only the second blast reaches it
+        const ewb::ExplodeCell* far = b.at(2009, 100, 2000);   // only the second blast reaches it
         CHECK(far && far->type == 0, "control: the chained blast reaches past the first");
     }
     // The second inside a zone: it is not set off, not written, and so nothing
@@ -478,11 +496,11 @@ static void test_explode_protected_tnt_does_not_chain() {
 
 // EXPLODE_REACH is what lets the server hand a chain only the zones near its root,
 // so it must bound every cell the chain can touch — and be tight, or it filters
-// in zones for nothing. A line of TNT 6 apart chains as deep as the guard allows.
+// in zones for nothing. A line of TNT one radius apart chains as deep as the guard allows.
 static void test_explode_reach() {
     ZonedBlast b;
     // TNT at depths 0..6; the last link's blast is the one that reaches furthest.
-    for (int k = 0; k <= ewb::EXPLODE_MAX_DEPTH; ++k) b.fw.cells[FakeWorld::key(5000 + 6 * k, 100, 5000)] = {9, 0};
+    for (int k = 0; k <= ewb::EXPLODE_MAX_DEPTH; ++k) b.fw.cells[FakeWorld::key(5000 + ewb::EXPLODE_RADIUS * k, 100, 5000)] = {9, 0};
     int maxOff = 0;
     auto set = b.w.set;
     b.w.set = [&](int x, int y, int z, int type, int color) -> bool {
@@ -498,7 +516,7 @@ static void test_explode_reach() {
 
 static void test_explode_blast_footprint() {
     // explode_for_each_blast_cell is the footprint simExplode actually sets: an
-    // isolated blast's distinct cells, the 923 of the 7.7 golden.
+    // isolated blast's distinct cells (513 at the default radius 5).
     std::set<std::tuple<int, int, int>> fp;
     ewb::explode_for_each_blast_cell(100, 100, 100, 0, 256, [&](int x, int y, int z) { fp.insert({x, y, z}); });
     ZonedBlast b;
@@ -507,7 +525,7 @@ static void test_explode_blast_footprint() {
     std::set<std::tuple<int, int, int>> set;
     for (const auto& kv : b.fw.cells)
         set.insert({int(kv.first >> 40), int(kv.first & 0xFFFF), int((kv.first >> 16) & 0xFFFFFF)});
-    CHECK(fp.size() == 923 && fp == set, "the blast footprint matches what a blast writes");
+    CHECK(fp.size() == 513 && fp == set, "the blast footprint matches what a blast writes");
     size_t clipped = 0;
     ewb::explode_for_each_blast_cell(100, 0, 100, 0, 256, [&](int, int y, int) { clipped += (y < 0); });
     CHECK(clipped == 0, "the footprint is clipped to the world");

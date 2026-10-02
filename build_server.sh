@@ -200,6 +200,14 @@ echo "Built ./auth_test  —  hash vectors / PINs / eden_auth.txt / login levels
 ./topmap_test
 echo "Built ./topmap_test  —  topmap parse / surface rule / chunk walk / brute force"
 
+# Offline burn checks (ROADMAP-SERVER stage 10): the game's block tables, fireworks
+# and the golden cube in a blast (10.2a), the expansion-block fill — box, bounds,
+# side-variant ramp ring, chaining, zones, reach, budget (10.2b) — and the TNT/fire
+# switches' verdict, dry-run preview and restore timing (10.4). No zlib needed.
+"$CXX" -std=c++17 -O2 -Wall burn_test.cpp -o burn_test
+./burn_test
+echo "Built ./burn_test  —  block rules / fireworks / expansion fill / TNT+fire switches"
+
 # edenadmin, the local operator GUI (ROADMAP-SERVER Phase 6). Opt-in: --with-admin.
 # Its own offline Go suite (quoting boundary, per-verb argv for both transports,
 # profile round-trip, the HTTP guard rejections) runs inside admin/build.sh.

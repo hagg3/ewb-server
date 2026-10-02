@@ -202,19 +202,46 @@ palette; every painted value observed in capture fell in `0..54`, and none was e
 
 Modes 1 and 2 carry no payload, so anything trailing them is ignored.
 
-The server does not merely record the edit: it simulates it, including TNT and firework
-explosions with chaining. One burn can therefore change hundreds of cells, which is why it is
-charged much more heavily against the per-connection edit budget (see
-[configuration.md](configuration.md)).
+The server does not merely record the edit: it simulates it. A client sends only the cell the
+player lit (a burn, then a mine on the same cell) and works out every consequence itself; the
+server works out the same consequences from the game's own rules (`explode.h`, `block_rules.h`):
+
+| What is lit | What the server applies |
+|---|---|
+| TNT (`9`) | a blast: every cell within `--tnt-radius` becomes air, except bedrock, steel and the golden cube (`71`). TNT in the blast chains into its own blast. A firework in it is destroyed like any block. |
+| an expansion block (`81`–`111`) | its **fill**: the air within 2 cells (a 5×5×5 box) takes the block's material (`84` stone, `87` TNT, `107` water, …), painted the block's colour. A side already against a block does not grow that way, so one on the ground fills upwards. The four side variants (`102`–`105`) put ramps or side blocks in the box's corner columns. The centre ends as the material too, unpainted. Expansion blocks in the box are lit and fill in turn; one caught in a TNT blast is lit, not destroyed. `81` fills with nothing. TNT made by a fill is not lit. |
+| a firework (`65`) | its own cell becomes air; nothing else (it launches and is gone) |
+| any other stored block | becomes air |
+| a cell nothing is stored for | nothing |
+
+All of it happens at once, at the burn; clients get there over a few seconds. One burn can
+change hundreds of cells, which is why it is charged much more heavily against the
+per-connection edit budget (see [configuration.md](configuration.md)).
+
+Fire spread is **not** modelled yet: a lit flammable block is the only one the server removes,
+while clients burn every flammable block touching it. ⚠️ The expansion rules are ported from the
+game's source and not yet confirmed against a retail client. Two known differences: where a
+client would fill a cell its own player is standing in it leaves that cell empty, which the
+server cannot know; and a corner ramp whose direction the game takes from the local player's
+facing is placed unrotated. The mine an expansion block's client follows its burn with (if it
+arrives within 8 s, from the same player, on the same cell) is taken as part of the burn: it is
+not applied and not relayed, since the server has already left the material in that cell.
+
+Expansion blocks run after the TNT chain, on what is left of the same budget, and a chain of
+them stops at a box of `burn_reach()` around the lit cell (`7 × --tnt-radius + 64` per axis);
+a link past either counts as truncated, as below.
 
 A chain reaction is bounded two ways: a recursion-depth guard (an explosion caused by an
 explosion caused by... six levels deep, the same as before), and a **work budget** for the
 whole chain — `--burn-max-cells`, the number of cells one `ACTION:...:2` may read before the
 chain is cut short (`explode.h`). Depth alone does not bound fan-out: a dense enough
-TNT/firework field chains every block in the blast into its own explosion, each one a ~1 000-cell
+TNT field chains every block in the blast into its own explosion, each one a ~1 000-cell
 sphere scan, and all of it runs under the world lock that every other player's edit needs. The
 budget is what bounds how long that is. It is spent one whole blast at a time, so a chain is
 never cut off half-way through a sphere.
+
+The blast sphere's radius is `--tnt-radius` (default 5, the game's own; see
+[configuration.md](configuration.md)). Every sphere above scales with it.
 
 The server's copy of a blast is clipped to the world (`y` 0–255, `x`/`z` 0–16777215): the part of
 a sphere that pokes out past the top or an edge is neither read nor written. Nothing is lost —
@@ -227,8 +254,8 @@ finish; some of the TNT is still there on the server.`, at most once every 30 s)
 operator gets a log line naming the flag. If it happens in ordinary play, raise
 `--burn-max-cells`; see [configuration.md](configuration.md).
 
-The blasts a chain actually ran are charged back against the sender's `ACTION` budget (1 token
-each, over the flat 64 a burn pays upfront), so a player who keeps setting off large chains
+The blasts and expansion fills a chain actually ran are charged back against the sender's
+`ACTION` budget (1 token each, over the flat 64 a burn pays upfront), so a player who keeps setting off large chains
 pays for them in edits they cannot make for the next second or two. It is a pause, not a
 lockout: the debt is capped at one burst.
 
@@ -250,6 +277,42 @@ in open air, a natural block mined or painted — is refused:
   blast was refused, the player is told that instead.
 
 Sizing the cap so this never happens is covered in [configuration.md](configuration.md).
+
+### TNT and burning switched off
+
+`--tnt off` and `--fire off` (or the `tnt` / `fire` control verbs at runtime) refuse edits the
+way a protected zone does: the edit is **not applied and not relayed**, so no peer ever sees it,
+the sender's screen is put back from the model, and the sender is told `[Server] TNT is disabled
+on this server.` or `[Server] Burning is disabled on this server.`, at most once every 10 s. A
+refused edit still spends its `ACTION` budget.
+
+- **TNT off, a build of TNT** (`9`, or the expansion block that fills with TNT, `87`): the sender
+  is sent `ACTION:server:0:x:y:z:1` (the cell's restore) at once, so the block blinks out as it
+  is placed. No new TNT can enter the world through play; TNT already there can be cleared with
+  `//replace` or the control socket, which the switches do not affect.
+- **TNT off, a burn** that would set off TNT, make TNT, or reach TNT through the fire it starts
+  (wood touching TNT) is refused. Any other burn goes through.
+- **Fire off**: every burn is refused.
+
+A refused burn is the hard case: the client lit the block before it asked, and a lit fuse
+cannot be cancelled. So the server, on the sender's connection only:
+
+1. sends a mine on the lit cell **at once**. In the game a burning block whose cell is emptied
+   finishes burning there and then — a lit wood block goes out before its fire spreads (1 s),
+   a lit TNT goes off now rather than in 4 s;
+2. **~0.25 s later**, restores the lit cell (for TNT, a firework or an expansion block, every
+   cell its blast or fill changes);
+3. **once every fire and fuse the burn could have started is over** (6 s, plus 1 s per block
+   the fire spreads, plus 0.8 s per chained link, plus 1 s; at most 120 s), restores every cell
+   the burn could have changed — the fire's spread through touching flammable blocks and the
+   blasts and fills it sets off, worked out by a dry run that changes nothing. This covers a
+   client that keeps burning anyway.
+
+A non-flammable block does nothing when burnt, so it gets the notice and nothing else. A
+restore is capped at 16,384 cells; past that the player is told some of it may look damaged
+until they rejoin. ⚠️ That the retail client puts a fire out, or sets a fuse off, when the
+server mines the cell is read from the game's source, not yet confirmed; step 3 is there in
+case it does not.
 
 ### Protected zones
 
@@ -279,20 +342,21 @@ the model is left alone, and the player's screen is put back.
   protected wall is paced like any other editing and cannot be used to make the server send
   restores faster than it accepts edits.
 - The player is told `[Server] This area is protected ('<zone>').`, at most once every 10 s.
-- **Burns.** A burn *on* a protected cell is refused like any other edit; if the cell holds TNT
-  or a firework, the sender's client has already set it off, so its blast sphere is restored to
-  the sender too. A burn *outside* a zone whose blast reaches into one is relayed as normal and
-  the unprotected part of the blast applies. The protected cells it reached are left alone, and
-  a protected TNT or firework is **not chained** — it does not go off on the server, so it
-  cannot carry the blast further. Every client, though, runs the whole blast itself, zones
-  unknown, so **every connected client** gets a restore of the protected cells, queued behind
-  the relay that makes it run the blast; the sphere of each protected TNT the clients will
-  have set off is included. The restore for one burn is capped at 16,384 cells; past that the
-  rest is intact on the server but not redrawn, and the player is told it may look damaged until
-  they rejoin. ⚠️ Two limits, both unverified against the retail client: a client may chain from
-  a protected TNT into further TNT the server never reached, and the restore does not follow that
-  second chain; and whether a restore can land before the client's own blast has finished is not
-  measured.
+- **Burns.** A burn *on* a protected cell is refused like any other edit; if the cell holds TNT or
+  an expansion block, the sender's client has already set it off, so its blast sphere or fill box
+  is restored to the sender too (a firework only takes its own cell). A burn *outside* a zone
+  whose blast reaches into one is relayed as normal and the unprotected part of the blast applies.
+  The protected cells it reached are left alone, and a protected TNT or expansion block is **not
+  set off** — it does not go off on the server, so it cannot carry the blast further. A fill is
+  refused cell by cell the same way. Every client, though, runs the whole blast itself, zones
+  unknown, so **every connected client** gets a restore of the protected cells, queued behind the
+  relay that makes it run the blast; the sphere of each protected TNT, and the fill box of each
+  protected expansion block, the clients will have set off is included. The restore for one burn
+  is capped at 16,384 cells; past that the rest is intact on the server but not redrawn, and the
+  player is told it may look damaged until they rejoin. ⚠️ Two limits, both unverified against the
+  retail client: a client may chain from a protected TNT into further TNT the server never
+  reached, and the restore does not follow that second chain; and whether a restore can land
+  before the client's own blast has finished is not measured.
 - **Player commands** (`//set`, `//paste`, `//undo`, …) are decided by the server before anything
   is drawn, so there is nothing to restore: protected cells are skipped, the rest of the
   command applies, and the reply says `N cell(s) skipped: protected area '<zone>'.`.

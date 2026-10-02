@@ -144,6 +144,23 @@ enough on its own. A zone with no `level` stops every player. Otherwise, toggle 
 `zone flags <name> off` (no restart needed — see [commands.md](commands.md#commands)), or make
 the edits through the control socket (`setblock` / `fill`), which is not subject to zones.
 
+### TNT and fire
+
+Switches for what players may set off. What a refusal looks like on the wire is in
+[protocol.md § TNT and burning switched off](protocol.md#tnt-and-burning-switched-off).
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--tnt on\|off` | `on` | `off`: a player may not place TNT (`9`) or the expansion block that fills with TNT (`87`) — it blinks out as it is placed — and a burn that would set off TNT, make it, or reach it through fire is refused and put back on the player's screen. TNT already in the world stays; clear it with `//replace` or the control socket, which the switch does not affect. |
+| `--fire on\|off` | `on` | `off`: every burn is refused and put back on the player's screen. |
+
+Either one refused is not applied and not relayed, and the player is told (`TNT is disabled on
+this server.` / `Burning is disabled on this server.`, at most once every 10 s). Any value but
+`on` or `off` stops the server from starting, so a typo cannot leave TNT on. Set them in the
+conf with `EDEN_EXTRA_ARGS="--tnt off"`. The `tnt` and `fire` control verbs show or flip them on a
+running server ([commands.md](commands.md#commands)); a flip lasts until the server stops, and
+the flag is what it starts with.
+
 ### Logging
 
 | Flag | Default | Meaning |
@@ -207,7 +224,8 @@ keeping a copy that outlives `journalctl --vacuum`.
 | `--move-burst N` | `80` | Movement updates a connection may spend at once before the sustained rate applies. |
 | `--chat-rate N` | `0.5` | Sustained `MSG` (chat) lines per second per connection — i.e. one line every two seconds sustained. `0` disables the limit entirely. Does not apply to `/`-prefixed commands, which have their own budget (see [Player commands](#player-commands) above). |
 | `--chat-burst N` | `5` | Chat lines a connection may spend at once before the sustained rate applies. |
-| `--burn-max-cells N` | `1048576` | Cells one TNT/firework chain from a single `ACTION:...:2` may read before it is cut short. This is a **world-lock** budget, not a world-size one: `simAction()` holds the world lock for the whole chain, so it is the one thing one packet can make every other player wait for. The default is ~1 000 blasts (~1 M cell reads, measured ~7 ms; the 4 096-blast bound it replaced was ~23 ms) and finishes a solid 5×5×5 block of TNT. Values below one blast (1 037) are raised to it. Raise it if players report TNT surviving a big detonation and reappearing on rejoin; see [protocol.md](protocol.md). |
+| `--burn-max-cells N` | `1048576` | Cells one TNT/expansion chain from a single `ACTION:...:2` may read before it is cut short. This is a **world-lock** budget, not a world-size one: `simAction()` holds the world lock for the whole chain, so it is the one thing one packet can make every other player wait for. The default is ~1 750 blasts at the default radius (~1 M cell reads, measured ~7 ms; the 4 096-blast bound it replaced was ~23 ms) and finishes a solid 5×5×5 block of TNT. Values below one blast (595 cells at radius 5; it follows `--tnt-radius`) are raised to it. Raise it if players report TNT surviving a big detonation and reappearing on rejoin; see [protocol.md](protocol.md). Expansion blocks set off by the chain (or lit directly) spend what is left of it, one ~850-cell fill at a time. It also bounds the dry run behind a refused burn (`--tnt off` / `--fire off`). |
+| `--tnt-radius N` | `5` | Blast radius, in cells, of a TNT burn (a firework takes only its own cell) (`1..16`; out of range falls back to `5` with a warning, a non-default value is logged at startup). `5` is the game's own `EXPLOSION_RADIUS`; the server used to copy an older public server's `6`, which dug a bigger crater than the client drew, visible on rejoin. If your players' clients run a different radius, match it here. The per-blast read cost, the `--burn-max-cells` blast count, the zone-reach box and the zone-restore footprint all follow it. |
 | `--connect-limit N` | `10` | New connections allowed per source IP per 10 s window. `0` disables. ⚠️ It is per *source address*, so a whole LAN behind one NAT address shares the allowance — as does a test harness on loopback. |
 | `--auth-fail-limit N` | `5` | Wrong-password `JOIN` attempts allowed per source IP inside a 60 s window before that IP is locked out at `accept()`. The same count, in a separate table, applies to wrong `/login` PINs (that lockout refuses `/login` only, never the connection). The lockout starts at 60 s and **doubles** on every further failure, up to 1 h; an IP that stops guessing for an hour has its escalation reset. `0` disables. Per-IP only — a distributed guesser is not stopped by this (see below). |
 
@@ -317,15 +335,21 @@ in `server_posix.cpp` (and its headers) if you must.
 | Block a player `//up` stands on | 58 |
 | Failed-auth counting window | 60 s |
 | Auth lockout: base / max / reset-after | 60 s / 1 h (doubling) / 1 h idle |
-| Cells one blast reads (`EXPLODE_VISITS_PER_BLAST`, `explode.h`) | 1,037 |
-| Explosions chained from one `ACTION:...:2` | `--burn-max-cells` / 1,037 (~1,011 by default) |
+| Cells one blast reads (`explode_visits_per_blast()`, `explode.h`) | 595 at `--tnt-radius 5` (1,037 at 6) |
+| Explosions chained from one `ACTION:...:2` | `--burn-max-cells` / cells per blast (~1,762 by default) |
 | Explosion chain recursion-depth guard | 6 |
-| Furthest a chain can reach from its root (`EXPLODE_REACH`) | 42 cells per axis |
+| Furthest a TNT chain can reach from its root (`explode_reach()`) | 7 × `--tnt-radius` (35 cells per axis by default) |
+| Furthest a burn can reach from its root, expansion blocks included (`burn_reach()`) | `explode_reach()` + 64 (99 cells per axis by default); the zones a burn is checked against are those within it |
+| Cells one expansion fill can change | its 5×5×5 box (`EXPAND_EXTENT` 2) |
+| Cells one fired expansion block reads, at most (`EXPAND_VISITS_PER_LINK`, `explode.h`) | 853 |
+| A player's follow-up `MINE` on the expansion block they lit, taken as part of the burn | within 8 s |
+| "TNT/Burning is disabled" notice | once per 10 s per player |
+| A refused burn's restores | at once (a mine on the lit cell), 0.25 s, then 6 s + 1 s per fire spread + 0.8 s per chained link + 1 s (at most 120 s) |
 | Protected zones on file | 256 |
 | "This area is protected" notice | once per 10 s per player |
 | Zone refusals audited | one line per player per zone per 10 s, with a count |
 | Cells one burn's restore may redraw | 16,384 — past it, the player is told it may look damaged until they rejoin |
-| Restore cells waiting out `--zone-revert-delay-ms`, all players | 1,048,576 — past it a restore is dropped (the world is intact; the player sees it on rejoin) and the drop logged at most once a minute |
+| Restore cells waiting to be sent (zone refusals and refused burns), all players | 1,048,576 — past it a restore is dropped (the world is intact; the player sees it on rejoin) and the drop logged at most once a minute |
 
 ## The systemd EnvironmentFile (`/etc/edenserver.conf`)
 

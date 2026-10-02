@@ -74,6 +74,8 @@ inline const std::vector<CtlSpec>& ctl_specs() {
         {"passwd",       1,  1, "passwd:<name>                    — issue (or replace) a login PIN; shown once"},
         {"unpasswd",     1,  1, "unpasswd:<name>                  — remove a name's PIN"},
         {"pins",         0,  0, "pins                             — names that have a login PIN"},
+        {"tnt",          0,  1, "tnt[:on|off]                     — show or switch TNT (until restart; --tnt sets the start)"},
+        {"fire",         0,  1, "fire[:on|off]                    — show or switch burning (until restart; --fire sets the start)"},
     };
     return specs;
 }

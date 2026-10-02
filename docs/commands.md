@@ -84,6 +84,8 @@ A raw client works too — `printf 'who\n' | nc -U ./edenserver.sock`.
 | `passwd <name>` | Issue a login PIN for a player name, or replace its PIN. The 8-digit PIN is in the reply and **nowhere else** — it is stored only as a salted hash in `eden_auth.txt`, never logged or audited — so hand it to the player now. A live session under that name is logged out. See [Player identity](#player-identity-pins-and-login). |
 | `unpasswd <name>` | Remove a name's PIN. The name goes back to being claimed by name alone; a live session under it is logged out. |
 | `pins` | Names that have a PIN, each `offline`, `online verified` or `online unverified`. |
+| `tnt [on\|off]` | Bare, shows the TNT switch (`tnt: on`). With a value, flips it (`ok: tnt off`) until the server stops; `--tnt` is what it starts with. Off: players cannot place TNT, and a burn that would set TNT off is refused and put back on their screen ([configuration.md § TNT and fire](configuration.md#tnt-and-fire)). Audited. |
+| `fire [on\|off]` | The same for burning (`--fire`). Off: every burn is refused and put back. Audited. |
 
 ### Notes
 

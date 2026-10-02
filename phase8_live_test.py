@@ -320,11 +320,11 @@ def group_burn(srv):
           "the peer's restore arrives after the relay that makes it run the blast")
     check("ACTION:server:0:65501:60:65510:0:5" in rest_a and "ACTION:server:0:65501:60:65510:0:5" in rest_b,
           "the protected block is redrawn on both screens")
-    check("ACTION:server:0:65502:60:65512:0:9" in rest_b,
+    check("ACTION:server:0:65501:60:65512:0:9" in rest_b,
           "the protected TNT is redrawn (it went off on the clients)")
     # The protected TNT's own sphere is restored too: a cell outside the zone that only
     # its blast (which the clients ran and the server did not) could have reached.
-    check("ACTION:server:0:65499:60:65517:1" in rest_b,
+    check("ACTION:server:0:65498:60:65516:1" in rest_b,
           "the protected TNT's sphere is restored, beyond the zone")
     # A restore is the model as it is now, so a cell the server did destroy — the
     # burned TNT, the block beside it — is at most redrawn as air, never rebuilt.
@@ -335,7 +335,7 @@ def group_burn(srv):
 
     model = srv.model()
     check(model.get((65501, 60, 65510)) == (5, 0), "the protected block is intact in the model")
-    check(model.get((65502, 60, 65512)) == (9, 0), "the protected TNT is intact: not chained")
+    check(model.get((65501, 60, 65512)) == (9, 0), "the protected TNT is intact: not chained")
     check(model.get((65495, 60, 65510)) == (0, 0), "the unprotected block in the blast is gone")
     check(not any(in_zone(x, z) for (x, y, z) in model if y >= 54 and model[(x, y, z)] == (0, 0)),
           "no cell inside the zone was stored as air")
@@ -795,7 +795,7 @@ WORLD = [
     (65511, 40, 65511, 5, 12),    # a painted stored block in the zone
     (65505, 33, 65505, 5, 0),     # the signed block
     (65501, 60, 65510, 5, 0),     # in the zone, inside the burn's blast
-    (65502, 60, 65512, 9, 0),     # a protected TNT inside the blast
+    (65501, 60, 65512, 9, 0),     # a protected TNT inside the blast (radius 5: 4 x, 2 z away)
     (65495, 60, 65510, 5, 0),     # outside the zone, inside the blast
     (65497, 60, 65510, 9, 0),     # the TNT that gets burned
 ]

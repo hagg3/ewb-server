@@ -93,6 +93,7 @@
 #include "zone_guard.h"     // restore wire, revert queue, audit folding   (stage 8.2)
 #include "auth.h"           // eden_auth.txt: per-name PINs, /login        (stage 8.6)
 #include "topmap.h"         // topmap: bounded top-down height map          (stage 8.5)
+#include "burn_guard.h"     // --tnt / --fire switches, refused-burn preview (stage 10.4)
 #include "base_profile.h"   // the terrain the client draws for itself
 
 typedef int SOCKET;
@@ -206,6 +207,12 @@ double      g_weCellBurst  = ewb::WE_CELL_BURST;         // cells they may spend
 // g_worldMtx for the whole chain, so it is the one thing one packet can make every
 // other player wait for. See explode.h for how the budget is spent.
 size_t      g_burnMaxCells = ewb::EXPLODE_DEFAULT_MAX_VISITS;
+int         g_tntRadius    = ewb::EXPLODE_RADIUS;   // --tnt-radius (stage 10.1)
+// TNT and burning switches (stage 10.4): --tnt / --fire at start, the `tnt` / `fire`
+// control verbs at runtime (not saved). Off refuses the edit: not applied, not
+// relayed, and put back on the sender's screen. Read once per ACTION.
+std::atomic<bool> g_tntOn{true};
+std::atomic<bool> g_fireOn{true};
 
 // --- Protected zones (stage 8.2) ---------------------------------------------
 std::string g_zonesFile  = "";                    // eden_zones.txt; empty -> derived from the world dir (--zones-file)
@@ -576,9 +583,10 @@ static bool worldGet(int x,int y,int z, Cell& out){
 // reach, and every cell the blast was refused is collected into it for the restore.
 // Every client simulated the blast itself and did destroy those cells.
 struct ZoneBlast {
-    ZoneCheck near;                               // zones within EXPLODE_REACH of the root
+    ZoneCheck near;                               // zones within burn_reach() of the root
     ewb::ZoneCellSet hit{ewb::ZONE_BURN_RESTORE_MAX};   // cells to put back, deduplicated
-    std::vector<ewb::RevertCell> explosives;      // protected TNT/fireworks: clients chain these
+    std::vector<ewb::RevertCell> explosives;      // protected TNT: clients still set it off
+    std::vector<ewb::RevertCell> expanders;       // protected expansion blocks: clients still fill
     std::string zone;                             // the first zone the blast hit, for the notice
     int fx = 0, fy = 0, fz = 0;                   // ...and where
 };
@@ -593,8 +601,10 @@ struct SvExplodeWorld {
         if (zb->hit.empty()) { zb->zone = zn->name; zb->fx = x; zb->fy = y; zb->fz = z; }
         if (zb->hit.add(x, y, z)) {
             Cell c;
-            if (worldGet(x, y, z, c) && (c.type == SV_TNT || c.type == SV_FIREWORK))
-                zb->explosives.push_back({x, y, z});
+            if (worldGet(x, y, z, c)) {
+                if (c.type == SV_TNT) zb->explosives.push_back({x, y, z});
+                else if (ewb::is_expansion(c.type)) zb->expanders.push_back({x, y, z});
+            }
         }
         return true;
     }
@@ -609,9 +619,13 @@ struct SvExplodeWorld {
         if (!ewb::ws_in_world(x, y, z)) return true;
         return worldSet(x, y, z, type, color);
     }
+    // What a client draws where nothing is stored: an expansion only fills air (10.2b).
+    int baseType(int y) const { return ewb::we_base_at(y).type; }
     int airType = SV_AIR, tntType = SV_TNT, fireworkType = SV_FIREWORK;
     int bedrockType = SV_BEDROCK, steelType = SV_STEEL, paintedBaseType = SV_PAINTED_BASE;
+    int goldenType = ewb::BLK_GOLDEN_CUBE;
     int yMin = 0;
+    int radius = ewb::EXPLODE_RADIUS;   // simExplode() below sets --tnt-radius
     // Exclusive. Was 1024: a TNT at y 255 wrote y 256..260 into chunks no REGION
     // reply ever reads, counted against the cap and saved forever (7.22).
     int yMax = SV_WORLD_HEIGHT;
@@ -619,10 +633,17 @@ struct SvExplodeWorld {
 static_assert(SvExplodeWorld{}.yMax == ewb::WS_WORLD_HEIGHT,
               "the blast must clip at the height the chunk store's box sweep covers");
 
-static ewb::ExplodeResult simExplode(int cx,int cy,int cz, ZoneBlast* zb){
+static_assert(SV_TNT == ewb::BLK_TNT && SV_FIREWORK == ewb::BLK_FIREWORK && SV_STEEL == ewb::BLK_STEEL &&
+              SV_BEDROCK == ewb::BLK_BEDROCK && SV_AIR == ewb::BLK_AIR,
+              "the server's block ids must match block_rules.h's");
+
+// One burn's consequences: a blast, an expansion fill, a firework's one cell
+// (explode.h simBurn, stages 10.2a/b). Caller holds g_worldMtx.
+static ewb::ExplodeResult simBurnAt(int cx,int cy,int cz, ZoneBlast* zb){
     SvExplodeWorld w;
     w.zb = zb;
-    return ewb::simExplode(w, cx, cy, cz, g_burnMaxCells);
+    w.radius = g_tntRadius;
+    return ewb::simBurn(w, cx, cy, cz, g_burnMaxCells);
 }
 
 // Apply one terrain action to the model. mode: 0 build 1 mine 2 burn 3 paint.
@@ -640,10 +661,7 @@ static ewb::ExplodeResult simAction(int mode,int x,int y,int z,int extra, ZoneBl
         case 3: { Cell c; bool have=worldGet(x,y,z,c);            // PAINT (extra=color)
                   if(!worldSet(x,y,z, have? c.type : SV_PAINTED_BASE, extra)) ++res.refused;
                   break; }
-        case 2: { Cell c; bool have=worldGet(x,y,z,c);            // BURN
-                  if(have && (c.type==SV_TNT || c.type==SV_FIREWORK)) res = simExplode(x,y,z, zb);
-                  else if(have && c.type!=SV_AIR) worldSet(x,y,z, SV_AIR, 0);
-                  break; }
+        case 2: res = simBurnAt(x,y,z, zb); break;                // BURN
     }
     return res;
 }
@@ -2337,15 +2355,37 @@ static void sendRestore(uint64_t target, const RevertTo& to, const std::vector<e
     else if (auto o = to.out.lock()) pushWorld(o, std::move(wire));
 }
 
+// Coalescing channels for a refused burn's two restores (stage 10.4b), OR-ed into a
+// client's target. The queue folds a (target, cell) already waiting into the job
+// before it, so without them the late restore would lose every cell the early one
+// (or a zone restore) still holds. Delivery reads the payload, not the target.
+static constexpr uint64_t BURN_CHANNEL_EARLY = 1ull << 62;
+static constexpr uint64_t BURN_CHANNEL_LATE  = 1ull << 61;
+
+static void queueRestore(double due, uint64_t target, const std::shared_ptr<ClientOut>& to,
+                         const std::vector<ewb::RevertCell>& cells);
+
 // Restore `cells` on one client's screen (`to`), or on everyone's (`to` null).
 static void scheduleRestore(const std::shared_ptr<ClientOut>& to, const std::vector<ewb::RevertCell>& cells) {
     if (cells.empty()) return;
     const uint64_t target = to ? (uint64_t)to->id + 1 : ZONE_TARGET_ALL;
     if (g_zoneRevertDelayMs <= 0) { sendRestore(target, RevertTo{to}, cells); return; }
+    queueRestore(monoSeconds() + g_zoneRevertDelayMs / 1000.0, target, to, cells);
+}
+
+// Restore `cells` on `to`'s screen `delaySec` from now, on its own coalescing channel.
+static void scheduleRestoreIn(const std::shared_ptr<ClientOut>& to, const std::vector<ewb::RevertCell>& cells,
+                              double delaySec, uint64_t channel) {
+    if (cells.empty() || !to) return;
+    queueRestore(monoSeconds() + delaySec, ((uint64_t)to->id + 1) | channel, to, cells);
+}
+
+static void queueRestore(double due, uint64_t target, const std::shared_ptr<ClientOut>& to,
+                         const std::vector<ewb::RevertCell>& cells) {
     size_t dropped = 0;
     {
         std::lock_guard<std::mutex> lk(g_revertMtx);
-        g_revertQ.push(monoSeconds() + g_zoneRevertDelayMs / 1000.0, target, RevertTo{to}, cells, &dropped);
+        g_revertQ.push(due, target, RevertTo{to}, cells, &dropped);
     }
     g_revertCv.notify_one();
     if (dropped) {
@@ -2362,7 +2402,7 @@ static void scheduleRestore(const std::shared_ptr<ClientOut>& to, const std::vec
     }
 }
 
-// The one thread that sends delayed restores (started only when the delay is > 0).
+// The one thread that sends delayed restores.
 static void revertThread() {
     std::unique_lock<std::mutex> lk(g_revertMtx);
     while (serverRunning) {
@@ -2415,6 +2455,54 @@ static void zoneRefused(SOCKET s, ewb::TokenBucket& notice, const std::string& p
     if (notice.allow(monoSeconds()))
         sendLine(s, "[Server] This area is protected ('" + zone + "').\n");
     zoneAudit(player, zone, verb, x, y, z);
+}
+
+// --- TNT / fire switches: the refusals (stage 10.4) --------------------------
+//
+// Both refusals follow the zone shape: not applied, not relayed (no peer ever sees
+// it), the sender's screen put back from the model, a private notice paced by the
+// connection's own bucket. What differs is timing, because of what the client has
+// already done by the time it asks (burn_guard.h has the reasoning).
+
+static const char* switchName(ewb::BurnVerdict v) { return v == ewb::BurnVerdict::RefuseTnt ? "tnt" : "fire"; }
+
+// 10.4a: a TNT build with TNT off. The client has drawn an unlit block, so it is
+// taken back out at once — it blinks out as it is placed.
+static void tntBuildRefused(SOCKET s, ewb::TokenBucket& notice, const std::string& player,
+                            int x, int y, int z, int type) {
+    if (g_verbose)
+        std::cout << "[" << player << "] BUILD at (" << x << "," << y << "," << z << ") type=" << type
+                  << " refused: --tnt off" << std::endl;
+    sendWorldTo(s, buildRestore({{x, y, z}}));
+    if (notice.allow(monoSeconds()))
+        sendLine(s, std::string("[Server] ") + ewb::burn_refusal_notice(ewb::BurnVerdict::RefuseTnt) + "\n");
+}
+
+// 10.4b: a burn the switches refuse. The client has already lit the block. Mining it
+// now puts a fire out before it spreads and sets a fuse off at once (the game fires a
+// burning cell the moment it is emptied); the early restore then redraws what that
+// did, and the late one, once everything the burn could have started is over, covers
+// a client that kept burning anyway. A block that is not flammable did nothing on the
+// sender's screen, so it only gets the notice.
+static void burnRefused(SOCKET s, const std::shared_ptr<ClientOut>& out, ewb::TokenBucket& notice,
+                        const std::string& player, ewb::BurnVerdict v, int x, int y, int z,
+                        const ewb::BurnPreview& pv) {
+    if (g_verbose)
+        std::cout << "[" << player << "] BURN at (" << x << "," << y << "," << z << ") refused: --"
+                  << switchName(v) << " off (" << pv.cells.size() << " cell(s) to restore)" << std::endl;
+    if (pv.flammable) {
+        std::string mine;
+        ewb::zone_restore_wire(mine, x, y, z, true, SV_AIR, 0);   // a lone mine
+        pushWorld(out, std::move(mine));
+        const std::vector<ewb::RevertCell> root{{x, y, z}};
+        scheduleRestoreIn(out, pv.explosive ? pv.cells.cells() : root, ewb::BURN_RESTORE_EARLY_SEC,
+                          BURN_CHANNEL_EARLY);
+        scheduleRestoreIn(out, pv.cells.cells(), ewb::burn_restore_late_sec(pv.fireDepth, pv.chainDepth),
+                          BURN_CHANNEL_LATE);
+    }
+    if (notice.allow(monoSeconds()))
+        sendLine(s, std::string("[Server] ") + ewb::burn_refusal_notice(v) +
+                        (pv.truncated ? " Some of it may look damaged until you rejoin." : "") + "\n");
 }
 
 // Handle one complete control line. `reply` is sent back (a trailing '\n' is
@@ -2935,6 +3023,20 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
             return;
         }
         reply = "usage: " + std::string(spec->usage);
+        return;
+    }
+
+    // TNT / fire switches (stage 10.4). A runtime change lasts until the server stops;
+    // the --tnt / --fire flag is what it starts with.
+    if (verb == "tnt" || verb == "fire") {
+        std::atomic<bool>& sw = (verb == "tnt") ? g_tntOn : g_fireOn;
+        if (rest.empty()) { reply = verb + ": " + (sw.load() ? "on" : "off"); return; }
+        bool on = true;
+        if (!ewb::parse_on_off(rest, on)) { reply = std::string("usage: ") + spec->usage; return; }
+        sw = on;
+        auditLog("control", verb + " " + rest);
+        std::cout << "[Server] " << verb << " " << rest << " (control socket; until restart)." << std::endl;
+        reply = "ok: " + verb + " " + rest;
         return;
     }
 
@@ -4178,6 +4280,9 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
     ewb::TokenBucket burnTruncNotice(1.0, 1.0 / 30.0);  // "that chain was too big" (stage 7.19)
     ewb::TokenBucket burnTruncLog(1.0, 1.0 / 30.0);     // ...and the operator's copy of it
     ewb::TokenBucket zoneNotice(1.0, 1.0 / 10.0);   // "this area is protected", <= 1 per 10 s (stage 8.2)
+    ewb::TokenBucket switchNotice(1.0, 1.0 / 10.0); // "TNT/burning is disabled", <= 1 per 10 s (stage 10.4)
+    // The last expansion block this player lit, and until when its MINE echo is expected.
+    struct { int x = 0, y = 0, z = 0; double until = 0; } expandEcho;
     ewb::TokenBucket zoneTruncNotice(1.0, 1.0 / 30.0);  // "too much of that blast to put back"
     // "Invalid POS/VEL/POSVEL/ACTION message" were unconditional and per-malformed-
     // packet, so a garbage-packet flood was an unthrottled journal flood too
@@ -4465,6 +4570,46 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                             std::cout << "[" << username << "] Unknown action mode: " << mode << std::endl;
                             continue;
                     }
+                    // TNT / fire switches (stage 10.4). After the edit budget, like a
+                    // zone refusal, and before it: a switch refuses the edit wherever it is.
+                    if (mode == 0 && !g_tntOn.load() && ewb::is_tnt_build(extra)) {
+                        tntBuildRefused(clientSocket, switchNotice, username, x, y, z, extra);
+                        continue;
+                    }
+                    if (mode == 2 && (!g_tntOn.load() || !g_fireOn.load())) {
+                        const ewb::BurnPreview pv = [&] {
+                            std::lock_guard<std::mutex> lk(g_worldMtx);
+                            SvExplodeWorld w;
+                            w.radius = g_tntRadius;
+                            return ewb::preview_burn(w, x, y, z, g_burnMaxCells);
+                        }();
+                        const ewb::BurnVerdict v = ewb::burn_verdict(g_tntOn.load(), g_fireOn.load(), pv.touchesTnt);
+                        if (v != ewb::BurnVerdict::Allow) {
+                            // The dry run held the lock like a real chain; charge it like one.
+                            if (SV_ACTION_RATE > 0.0 && pv.explosions > (size_t)SV_ACTION_COST_BURN)
+                                actionBucket.charge(monoSeconds(), (double)pv.explosions - SV_ACTION_COST_BURN);
+                            burnRefused(clientSocket, myOut, switchNotice, username, v, x, y, z, pv);
+                            continue;
+                        }
+                    }
+                    // A lit expansion block's client follows its BURN with a MINE on the
+                    // same cell (TNT does: LIVE-FINDINGS session 1). The server has already
+                    // applied the whole fill, which ends with the centre as the material,
+                    // so that MINE would leave a hole no screen shows. It is the client's
+                    // own bookkeeping, not an edit: not applied, not relayed. Provisional
+                    // until the retail capture (ROADMAP-SERVER 10.0 C4) shows the lines.
+                    if (mode == 1 && expandEcho.until > 0 && x == expandEcho.x && y == expandEcho.y &&
+                        z == expandEcho.z) {
+                        const bool fresh = monoSeconds() < expandEcho.until;
+                        expandEcho.until = 0;
+                        if (fresh) {
+                            if (g_verbose)
+                                std::cout << "[" << username << "] MINE at (" << x << "," << y << "," << z
+                                          << ") taken as the lit expansion block's own echo; not applied"
+                                          << std::endl;
+                            continue;
+                        }
+                    }
                     // Protected zones (stage 8.2). Here — after the edit budget, so a
                     // refused edit still spends its tokens and hammering a protected
                     // wall is paced like any other editing; before simAction, so the
@@ -4475,20 +4620,22 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                         static const char* const kVerb[] = {"build", "mine", "burn", "paint"};
                         ewb::ZoneCellSet back;
                         back.add(x, y, z);
-                        // A burn on a protected TNT or firework: the sender's client set it
-                        // off — and its sphere with it — before asking. Put that sphere back
-                        // too. (Links it chained from there are not modelled; see
-                        // docs/protocol.md "Protected zones".)
+                        // A burn on a protected TNT or expansion block: the sender's client
+                        // set it off — its sphere or its fill with it — before asking. Put
+                        // that back too. (Links it chained from there are not modelled; see
+                        // docs/protocol.md "Protected zones".) A firework only takes its own
+                        // cell (10.2a), which is already in.
                         if (mode == 2) {
-                            Cell c;
-                            bool explosive;
+                            Cell c{0, 0};
                             { std::lock_guard<std::mutex> lk(g_worldMtx);
-                              explosive = worldGet(x, y, z, c) && (c.type == SV_TNT || c.type == SV_FIREWORK); }
-                            if (explosive)
-                                ewb::explode_for_each_blast_cell(x, y, z, 0, SV_WORLD_HEIGHT,
-                                    [&](int bx, int by, int bz) {
-                                        if (ewb::ws_in_world(bx, by, bz)) back.add(bx, by, bz);
-                                    });
+                              if (!worldGet(x, y, z, c)) c.type = SV_AIR; }
+                            auto add = [&](int bx, int by, int bz) {
+                                if (ewb::ws_in_world(bx, by, bz)) back.add(bx, by, bz);
+                            };
+                            if (c.type == SV_TNT)
+                                ewb::explode_for_each_blast_cell(x, y, z, 0, SV_WORLD_HEIGHT, add, g_tntRadius);
+                            else if (ewb::is_expansion(c.type))
+                                ewb::expand_for_each_box_cell(x, y, z, 0, SV_WORLD_HEIGHT, add);
                         }
                         scheduleRestore(myOut, back.cells());
                         zoneRefused(clientSocket, zoneNotice, username, zn->name, kVerb[mode], x, y, z);
@@ -4498,9 +4645,11 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     // told which zones are within its reach, and collects what it hit.
                     ZoneBlast blast;
                     if (mode == 2)
-                        blast.near = zoneCheckNear(zc, x - ewb::EXPLODE_REACH, y - ewb::EXPLODE_REACH,
-                                                   z - ewb::EXPLODE_REACH, x + ewb::EXPLODE_REACH,
-                                                   y + ewb::EXPLODE_REACH, z + ewb::EXPLODE_REACH);
+                    {
+                        const int reach = ewb::burn_reach(g_tntRadius);
+                        blast.near = zoneCheckNear(zc, x - reach, y - reach, z - reach,
+                                                   x + reach, y + reach, z + reach);
+                    }
 
                     // Simulate the action into the authoritative world model so the
                     // server always has an accurate picture (handles TNT/paint
@@ -4513,9 +4662,16 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     // can't know how much of the world one BURN would touch, and
                     // without this a player may hold g_worldMtx for a budgeted chain
                     // eight times a second, indefinitely.
-                    if (SV_ACTION_RATE > 0.0 && act.explosions > (size_t)SV_ACTION_COST_BURN)
+                    // An expansion fill reads about half what a blast does; it is charged
+                    // as one all the same (stage 10.2b).
+                    const size_t links = act.explosions + act.expansions;
+                    if (SV_ACTION_RATE > 0.0 && links > (size_t)SV_ACTION_COST_BURN)
                         actionBucket.charge(monoSeconds(),
-                                            (double)act.explosions - SV_ACTION_COST_BURN);
+                                            (double)links - SV_ACTION_COST_BURN);
+                    // A burn whose root was an expansion block (it fired; no blast ran):
+                    // arm the MINE echo check above for this cell.
+                    if (mode == 2 && act.expansions && !act.explosions)
+                        expandEcho = {x, y, z, monoSeconds() + ewb::EXPAND_MINE_ECHO_SEC};
                     // A mine or a blast that took a sign's block took the sign. The client
                     // sends nothing for the sign itself (LIVE-FINDINGS 2026-09-11).
                     drainSignRemovals();
@@ -4549,11 +4705,13 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     // back, queued behind the relay. A protected TNT did not go off here
                     // but will on every client, so its sphere is restored as well.
                     if (!blast.hit.empty()) {
+                        auto addHit = [&](int bx, int by, int bz) {
+                            if (ewb::ws_in_world(bx, by, bz)) blast.hit.add(bx, by, bz);
+                        };
                         for (const ewb::RevertCell& t : blast.explosives)
-                            ewb::explode_for_each_blast_cell(t.x, t.y, t.z, 0, SV_WORLD_HEIGHT,
-                                [&](int bx, int by, int bz) {
-                                    if (ewb::ws_in_world(bx, by, bz)) blast.hit.add(bx, by, bz);
-                                });
+                            ewb::explode_for_each_blast_cell(t.x, t.y, t.z, 0, SV_WORLD_HEIGHT, addHit, g_tntRadius);
+                        for (const ewb::RevertCell& t : blast.expanders)
+                            ewb::expand_for_each_box_cell(t.x, t.y, t.z, 0, SV_WORLD_HEIGHT, addHit);
                         scheduleRestore(nullptr, blast.hit.cells());
                         zoneRefused(clientSocket, zoneNotice, username, blast.zone, "blast",
                                     blast.fx, blast.fy, blast.fz);
@@ -4951,6 +5109,8 @@ int main(int argc, char* argv[]) {
     //   --region-radius N  --no-region-sort  --no-region-empty-frame
     //   --action-rate N  --action-burst N   (0 = unlimited)
     //   --burn-max-cells N  (cells one TNT chain may read before it is truncated)
+    //   --tnt-radius N  (blast radius in cells; default 5, the game's)
+    //   --tnt on|off  --fire on|off  (default on; off refuses TNT / every burn)
     //   --move-rate N  --move-burst N   --chat-rate N  --chat-burst N   (0 = unlimited)
     //   --legacy-snapshot  --connect-limit N  --tcp-nodelay 0|1  (1 = default, disables Nagle)
     //   --auth-fail-limit N  --handshake-timeout N  --idle-timeout-conn N  (0 = off)
@@ -5036,6 +5196,16 @@ int main(int argc, char* argv[]) {
         // --we-rate 0 disables the cell budget but the per-command cap stands.
         else if (a == "--no-worldedit")      g_weEnabled      = false;
         else if (a == "--we-max-cells")      g_weMaxCells     = std::atoll(next("131072").c_str());
+        else if (a == "--tnt-radius")        g_tntRadius      = std::atoi(next("5").c_str());
+        // A typo here must not leave TNT or fire on, so a bad value stops the start.
+        else if (a == "--tnt" || a == "--fire") {
+            bool on = true;
+            if (!ewb::parse_on_off(next(""), on)) {
+                std::cerr << "[Server] " << a << " must be 'on' or 'off'" << std::endl;
+                return 1;
+            }
+            (a == "--tnt" ? g_tntOn : g_fireOn) = on;
+        }
         else if (a == "--burn-max-cells")    g_burnMaxCells   = (size_t)std::atoll(next("1048576").c_str());
         // Protected zones (stage 8.2).
         else if (a == "--zones-file")        g_zonesFile      = next("");
@@ -5413,10 +5583,21 @@ int main(int argc, char* argv[]) {
         std::cout << "[Server] --idle-timeout-conn 0: post-JOIN idle read timeout disabled." << std::endl;
     if (!g_regionEmptyFrame)
         std::cout << "[Server] --no-region-empty-frame: unbuilt regions answered with silence." << std::endl;
-    if (g_burnMaxCells < ewb::EXPLODE_VISITS_PER_BLAST) {
+    if (g_tntRadius < ewb::EXPLODE_RADIUS_MIN || g_tntRadius > ewb::EXPLODE_RADIUS_MAX) {
+        std::cerr << "[Server] --tnt-radius must be " << ewb::EXPLODE_RADIUS_MIN << ".."
+                  << ewb::EXPLODE_RADIUS_MAX << "; using " << ewb::EXPLODE_RADIUS << "." << std::endl;
+        g_tntRadius = ewb::EXPLODE_RADIUS;
+    }
+    if (g_tntRadius != ewb::EXPLODE_RADIUS)
+        std::cout << "[Server] --tnt-radius " << g_tntRadius << " (game default "
+                  << ewb::EXPLODE_RADIUS << ")." << std::endl;
+    if (!g_tntOn) std::cout << "[Server] --tnt off: TNT placement and every burn that would set off TNT are refused." << std::endl;
+    if (!g_fireOn) std::cout << "[Server] --fire off: every burn is refused." << std::endl;
+    const size_t blastVisits = ewb::explode_visits_per_blast(g_tntRadius);
+    if (g_burnMaxCells < blastVisits) {
         std::cerr << "[Server] --burn-max-cells " << g_burnMaxCells << " is below one blast ("
-                  << ewb::EXPLODE_VISITS_PER_BLAST << " cells); using that." << std::endl;
-        g_burnMaxCells = ewb::EXPLODE_VISITS_PER_BLAST;
+                  << blastVisits << " cells); using that." << std::endl;
+        g_burnMaxCells = blastVisits;
     }
     if (SV_ACTION_RATE <= 0.0)
         std::cout << "[Server] --action-rate 0: per-connection ACTION rate limit disabled." << std::endl;
@@ -5425,7 +5606,7 @@ int main(int argc, char* argv[]) {
                   << SV_ACTION_BURST << " burst (BURN costs " << SV_ACTION_COST_BURN
                   << " upfront, then 1 per blast past that)." << std::endl;
     std::cout << "[Server] BURN chain budget: " << g_burnMaxCells << " cells read (~"
-              << g_burnMaxCells / ewb::EXPLODE_VISITS_PER_BLAST << " blasts) per ACTION." << std::endl;
+              << g_burnMaxCells / blastVisits << " blasts) per ACTION." << std::endl;
     if (SV_MOVE_RATE <= 0.0)
         std::cout << "[Server] --move-rate 0: per-connection movement rate limit disabled." << std::endl;
     else
@@ -5464,14 +5645,15 @@ int main(int argc, char* argv[]) {
     else
         std::cout << "[Server] Audit log: stdout and " << g_auditFile << "." << std::endl;
 
-    // Protected zones (stage 8.2). The restore thread only exists when there is a delay
-    // to wait out; with 0 a refusal's restore is sent by the thread that refused it.
+    // Protected zones (stage 8.2). With --zone-revert-delay-ms 0 a zone refusal's
+    // restore is sent by the thread that refused it; the restore thread still runs,
+    // because a refused burn (stage 10.4, switchable at runtime) always waits.
     {
         const size_t nz = zonesSnapshot()->size();
         if (nz)
             std::cout << "[Server] Protected zones: " << nz << ". Refused edits are put back after "
                       << g_zoneRevertDelayMs << " ms (--zone-revert-delay-ms)." << std::endl;
-        if (g_zoneRevertDelayMs > 0) std::thread(revertThread).detach();
+        std::thread(revertThread).detach();
     }
 
     // Tier 1 operator control socket (stage 3.2).

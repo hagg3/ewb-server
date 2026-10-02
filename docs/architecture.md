@@ -38,8 +38,13 @@ worldedit.h          Player command table with a permission level per row, chat-
 base_profile.h       The base terrain profile: what a client draws in a cell the server
                      has never stored. Shared by the WorldEdit path, the zone restore and
                      eden_import / eden_export; tested by worldedit_test and eden_import_test.
-explode.h            The TNT / paint explosion chain: worklist, depth guard, cell-visit
-                     budget, the protectedAt hook zones use, EXPLODE_REACH.
+explode.h            What a burn does: the TNT / paint explosion chain (worklist, depth
+                     guard, cell-visit budget), fireworks, the expansion-block fill and its
+                     chain, the protectedAt hook zones use, explode_reach / burn_reach.
+block_rules.h        The game's block vocabulary burning depends on: flammable ids, the
+                     expansion blocks and what each fills with, ramp / side face solidity.
+burn_guard.h         The --tnt / --fire switches: the verdict, the dry-run preview a refused
+                     burn is restored from (fire spread included), and the restore timing.
 zones.h              Protected zones: the eden_zones.txt grammar, load / normalise / caps,
                      and the two lookups — blocking(cell) and intersects(box).
 zone_guard.h         What happens after a zone says no: the restore wire, a capped
@@ -98,6 +103,10 @@ auth_test.cpp          SHA-256 / HMAC / PBKDF2 against published vectors, PIN un
                        eden_auth.txt all-or-nothing load, effective level and zone bypass.
 topmap_test.cpp        topmap parsing and the sample cap, the surface rule, the chunk-column
                        walk, and the whole verb against a brute-force surface scan.
+burn_test.cpp          The game's block tables, fireworks and the golden cube in a blast, the
+                       expansion fill (box, bounds, side-variant ramp ring, chain, zones,
+                       reach, budget), and the TNT/fire switches' verdict, dry-run preview
+                       and restore timing.
 control_test.cpp       Control line grammar, command table, ban/ops files, fill bounds,
                        the derived fill cap, the flood guard's state machine.
 worldedit_test.cpp     Player command table + permission floors, grammar, explicit //pos
@@ -119,8 +128,8 @@ eden_import_test.cpp   The base terrain profile, the diff/solid/full emitter, th
 
 Supporting files: `build_server.sh` (build + run all suites), `host_world.sh`
 (convenience launcher), `edenctl` (client for the operator control socket), `run_server.bat`
-(Windows/MSVC launcher), the `phase3_live_test.py`, `phase7_live_test.py` and
-`phase8_live_test.py` scripts (run by hand, not by the build — they bind a port and spawn
+(Windows/MSVC launcher), the `phase3_live_test.py`, `phase7_live_test.py`,
+`phase8_live_test.py` and `phase10_live_test.py` scripts (run by hand, not by the build — they bind a port and spawn
 processes), `worlds/<name>/` (sample
 worlds), `testdata/` (committed golden files for the offline suites).
 
@@ -164,6 +173,14 @@ unchained; WorldEdit across a zone edge changes only the outside cells; the cont
 bypasses zones; a hundred mines on one protected cell under a revert delay produce one restore
 and one audit line; refused edits spend the `ACTION` budget; and a malformed `eden_zones.txt`
 stops the server. Run it after touching any edit path.
+
+`phase10_live_test.py` covers what a burn does and the TNT / fire switches: a burnt firework
+takes one cell, a golden cube survives a blast, an expansion block fills its box and its
+client's follow-up mine is not applied; with `--tnt off` a TNT build is taken back out at once
+and never relayed or stored, and a burn on TNT (or on wood touching it) gets an immediate mine,
+an early restore and a late one, with peers seeing nothing; with `--fire off` every burn is
+refused; the `tnt` / `fire` verbs flip them at runtime; and a bad value stops the server. Run it
+after touching the burn path.
 
 `server.cpp` is the original Winsock server this was ported from — reference only, a strict
 subset with no world model, persistence or validation. `server_posix_modded.cpp` is a
@@ -393,13 +410,16 @@ just recording a delta:
 
 - **build** writes the given type; **mine** writes air; **paint** recolours, promoting an
   untouched natural cell to the painted-base sentinel.
-- **burn** on TNT or a firework runs `simExplode()`, a spherical blast that mirrors the game's
-  `Terrain::explode`: a coloured centre paints the sphere, an uncoloured one destroys it,
-  bedrock and steel survive, and TNT caught in the blast chains (bounded by a recursion depth
-  guard and by `--burn-max-cells`, a budget of cells the whole chain may read — the world lock
-  is held for all of it). One `ACTION` can therefore write hundreds of cells, which is why burn
-  is charged a much higher rate-limit cost than an ordinary edit, plus the blasts its chain
-  actually ran once they are known.
+- **burn** runs `simBurn()` (`explode.h`). On TNT that is a spherical blast that mirrors the
+  game's `Terrain::explode`: a coloured centre paints the sphere, an uncoloured one destroys it,
+  bedrock, steel and the golden cube survive, and TNT caught in the blast chains (bounded by a
+  recursion depth guard and by `--burn-max-cells`, a budget of cells the whole chain may read —
+  the world lock is held for all of it). On an expansion block it is the game's
+  `blocktntexplode` fill, which lights the expansion blocks around it; one caught in a blast is
+  lit rather than destroyed, and fills once the chain is done. A firework, or any other block,
+  loses only its own cell. One `ACTION` can therefore write hundreds of cells, which is why burn
+  is charged a much higher rate-limit cost than an ordinary edit, plus the blasts and fills its
+  chain actually ran once they are known. Fire spread is not modelled yet.
 
 Modelling the rules rather than the deltas is what lets a late joiner be handed a correct
 snapshot regardless of the order edits arrived in.
@@ -421,7 +441,7 @@ TNT), the player sign write, and the WorldEdit scan-and-commit path (`weCommit()
 socket's `setblock` / `fill` / `signs` have their own write path and never ask. The zone set is
 immutable once loaded and published behind a `shared_ptr`, so a check copies the pointer under
 `g_zonesMtx` before `g_worldMtx` is taken and never holds the zone lock into an edit. A burn and a
-WorldEdit box first narrow the set to the zones that meet their box (`EXPLODE_REACH` around a
+WorldEdit box first narrow the set to the zones that meet their box (`burn_reach()` around a
 burn's root), which is usually none, so a world with zones pays nothing per cell away from them.
 
 A refused `ACTION` or burn is followed by a **restore** — the refused cells redrawn from the
@@ -431,6 +451,13 @@ world as it is then, so an operator edit that lands in the meantime is not paint
 coalesced per client per cell) drained by the zone restore thread; with 0 the refusing thread
 sends it at once. Either way it goes on the client's world-state stream, behind anything already
 queued there — for a burn, behind the relay that makes each peer run the blast.
+
+**The TNT / fire switches sit at the same spot**, just before the zone check, and refuse the same
+way: not simulated, not relayed, the sender's screen put back. A refused burn is first run dry
+(`burn_guard.h`'s `preview_burn()`, against an overlay that keeps every write to itself, under the
+world lock and inside `--burn-max-cells`) to find what the sender's client will change. Its two
+restores go through the same `RevertQueue` on per-client channels of their own, so neither folds
+into the other or into a zone restore; the restore thread therefore always runs.
 
 ## Persistence
 
