@@ -183,8 +183,7 @@ inline bool verb_allowed_before_join(const std::string& command) {
 /// Highest block id the server will accept in an `ACTION:...:0:<type>`.
 ///
 /// 0–111 are the community-named blocks (`BLOCK_MAP`, plan §0.5.1); 112–127 are the
-/// ids the 2026-08 game update added (VuencEdit `CLAUDE.md` "New block types
-/// 112–127"). 128+ has never been seen from any client, and 255 in particular is
+/// ids the 2026-08 game update added (observed from the updated client). 128+ has never been seen from any client, and 255 in particular is
 /// the server model's own painted-base sentinel — letting one in would make a
 /// player-placed block indistinguishable from a painted natural cell.
 constexpr int MAX_BLOCK_TYPE = 127;

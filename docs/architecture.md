@@ -127,8 +127,7 @@ eden_import_test.cpp   The base terrain profile, the diff/solid/full emitter, th
 ```
 
 Supporting files: `build_server.sh` (build + run all suites), `host_world.sh`
-(convenience launcher), `edenctl` (client for the operator control socket), `run_server.bat`
-(Windows/MSVC launcher), the `phase3_live_test.py`, `phase7_live_test.py`,
+(convenience launcher), `edenctl` (client for the operator control socket), the `phase3_live_test.py`, `phase7_live_test.py`,
 `phase8_live_test.py` and `phase10_live_test.py` scripts (run by hand, not by the build — they bind a port and spawn
 processes), `worlds/<name>/` (sample
 worlds), `testdata/` (committed golden files for the offline suites).
@@ -182,10 +181,8 @@ an early restore and a late one, with peers seeing nothing; with `--fire off` ev
 refused; the `tnt` / `fire` verbs flip them at runtime; and a bad value stops the server. Run it
 after touching the burn path.
 
-`server.cpp` is the original Winsock server this was ported from — reference only, a strict
-subset with no world model, persistence or validation. `server_posix_modded.cpp` is a
-community in-chat-command patch, not built by default; its command surface is unauthenticated.
-Do not develop against either.
+The server began as a port of a small Winsock server and has since diverged completely; that
+original and a community in-chat-command patch are no longer in the tree.
 
 ### The header + offline test convention
 
@@ -542,4 +539,3 @@ supervisor configured to restart unconditionally — it would become a start/idl
 
 - Wire messages, join order, coordinates: [protocol.md](protocol.md)
 - Flags, environment, file formats: [configuration.md](configuration.md)
-- Status and planned work: the roadmap in `WORKING/` (untracked, local only).

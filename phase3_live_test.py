@@ -149,7 +149,7 @@ def ctl_cmd(path, line, wait=0.6):
 class Server:
     """A running ./edenserver with its stdout drained into a list.
 
-    Draining matters here and not in phase1_live_test.py: this test asserts on
+    Draining matters here and not in the simpler probes: this test asserts on
     the audit channel, and an undrained pipe would deadlock the server as soon
     as it filled."""
     def __init__(self, world_dir, *extra):

@@ -11,7 +11,7 @@ server, admin access is possession of the SSH key — the same as today. The HTT
 server binds loopback only, is up only while `edenadmin` runs, and is guarded by
 a per-run token plus an `Origin`/`Host` allowlist.
 
-> **Status:** stage 6.7, in progress (see `WORKING/ROADMAP-SERVER.md`). Shipped:
+> **Status:** stage 6.7, in progress. Shipped:
 > the HTTP shell, the loopback guard, profile storage, the **Connection** panel,
 > the reply parsers + golden corpus, the plain-process supervisor, the read-only
 > **Status / Players / Logs** panels, the **write actions** — Power

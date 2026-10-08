@@ -1,6 +1,7 @@
 # ewb-server documentation
 
-**Audience:** everyone — start here, then follow the pointer for your job.
+**Audience:** everyone — start here, then follow the pointer for your job. For an overview of the
+project, see the [top-level README](../README.md).
 
 This directory is the shipped reference for `ewb-server`, a standalone C++ multiplayer server
 for **Eden** (Eden World Builder). It speaks the game's native wire protocol, so an unmodified
@@ -39,7 +40,7 @@ retail client can connect to a world you host yourself.
 An operations guide (`operations.md`: service supervision, firewall, backups) is not written
 yet; see [quickstart.md § What this does not cover](quickstart.md#what-this-does-not-cover).
 
-## Keep these files updated
+## For contributors: keeping these files updated
 
 **`docs/` is the live source of truth for how this server works, and it is updated in the same
 commit as the code change that makes it true.** Not a follow-up commit, not a TODO. This is the
@@ -77,7 +78,7 @@ Practically, when you touch a source file, move the doc in the same row:
 | `admin/` — the optional `edenadmin` operator GUI (separate Go module) | `admin/README.md` (not part of `docs/`); mention it in [quickstart.md](quickstart.md) / [architecture.md](architecture.md) only where it touches the build |
 | `phase3_live_test.py`, `phase7_live_test.py`, `phase8_live_test.py`, `phase10_live_test.py` — the by-hand live socket tests | [architecture.md](architecture.md) (what each one covers) |
 | `server_posix.cpp` — anything written to the audit channel (`auditLog()`) | [configuration.md](configuration.md) § The audit channel |
-| `host_world.sh`, `run_server.bat` — launcher arguments | [configuration.md](configuration.md), [quickstart.md](quickstart.md) |
+| `host_world.sh` — launcher arguments | [configuration.md](configuration.md), [quickstart.md](quickstart.md) |
 | `ops/edenserver.service`, `ops/edenserver@.service`, `ops/edenserver.conf.example`, `ops/edenserver-writeconf` — the systemd `EnvironmentFile` layer (`EDEN_*` keys, `${VAR}` vs `$VAR`) | [configuration.md](configuration.md) § The systemd EnvironmentFile; `ops/INSTALL.md` (template unit in § Multi-world hosting) |
 | `ops/edenserverctl` verbs, `ops/edenserver-backup.{service,timer}` | [configuration.md](configuration.md) § Ops wrapper; `ops/INSTALL.md` |
 | `eden_file.h` — `.eden` world-format parsing (header, chunks, spans, signs, ZIP wrapper) | [import.md](import.md) § What it reads; [architecture.md](architecture.md) (file map) |

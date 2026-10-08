@@ -44,6 +44,7 @@ server. Unknown flags are ignored.
 | `--signs FILE` | `eden_signs.txt` | Sign sidecar. Read at startup, when signs on blocks the world stores as air are dropped (see [`eden_signs.txt`](#eden_signstxt)); the control socket's `signs add`/`rm`/`reload` also edit it. Absent is normal and silent. |
 | `--spawn-file FILE` | `eden_spawn.txt` beside `--world` | World default-spawn sidecar (one line `x:y:z`), as written by [`eden_import`](import.md). Read once at startup. Absent is normal and silent; a malformed line warns and is ignored. |
 | `--spawn x:y:z` | *(none)* | Set the world default spawn inline; overrides `--spawn-file` and skips reading it. |
+| `--rejoin spawn\|last\|x:y:z` | `spawn` | Where a **returning** player (one with an `eden_players.txt` row) lands on join. `spawn`: the world default spawn, like a new player (with no spawn configured, the client's own default). `last`: their saved position. `x:y:z`: a fixed point. New players always get the world spawn. Players can use `/last` to jump to where their previous session ended (kept in memory; lost on restart). |
 | `--zones-file FILE` | `eden_zones.txt` beside `--world` | Protected zones (see [`eden_zones.txt`](#eden_zonestxt) and [Protected zones](#protected-zones)). Read at startup; also read and written at runtime by the `zone:*` control verbs. Absent is normal and silent. **A file that does not parse stops the server** at startup (exit 2, naming the file, line and reason) or is refused by `zone reload` at runtime: the loader takes all of it or none. |
 | `--auth-file FILE` | `eden_auth.txt` beside `--world` | Login PINs (see [`eden_auth.txt`](#eden_authtxt) and [commands.md § Player identity](commands.md#player-identity-pins-and-login)). Read at startup; written by the `passwd` / `unpasswd` control verbs, always mode `0600`. Absent is normal: no name has a PIN. **A file that does not parse stops the server** (exit 2, naming the file, line and reason) — carrying on without it would hand every PIN-protected name's level back to whoever claims the name. |
 | `--players-file FILE` | `eden_players.txt` beside `--world` | Player-position store. Defaults to the same directory as `--world`, not the process cwd, so two differently-named worlds hosted from one directory no longer share (and silently teleport players between) one file. If a legacy `./eden_players.txt` already exists and the derived path is a different file, it is read instead, so nobody's saved position vanishes on upgrade. |
@@ -523,12 +524,6 @@ It needs one of `nc` (with `-U`), `socat`, or `python3` on the host.
 | Variable | Default |
 |---|---|
 | `EDENSERVER_CONTROL_SOCKET` | *(unset — falls through to the paths above)* |
-
-## `run_server.bat`
-
-Windows launcher for the **MSVC build of the original Winsock server** (`server.cpp` →
-`TCPServer.exe`), kept as reference. It searches the usual MSVC output directories and takes no
-arguments. It does **not** launch `edenserver`, which is the POSIX build. On Windows, use WSL.
 
 ## Environment
 

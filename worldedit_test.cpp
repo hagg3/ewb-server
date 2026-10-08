@@ -40,7 +40,7 @@ static void test_table() {
 
     // Every row in the vocabulary the plan (§0.5.6) told us to adopt verbatim.
     for (const char* v : {"/help", "/msg", "/r", "/tp", "/searchblocks", "/searchcolors",
-                          "/id", "/resync", "//pos1", "//pos2", "//set", "//walls",
+                          "/id", "/resync", "/spawn", "/home", "//pos1", "//pos2", "//set", "//walls",
                           "//replace", "//replacenear", "//paint", "//unpaint", "//strip",
                           "//undo", "//redo", "//copy", "//paste", "//rotate", "//up",
                           "//sphere", "//cyl", "//hsphere", "//hcyl"})
@@ -88,6 +88,47 @@ static void test_permissions() {
     bool loginListed = false;
     for (const std::string& line : visitor) if (line.rfind("/login", 0) == 0) loginListed = true;
     CHECK(loginListed, "a visitor's /help lists /login");
+
+    // /help pages: one chat message each, inside the 160-byte on-screen budget
+    // (including the "[Server] " prefix the caller adds), every listed command on
+    // exactly one page, and each page says how to reach the next.
+    for (int lvl : {ewb::WE_LEVEL_VISITOR, ewb::WE_LEVEL_BUILDER, ewb::WE_LEVEL_OPERATOR}) {
+        const auto pages = ewb::we_help_pages(lvl);
+        CHECK(!pages.empty(), "help has pages");
+        std::string all;
+        for (size_t i = 0; i < pages.size(); ++i) {
+            CHECK(pages[i].size() + 9 <= 160, "help page fits one chat line");
+            CHECK(pages[i].find('\n') == std::string::npos, "help page is a single line");
+            CHECK(pages[i].rfind("Help " + std::to_string(i + 1) + "/" +
+                                 std::to_string(pages.size()) + ": ", 0) == 0, "page header");
+            const std::string tail = i + 1 < pages.size()
+                ? "/help " + std::to_string(i + 2) : "(end)";
+            CHECK(pages[i].size() >= tail.size() &&
+                  pages[i].compare(pages[i].size() - tail.size(), tail.size(), tail) == 0,
+                  "page ends with how to continue");
+            all += pages[i];
+        }
+        for (const ewb::WeSpec& sp : ewb::we_specs()) {
+            if (sp.min_level > lvl || std::string(sp.name) == "//strip") continue;
+            CHECK(all.find(ewb::we_help_compact(sp.usage)) != std::string::npos,
+                  "every runnable command is listed");
+        }
+    }
+    CHECK(ewb::we_help_pages(ewb::WE_LEVEL_OPERATOR).size() >
+          ewb::we_help_pages(ewb::WE_LEVEL_VISITOR).size(), "operator help is longer");
+    CHECK(ewb::we_help_compact("//set <block> [color]              - fill the selection")
+              == "//set <block> [color]", "compact drops the description");
+    CHECK(ewb::we_help_compact("//replace <old> <new> [color] [oldColor]")
+              == "//replace <old> <new> [color] [oldColor]", "compact keeps a bare usage");
+
+    // /help <command>: bare, single- or double-slash names; gated by level.
+    CHECK(ewb::we_help_for(ewb::WE_LEVEL_BUILDER, "set")
+              == "//set <block> [color] - fill the selection", "help set");
+    CHECK(ewb::we_help_for(ewb::WE_LEVEL_BUILDER, "//set") == ewb::we_help_for(ewb::WE_LEVEL_BUILDER, "set"),
+          "help //set");
+    CHECK(ewb::we_help_for(ewb::WE_LEVEL_VISITOR, "msg").rfind("/msg ", 0) == 0, "help msg");
+    CHECK(ewb::we_help_for(ewb::WE_LEVEL_VISITOR, "set").empty(), "help hides commands above level");
+    CHECK(ewb::we_help_for(ewb::WE_LEVEL_OPERATOR, "nope").empty(), "help unknown");
 }
 
 static void test_zone_args() {

@@ -41,12 +41,12 @@ rejects those, `EDEN_HARDEN=0 ./build_server.sh` drops them (see
 `./build_server.sh --with-admin` additionally builds `admin/edenadmin`, an optional local
 operator GUI (needs a Go toolchain). It is not required to run a server — see `admin/README.md`.
 
-Two live tests are **not** run by the build, because they bind a port and spawn server
-processes. Run them by hand — the second one especially, before you host anything publicly:
+The live tests are **not** run by the build, because they bind a port and spawn server
+processes. Run them by hand — `phase3` especially — before you host anything publicly:
 
 ```bash
-python3 phase1_live_test.py    # join order, PONG, SIGNQ, the connection limits
 python3 phase3_live_test.py    # attacks the command surfaces; takes about 2 minutes
+# also: phase7_live_test.py, phase8_live_test.py (zones, PINs), phase10_live_test.py (TNT / fire)
 ```
 
 > ⚠️ The resulting binary is native to the machine that built it. Do not copy an arm64 build
@@ -148,7 +148,7 @@ world instead of the browser:
 [Server] REGION #1 Player6835 (65536,65536) ... 1169 cells -> ... 1 frame(s) ...
 ```
 
-Your position is remembered by username, so rejoining puts you back where you left off.
+Your position is remembered by username. By default a returning player starts at the world spawn like a new one; type `/last` to jump back to where you were, or start the server with `--rejoin last` to restore it automatically.
 
 ## Troubleshooting
 
@@ -168,8 +168,7 @@ Your position is remembered by username, so rejoining puts you back where you le
 
 ## What this does not cover
 
-These are real gaps, not omissions from this page. Detailed status lives in the project's
-development notes (`WORKING/ROADMAP-SERVER.md`), which are local-only and not published.
+These are real gaps, not omissions from this page.
 
 - **Running as a system service** — systemd unit, dedicated user, firewall, backups, log
   rotation. That is **Phase 4**. Its artifacts already exist in `ops/` (`edenserver.service`,
@@ -189,7 +188,5 @@ development notes (`WORKING/ROADMAP-SERVER.md`), which are local-only and not pu
   `//sphere`, `//copy`/`//paste`, `//undo`, `/tp`, `/msg`, and permission levels — see
   [commands.md § Part 2](commands.md#part-2--player-commands). Ramp *facing* under `//rotate` is
   also not yet verified.
-  `server_posix_modded.cpp` in this repository is the community patch the vocabulary came from.
-  It is **unauthenticated and unsafe to host** — kept for its data tables, not to be run.
 - **Writing signs from the game client** — the wire protocol has no known client sign-write
   message. Signs are authored in `eden_signs.txt`, by hand or with `edenctl signs add`.

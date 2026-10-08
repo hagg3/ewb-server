@@ -1,8 +1,8 @@
 // eden_names.h — community/RE-derived name tables for Eden's blocks, paint
 // palette and character types (ROADMAP-SERVER stage 3.6, plan §0.5.1).
 //
-// Harvested verbatim from `server_posix_modded.cpp`'s `BLOCK_MAP` / `COLOR_MAP`
-// / `charNames[]`. **Neither this list nor the companion editor's is
+// Harvested verbatim from a community in-chat-command patch's `BLOCK_MAP` /
+// `COLOR_MAP` / `charNames[]`. **Neither this list nor the companion editor's is
 // authoritative** — both are community reverse-engineering. Known unresolved
 // conflicts (plan §0.5.1), none of which change a numeric id:
 //

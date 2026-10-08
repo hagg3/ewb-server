@@ -218,7 +218,6 @@ if [ "$WITH_ADMIN" -eq 1 ]; then
 fi
 
 # Not run here (they bind a port and spawn server processes) — run by hand:
-#   python3 phase1_live_test.py   —  join order / PONG / SIGNQ / limits, over real sockets
 #   python3 phase3_live_test.py   —  adversarial pass at the Tier 1 + Tier 2 command
 #                                    surfaces: oversized selections, level escalation,
 #                                    undo growth, flooding, malformed arguments

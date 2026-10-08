@@ -5,9 +5,7 @@
 // owns only the model: the `eden_zones.txt` grammar, load/normalise/validate,
 // and the two lookups enforcement will need (`ZoneSet::blocking`,
 // `ZoneSet::intersects`). No sockets, no globals, no world model — the server
-// wires this up at the four edit call sites in stage 8.2. See
-// WORKING/anti-grief-zones-plan-2026-09-17.md § "Zone model (zones.h ...)" for
-// the design this implements.
+// wires this up at the four edit call sites in stage 8.2.
 //
 // Grammar, one zone per line:
 //

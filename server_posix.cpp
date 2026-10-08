@@ -1,4 +1,4 @@
-// Eden multiplayer server — POSIX port of server.cpp (Winsock) for macOS/Linux.
+// Eden multiplayer server — POSIX port of a Winsock original, for macOS/Linux.
 // Builds a standalone executable. Same wire protocol as the original Windows server.
 //
 // Build:   clang++ -std=c++17 -O2 -pthread server_posix.cpp -o edenserver
@@ -774,6 +774,17 @@ static const size_t SV_MAX_SAVED_POS_DEFAULT = 10000;
 static size_t g_maxSavedPos = SV_MAX_SAVED_POS_DEFAULT;
 static ewb::LruTable<SavedPos> g_playerPos(SV_MAX_SAVED_POS_DEFAULT);
 static std::mutex g_posMtx;
+// Where a returning player (one with a saved row) is sent on join (--rejoin).
+//   spawn  the world default spawn, same as a new player (default)
+//   last   their saved position from the previous session
+//   fixed  an admin-chosen x:y:z
+enum class RejoinMode { Spawn, Last, Fixed };
+static RejoinMode g_rejoinMode = RejoinMode::Spawn;
+static SavedPos   g_rejoinFixed = { 0, 0, 0 };
+// The position each name held when it joined, i.e. where its previous session ended.
+// `g_playerPos` is overwritten as soon as the player moves, so `/last` needs its own
+// copy. In-memory only: it is gone after a restart.
+static ewb::LruTable<SavedPos> g_lastSession(SV_MAX_SAVED_POS_DEFAULT);
 // Empty means "derive from --world's directory" (stage 7.15); --players-file
 // overrides outright. Resolved once in main() before loadPlayerPos() runs.
 static std::string g_posFile = "";
@@ -1337,14 +1348,13 @@ static size_t pruneOrphanSigns() {
 // The matchmaker treats the open TCP connection as "online"; if we exit it drops
 // and we're removed. Reconnects on failure.
 //
-// Wire (Eden dev, WORKING/matchmakerinfo.txt; own matchmaker in edenmatch.cpp):
+// Wire (Eden dev; own matchmaker in edenmatch.cpp):
 //   -> REGISTER:<name>:<port>:<hasPassword>[:<advertiseIP>]
 //   <- REGISTERED
 //   -> PING:<n>      every ~20s, comfortably inside the ~45s TTL. `n` is the
 //                    count channel (production matchmaker source, 2026-09-12
-//                    community drop; see WORKING/latestref-analysis-2026-09-12.md
-//                    §2 — supersedes the earlier "PING is argument-less" reading
-//                    of the lossy dev paste in WORKING/matchmakerinfo.txt).
+//                    community drop — supersedes the earlier "PING is argument-less" reading
+//                    of the lossy dev paste).
 static int joinedPlayerCount() {
     std::lock_guard<std::mutex> lock(clientsMutex);
     return static_cast<int>(playerInfoMap.size());
@@ -2247,8 +2257,7 @@ static void emitEditWire(std::string& wire, int x, int y, int z, int type, int c
 // world, so the batch is decided under the lock and the wire is built from it
 // out here. That is the plan's "snapshot under the lock, work outside it" rule
 // at its cheapest: worst-case lock hold drops ~4x for a few lines, no new
-// buffering, and the caps did not have to move. (Measurement lives in
-// WORKING/ROADMAP-SERVER.md §3.4; re-run it before raising any of the caps.)
+// buffering, and the caps did not have to move. (Re-measure before raising any of the caps.)
 static std::string emitEditBatch(const std::vector<ewb::WeEdit>& batch) {
     std::string wire;
     wire.reserve(batch.size() * 64);
@@ -3677,20 +3686,24 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
     // --- level 0: read-only and self-scoped ----------------------------------
 
     if (verb == "/help") {
-        int page = 1;
-        if (argc == 1 && !ewb::we_parse_int(tok[1], page)) page = 1;
-        const std::vector<std::string> lines = ewb::we_help_lines(level);
-        // The game's chat pane is a few lines tall, so paginate rather than
-        // flooding it with thirty lines nobody can scroll back through.
-        const int per = 6;
-        const int pages = ((int)lines.size() + per - 1) / per;
-        if (page < 1 || page > pages) {
-            weSay(s, "Page must be 1.." + std::to_string(pages) + ".");
+        // One chat message per page: the retail client shows a single message at
+        // a time, so a multi-line reply would leave only its last line on screen.
+        if (argc == 1) {
+            int page = 0;
+            if (!ewb::we_parse_int(tok[1], page)) {
+                const std::string one = ewb::we_help_for(level, tok[1]);
+                weSay(s, one.empty() ? "No command '" + tok[1] + "'. Try /help." : one);
+                return;
+            }
+            const std::vector<std::string> pages = ewb::we_help_pages(level);
+            if (page < 1 || page > (int)pages.size()) {
+                weSay(s, "Page must be 1.." + std::to_string(pages.size()) + ".");
+                return;
+            }
+            weSay(s, pages[page - 1]);
             return;
         }
-        weSay(s, "--- help " + std::to_string(page) + "/" + std::to_string(pages) + " ---");
-        for (int i = (page - 1) * per; i < (int)lines.size() && i < page * per; ++i)
-            weSay(s, lines[i]);
+        weSay(s, ewb::we_help_pages(level)[0]);
         return;
     }
 
@@ -3781,6 +3794,31 @@ static void handleWorldEditLine(SOCKET s, const std::string& username,
         float px, py, pz;
         if (!weClientPos(s, px, py, pz)) { weSay(s, "The server does not have your position yet."); return; }
         serveRegion(s, username, (int)lroundf(px), (int)lroundf(pz), regionLimiter);
+        return;
+    }
+
+    // --- /last -----------------------------------------------------------------
+
+    if (verb == "/last") {
+        SavedPos p;
+        {
+            std::lock_guard<std::mutex> lk(g_posMtx);
+            const SavedPos* sp = g_lastSession.find(username);
+            if (!sp) { weSay(s, "No previous location is recorded for you."); return; }
+            p = *sp;
+        }
+        weTeleport(s, username, p.x, p.y, p.z);
+        weSay(s, "Returned to where you were last session.");
+        return;
+    }
+
+    // --- /spawn, /home ---------------------------------------------------------
+
+    if (verb == "/spawn" || verb == "/home") {
+        // g_worldSpawn / g_haveWorldSpawn are set once at startup and never change.
+        if (!g_haveWorldSpawn) { weSay(s, "This world has no spawn point set."); return; }
+        weTeleport(s, username, g_worldSpawn.x, g_worldSpawn.y, g_worldSpawn.z);
+        weSay(s, "Returned to spawn.");
         return;
     }
 
@@ -4966,10 +5004,15 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                 {
                     std::lock_guard<std::mutex> lk(g_posMtx);
                     const SavedPos* sp = g_playerPos.find(username);
-                    if (sp) {
+                    if (sp) g_lastSession.put(username, *sp);   // for /last
+                    if (sp && g_rejoinMode == RejoinMode::Last) {
                         sendLine(clientSocket, spawnLine(sp->x, sp->y, sp->z));
                         std::cout << "[Server] Restored " << username << " to ("
                                   << sp->x << "," << sp->y << "," << sp->z << ")\n";
+                    } else if (sp && g_rejoinMode == RejoinMode::Fixed) {
+                        sendLine(clientSocket, spawnLine(g_rejoinFixed.x, g_rejoinFixed.y, g_rejoinFixed.z));
+                        std::cout << "[Server] Rejoin " << username << " sent to ("
+                                  << g_rejoinFixed.x << "," << g_rejoinFixed.y << "," << g_rejoinFixed.z << ")\n";
                     } else if (g_haveWorldSpawn) {
                         sendLine(clientSocket, spawnLine(g_worldSpawn.x, g_worldSpawn.y, g_worldSpawn.z));
                         std::cout << "[Server] Spawned " << username << " at world spawn ("
@@ -5155,6 +5198,16 @@ int main(int argc, char* argv[]) {
                 std::cerr << "[Server] --spawn " << v << " is outside the world; ignored." << std::endl;
             else { g_worldSpawn = s; g_haveWorldSpawn = true; }
         }
+        else if (a == "--rejoin") {
+            // Where a returning player lands: spawn | last | x:y:z.
+            const std::string v = next("spawn");
+            ewb::Spawn s;
+            if (v == "spawn") g_rejoinMode = RejoinMode::Spawn;
+            else if (v == "last") g_rejoinMode = RejoinMode::Last;
+            else if (!ewb::parse_spawn_line(v, s) || !ewb::move_pos_valid(s.x, s.y, s.z))
+                std::cerr << "[Server] --rejoin " << v << " is not spawn, last or an in-world x:y:z; ignored." << std::endl;
+            else { g_rejoinMode = RejoinMode::Fixed; g_rejoinFixed = { s.x, s.y, s.z }; }
+        }
         else if (a == "--max-saved-positions") {
             const long long v = std::atoll(next("10000").c_str());
             g_maxSavedPos = v >= 1 ? (size_t)v : 0;   // 0 -> reset with a warning below
@@ -5324,6 +5377,7 @@ int main(int argc, char* argv[]) {
         g_maxSavedPos = SV_MAX_SAVED_POS_DEFAULT;
     }
     g_playerPos.set_capacity(g_maxSavedPos);
+    g_lastSession.set_capacity(g_maxSavedPos);
     if (g_maxSavedPos != SV_MAX_SAVED_POS_DEFAULT)
         std::cout << "[Server] Saved-position cap " << g_maxSavedPos
                   << " (default " << SV_MAX_SAVED_POS_DEFAULT << ")" << std::endl;

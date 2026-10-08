@@ -208,7 +208,10 @@ entry. Set one with the operator socket: `edenctl op Alice 1`.
 | `2` | operator | Everything above, plus `/tp <player>` — which reveals that player's exact position. |
 
 `/help` lists only what the caller may actually run, so a visitor is never shown a command they
-would be refused. The level is re-read on every command: an `op` or `deop` from the control
+would be refused. Each `/help` page is **one chat message** (at most 160 bytes with the `[Server]`
+prefix, the width every device shows intact), commands packed comma-separated and ending in
+`/help <next>` — or `(end)` on the last page — because the retail client shows one chat message
+at a time and a multi-line reply would leave only its last line on screen. The level is re-read on every command: an `op` or `deop` from the control
 socket takes effect on the player's next line, not their next session.
 
 An **open creative server** hands everyone building rights with `--default-level 1`. That is a
@@ -298,11 +301,13 @@ it pastes correctly at any height.
 
 | Command | Level | What it does |
 |---|---|---|
-| `/help [page]` | 0 | List the commands you can run, a page at a time. |
+| `/help [page\|command]` | 0 | List the commands you can run, a page at a time — or show one command's usage and description (`/help set`, `/help //set`). |
 | `/msg <player> <text>` | 0 | Private message. |
 | `/r <text>` | 0 | Reply to whoever whispered to you last. |
 | `/tp <x> <y> <z>` | 1 | Teleport. `~` is your current value, `~5` an offset from it. |
 | `/tp <player>` | **2** | Teleport to a player — this discloses their exact position, so it is operator-only. |
+| `/spawn`, `/home` | 0 | Return to the world default spawn (`eden_spawn.txt` / `--spawn`) — the point a brand-new player first loads into. Not your saved position. Refused if the world has no spawn configured. |
+| `/last` | 0 | Jump to where your previous session ended. Useful when `--rejoin` sends returning players to spawn. Remembered in memory only (not across a server restart); refused if there is none. |
 | `/resync` | 0 | Resend the world around you, if your client has drifted. Paced by the same budget as a client's own `REGION` requests. |
 | `/id <block\|colour>` | 0 | Look up an id: a number reports what it names, a name reports its number. |
 | `/searchblocks <name>` | 0 | List blocks whose name contains the text, as `name=id`. |

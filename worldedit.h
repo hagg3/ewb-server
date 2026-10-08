@@ -126,6 +126,9 @@ inline const std::vector<WeSpec>& we_specs() {
         // Stage 8.6. Handled before this table's dispatcher ever sees the line, so
         // the PIN is never logged, audited or echoed; the row is here for /help.
         {"/login",        WE_LEVEL_VISITOR,  1,  1, "/login <pin>                       - prove this name is yours"},
+        {"/spawn",        WE_LEVEL_VISITOR,  0,  0, "/spawn                             - return to the world spawn"},
+        {"/home",         WE_LEVEL_VISITOR,  0,  0, "/home                              - alias of /spawn"},
+        {"/last",         WE_LEVEL_VISITOR,  0,  0, "/last                              - return to where you were last session"},
         // --- level 1: bounded edits ------------------------------------------
         {"/tp",           WE_LEVEL_BUILDER,  1,  3, "/tp <x> <y> <z> | /tp <player>     - teleport (~ is relative)"},
         // 0 or 3 arguments; the handler refuses 1 or 2 (`we_pos_args_ok`).
@@ -201,6 +204,81 @@ inline std::vector<std::string> we_help_lines(int level) {
         out.push_back(s.usage);
     }
     return out;
+}
+
+/// A usage row without its description: `//set <block> [color]   - fill the
+/// selection` -> `//set <block> [color]`. The description starts at the first
+/// ` - ` (padded rows have several spaces before it).
+inline std::string we_help_compact(const char* usage) {
+    const std::string u = usage;
+    const size_t cut = u.find(" - ");
+    std::string out = cut == std::string::npos ? u : u.substr(0, cut);
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
+/// A usage row with its padding collapsed to single spaces, for `/help <cmd>`.
+inline std::string we_help_full(const char* usage) {
+    std::string out;
+    for (const char* c = usage; *c; ++c) {
+        if (*c == ' ' && !out.empty() && out.back() == ' ') continue;
+        out += *c;
+    }
+    return out;
+}
+
+/// `/help` as whole pages, one chat message each. The retail client shows a
+/// single chat message at a time, so a page is **one string** that must fit the
+/// widest line every device shows intact (160 bytes, measured). The caller sends
+/// it as `[Server] <page>`, so `prefix_len` of that budget is already spent.
+///
+/// Each page is `Help p/N: a, b, c, /help p+1` — entries packed greedily, the
+/// last word always saying how to get the next page (the last page says
+/// `(end)`). Pure and deterministic, so the page count is stable for a level.
+inline std::vector<std::string> we_help_pages(int level, size_t width = 160,
+                                              size_t prefix_len = 9) {
+    std::vector<std::string> entries;
+    for (const WeSpec& s : we_specs()) {
+        if (s.min_level > level) continue;
+        if (std::string(s.name) == "//strip") continue;   // listed as //unpaint's alias
+        entries.push_back(we_help_compact(s.usage));
+    }
+    // "Help 99/99: " + ", /help 99" is the worst-case frame around the entries.
+    const size_t frame  = 12 + 11;
+    const size_t budget = width > prefix_len + frame ? width - prefix_len - frame : 1;
+    std::vector<std::string> bodies;
+    std::string cur;
+    for (const std::string& e : entries) {
+        if (!cur.empty() && cur.size() + 2 + e.size() > budget) {
+            bodies.push_back(cur);
+            cur.clear();
+        }
+        cur += cur.empty() ? e : ", " + e;
+    }
+    if (!cur.empty()) bodies.push_back(cur);
+    std::vector<std::string> pages;
+    const size_t n = bodies.size();
+    for (size_t i = 0; i < n; ++i) {
+        pages.push_back("Help " + std::to_string(i + 1) + "/" + std::to_string(n) + ": " +
+                        bodies[i] +
+                        (i + 1 < n ? ", /help " + std::to_string(i + 2) : " (end)"));
+    }
+    return pages;
+}
+
+/// `/help <command>`: that command's usage and description as one line, or empty
+/// if there is no such command *at this level* (a command above the caller's level
+/// is indistinguishable from a typo, as in `/help`'s own listing). Accepts `set`,
+/// `/set` or `//set`.
+inline std::string we_help_for(int level, const std::string& arg) {
+    for (const std::string& cand : {arg, "/" + arg, "//" + arg}) {
+        const WeSpec* s = we_find(cand);
+        if (s && s->min_level <= level) {
+            // //strip is the alias row; its own line already says so.
+            return we_help_full(s->usage);
+        }
+    }
+    return "";
 }
 
 // --- line grammar ------------------------------------------------------------
@@ -616,7 +694,7 @@ inline bool we_clip_cell(int y, unsigned char type, unsigned char color, ClipCel
 /// Rotate a ramp/wedge block id one 90° step.
 ///
 /// ⚠️ **Direction is unverified.** This is the modded patch's `(offset + 1) % 4`;
-/// VuencEdit's clipboard rotation uses `(offset + 3) & 3`, and the two codebases'
+/// a community editor's clipboard rotation uses `(offset + 3) & 3`, and the two codebases'
 /// orientation *names* for 24–27 and 40–55 also disagree (plan §0.5.1, §0.5.4).
 /// One of the two is inverted and no capture settles it, so ramps in a rotated
 /// paste may face the wrong way. Stage 3.6a owns the experiment that decides it

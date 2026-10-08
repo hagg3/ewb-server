@@ -53,7 +53,7 @@ logs/*.log
 logs/*.txt
 !logs/.gitkeep
 
-# --- MSVC / Windows build tree (reference project is TCPServer.zip + TCPServer.vcxproj) ---
+# --- Windows build cruft (local leftovers) ---
 x64/
 TCPServer/
 *.pdb

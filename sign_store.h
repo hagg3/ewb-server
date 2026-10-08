@@ -16,7 +16,7 @@
 // nothing. `LISTP` has an `END`, but that is a different subprotocol — do not
 // generalize one to the other.
 //
-// ⚠️ **`a`, `b`, `c` are unknown fields.** Same shape as VuencEdit's sign sidecar
+// ⚠️ **`a`, `b`, `c` are unknown fields.** Same shape as a community editor's sign sidecar
 // (`i32 x,y,z; i32 a,b,c; char text[96]`), where `c` is an unproven
 // facing-quadrant hypothesis. We emit whatever the file holds, verbatim, and
 // invent no semantics. Single-character sign texts in the capture (`q`, `a`, `s`,
@@ -66,7 +66,7 @@
 namespace ewb {
 
 /// Sign text long enough for anything observed (the capture's longest was cut off
-/// by a 64-byte logger cap, and VuencEdit's own sidecar field is `char[96]`), and
+/// by a 64-byte logger cap, and that editor's own sidecar field is `char[96]`), and
 /// short enough that a full `SIGNP` line stays well inside any receive guard.
 constexpr size_t SIGN_TEXT_MAX = 256;
 

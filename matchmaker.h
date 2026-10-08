@@ -4,8 +4,8 @@
 // Server Browser, which is populated by a matchmaker: game servers hold an open
 // TCP connection to it and register; game clients ask it for the list.
 //
-// The wire protocol here is the one described by Eden's developer (WORKING/
-// matchmakerinfo.txt — a lossy paste, superseded on several points) cross-checked
+// The wire protocol here is the one described by Eden's developer (a lossy
+// paste, superseded on several points) cross-checked
 // against the byte-exact browse capture of the *live* matchmaker in the private
 // RE tree (CAPTURE-FINDINGS.md "Matchmaker SERVER: grammar — CONFIRMED").
 //
@@ -476,7 +476,7 @@ class Registry {
 public:
     // Add or replace. The dedupe key is (ip, port), not (name, ip, port): the
     // dev's prose says name:ip:port, but the production matchmaker's own code
-    // keys on ip:port (latestref-analysis-2026-09-12.md §5) — code wins, and it
+    // keys on ip:port (community drop, 2026-09-12) — code wins, and it
     // matters here because the prose key let a server that renames itself
     // appear twice in the browser for up to the 45 s TTL (stage 2.2).
     //

@@ -4,7 +4,7 @@
 //   clang++ -std=c++17 -O2 -Wall eden_names_test.cpp -o eden_names_test
 //   ./eden_names_test
 //
-// The tables are pure data harvested from server_posix_modded.cpp. These checks
+// The tables are pure data harvested from a community patch. These checks
 // pin the round-trip (name -> id -> name), the range edges, the documented
 // aliases and sentinels, and the substring search used by /searchblocks and
 // /searchcolors. They do NOT assert the names are *correct* — plan §0.5.1
