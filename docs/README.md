@@ -69,7 +69,9 @@ Practically, when you touch a source file, move the doc in the same row:
 | `auth.h`, or `handleLogin()` / the `passwd`/`unpasswd`/`pins` verbs in `server_posix.cpp` — PINs, `/login`, the level a session gets, zone bypass | [commands.md](commands.md) § Player identity (and its reply strings); [configuration.md](configuration.md) § `eden_auth.txt`, `--auth-file`, `eden_ops.txt`, Protected zones; [protocol.md](protocol.md) § Chat and § Protected zones; [architecture.md](architecture.md) § Locks |
 | `topmap.h`, or the `topmap` verb | [commands.md](commands.md) (the verb and its reply format) |
 | `save_sched.h` — when the autosave thread writes the world (the periodic save and the departure saves it coalesces) | [architecture.md](architecture.md) § Threading model and § Persistence; [configuration.md](configuration.md) § Compiled-in limits |
+| `log_fold.h` — folding of `--verbose` per-edit log lines | [configuration.md](configuration.md) § Logging |
 | `durable_write.h` — how the world and sidecar files reach disk (`fsync` + `rename` + directory `fsync`) | [architecture.md](architecture.md) § Persistence (the durability guarantee); [configuration.md](configuration.md) § Temporary files |
+| `region_cache.h` — the encoded-region cache, its key and column-generation invalidation | [architecture.md](architecture.md) § The output path; [protocol.md](protocol.md) § Pacing; [configuration.md](configuration.md) (`--region-cache-mb`) |
 | `out_queue.h`, or anything that writes to a player's socket | [architecture.md](architecture.md) § The output path; [configuration.md](configuration.md) for the per-client bounds |
 | `sign_store.h` — `SIGNQ`/`SIGNP` wire shape | [protocol.md](protocol.md); the `eden_signs.txt` grammar lives in [configuration.md](configuration.md) |
 | `spawn_store.h` — `eden_spawn.txt` grammar (world default spawn) | [configuration.md](configuration.md) § `eden_spawn.txt` and the `--spawn` / `--spawn-file` flags |

@@ -145,8 +145,9 @@ inline void emit_cell_records(int x, int y, int z, unsigned char type, unsigned 
 /// `x, z, y, flag`. Recovered byte-exactly from the Pass-2 capture (stage 7.8):
 /// the native server hands the client each chunk as one contiguous run, 1.00
 /// runs per chunk; re-sorting the captured 253,671 records by this key
-/// reproduces the captured stream exactly. `g_world` is an `unordered_map`, so
-/// unsorted records arrive in hash order; this key is *also* near-monotonic
+/// reproduces the captured stream exactly. Since stage 12.1a the server never
+/// calls this: `WorldStore::for_each_in_box` already emits records in this order,
+/// and this function is the oracle `region_test` holds it to. This key is near-monotonic
 /// within a chunk (16 values per axis instead of the full ~464-block span), so
 /// it compresses 3.7% better than the flat `(z,x,y,flag)` order this replaced,
 /// on top of being 44x better chunk locality.

@@ -78,6 +78,7 @@
 #include <ctime>          // gmtime_r/strftime — the audit log's UTC stamp (stage 3.4)
 
 #include "region_query.h"   // REGION reply geometry + Cell -> record table (stage 1.1)
+#include "region_cache.h"   // encoded-region cache + column generations   (stage 12.1b)
 #include "snapz_codec.h"    // raw DEFLATE + base64 + SNAPZ framing      (stage 1.2)
 #include "out_queue.h"      // per-client output queue policy            (stage 7.3)
 #include "sign_store.h"     // eden_signs.txt + SIGNQ -> SIGNP           (stage 1.5)
@@ -96,6 +97,7 @@
 #include "burn_guard.h"     // --tnt / --fire switches, refused-burn preview (stage 10.4)
 #include "base_profile.h"   // the terrain the client draws for itself
 #include "save_sched.h"     // coalesced departure saves                  (stage 12.0a)
+#include "log_fold.h"       // --verbose edit-line folding                 (stage 12.2)
 
 typedef int SOCKET;
 constexpr SOCKET INVALID_SOCKET = -1;
@@ -162,7 +164,8 @@ std::string g_advertiseIP= "";                  // IP clients should use to reac
 bool        g_verbose    = false;               // log every terrain edit (chatty)
 int         g_idleTimeout = 0;                   // seconds; >0 = self-exit when empty this long
 int         g_regionRadius = ewb::REGION_RADIUS; // blocks a REGION reply covers (--region-radius)
-bool        g_regionSort  = true;                // sort records before deflate (--no-region-sort)
+// --no-region-sort is accepted and does nothing since stage 12.1a: the scan emits
+// records in wire order, so there is no sort left to switch off.
 bool        g_regionEmptyFrame = true;           // answer an empty region with SNAPZ:0 (--no-region-empty-frame to suppress)
 std::string g_signFile   = "eden_signs.txt";     // sign sidecar (--signs)
 std::string g_spawnFile  = "";                   // world spawn sidecar; empty -> derived from the world dir (--spawn-file)
@@ -171,6 +174,8 @@ bool        g_haveWorldSpawn = false;            // a default spawn point is con
 ewb::Spawn  g_worldSpawn;                        // the default spawn handed to a player with no saved position
 bool        g_legacySnapshot = false;            // push the ACTION dump on JOIN (--legacy-snapshot)
 int         g_connectLimit = 10;                 // connects per IP per window; 0 = off (--connect-limit)
+int         g_maxConnsPerIp = 6;                 // concurrent sessions per IP; 0 = off (--max-conns-per-ip)
+ewb::IpConnCounter g_ipConns;                   // live sessions per source IP (stage 12.3)
 bool        g_tcpNodelay = true;                 // disable Nagle on client sockets; --tcp-nodelay 0 to keep it
 
 // --- Connection-lifecycle hardening (stage 1.10) ---
@@ -239,6 +244,11 @@ int         g_regionEncoders    = -1;        // --region-encoders: frames deflat
 double      g_regionRecordBurst = 8000000;   // --region-record-burst: REGION records one client may take at once (0 = off)
 double      g_regionRecordRate  = 1000000;   // --region-record-rate: ...refilled per second (0 = off)
 int         g_writeTimeout  = 60;            // --client-write-timeout: seconds with no drain progress
+// REGION encode cost (stage 12.1, PERF-003/005). Level 1 is 4.6–5.5x less deflate
+// CPU than 6 for 8–17 % more bytes; any level inflates to the same records. The
+// cache answers a repeated box with the lines it was last sent as.
+int         g_regionDeflateLevel = 1;        // --region-deflate-level 0..9
+size_t      g_regionCacheMb      = 64;       // --region-cache-mb: encoded replies kept (0 = off)
 
 // REGION service counters (the measurement plan §3.2's `region-stats` asks for).
 std::atomic<uint64_t> g_rgnRequests{0};
@@ -252,6 +262,7 @@ std::atomic<uint64_t> g_slowDrops{0};       // clients disconnected for not drai
 std::atomic<uint64_t> g_rgnBudgetRefused{0};// regions refused over a client's record budget (12.0b)
 std::atomic<uint64_t> g_rgnEncodeWaits{0};  // frames handed back for want of an encoder slot (12.0b)
 std::atomic<uint64_t> g_rgnEncodeMax{0};    // most frames ever deflating at once (12.0b)
+std::atomic<uint64_t> g_rgnCacheRecords{0}; // records answered from the region cache (12.1b)
 
 // Lock-hold instrumentation (stage 7.6 step 1). The counters above measure *work*
 // (cells, records, bytes); these measure the thing that actually makes a busy
@@ -427,6 +438,15 @@ static std::mutex g_worldMtx;        // lock order: after g_zonesMtx (released),
 static std::mutex g_saveMtx;         // serializes on-disk writes (world + players)
 std::atomic<bool> editsDirty{false};
 
+// The encoded-region cache (stage 12.1b; region_cache.h). g_colGens is bumped by
+// worldSet() — the only live writer of g_world — and guarded by g_worldMtx, which is
+// what makes a lookup's validity check exact. The cache itself has its own mutex,
+// taken inside g_worldMtx (serveRegion's lookup) or with nothing held (the writer's
+// insert, region-stats); never the other way round, and nothing else under it.
+static ewb::ColumnGens  g_colGens;
+static std::mutex       g_regionCacheMtx;
+static ewb::RegionCache g_regionCache;
+
 // Protected zones (stage 8.2; model in zones.h). The set is immutable once published:
 // a change swaps in a new one, so a hot path copies the pointer under g_zonesMtx and
 // reads the set with no lock at all — the zone lock is never held across a world edit.
@@ -576,6 +596,7 @@ static bool worldSet(int x,int y,int z,int type,int color){
     }
     if(!g_world.set(x, y, z, (unsigned char)type, (unsigned char)color)) return false;
     editsDirty = true;
+    g_colGens.bump(x, z);   // every cached REGION reply covering this column is now stale
     // A sign hangs on a block; a block that is now air has no face left to hang one on.
     if(type==SV_AIR) removeSignsOnBlock(k);
     return true;
@@ -691,9 +712,10 @@ static ewb::ExplodeResult simAction(int mode,int x,int y,int z,int extra, ZoneBl
 // `eden_import` still writes — so no world needs a migration step, and a world
 // saved by an older build keeps working. The format is *not* sticky: unless
 // --world-format text says otherwise, the next save writes EDMB.
-void loadWorld() {
+// Returns true when the file was legacy text, so the caller can convert it.
+bool loadWorld() {
     std::ifstream f(g_worldFile, std::ios::binary);
-    if (!f) return;
+    if (!f) return false;
     std::string blob((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     std::lock_guard<std::mutex> lock(g_worldMtx);
     const bool binary = ewb::WorldStore::is_edmb(blob.data(), blob.size());
@@ -706,8 +728,8 @@ void loadWorld() {
                          " server now if you want to keep the file." << std::endl;
         }
     } else {
-        std::istringstream in(blob);
-        ewb::world_load_text(in, g_world);
+        // Parsed in place: an istringstream would copy the whole file (stage 12.4).
+        ewb::world_load_text_buf(blob.data(), blob.size(), g_world);
     }
     // world_store.h reserves in-array type 254 for "explicitly mined"; a block of
     // literal type 254 cannot be produced by this server (ACTION caps types at
@@ -728,6 +750,7 @@ void loadWorld() {
     std::cout << "[Server] Loaded " << g_world.size() << " world cells from " << g_worldFile
               << " (" << (binary ? "EDMB" : "legacy text") << ", " << g_world.chunk_count()
               << " chunks)" << std::endl;
+    return !binary;
 }
 
 void saveWorld(const char* reason) {
@@ -1618,6 +1641,20 @@ static bool pushRegion(const std::shared_ptr<ClientOut>& o, ewb::RegionJob job) 
     return ok;
 }
 
+// A REGION answered from the region cache (stage 12.1b): same admission as pushRegion.
+static bool pushCachedRegion(const std::shared_ptr<ClientOut>& o,
+                             std::shared_ptr<const ewb::CachedRegion> reply) {
+    if (!o) return false;
+    bool ok;
+    {
+        std::lock_guard<std::mutex> lk(o->m);
+        if (o->closing || o->dead || o->tooSlow) return false;
+        ok = o->q.push_cached_region(std::move(reply));
+    }
+    if (ok) o->cv.notify_one();
+    return ok;
+}
+
 // Socket-addressed convenience wrappers, so the ~30 existing output call sites keep
 // reading the way they did. Each is one g_outsMtx map lookup; a broadcast uses
 // outSnapshot() instead of calling these in a loop.
@@ -1761,7 +1798,18 @@ static void clientWriter(std::shared_ptr<ClientOut> o) {
     // so exactly one job is ever in flight here.
     size_t jobFrames = 0, jobRecords = 0, jobBytes = 0;
     long   jobEncodeUs = 0;
+    bool   jobCached = false;
     std::chrono::steady_clock::time_point jobStart = std::chrono::steady_clock::now();
+
+    // This writer's deflate stream (stage 12.1a), made on its first frame: a
+    // z_stream is ~256 KB, and most clients' writers never encode after the join.
+    std::unique_ptr<ewb::SnapzEncoder> enc;
+
+    // The reply being filed in the region cache (stage 12.1b): this job's encoded
+    // lines, kept as they are sent. Abandoned (and freed) once it outgrows what the
+    // cache would store, or if the job does not finish.
+    std::shared_ptr<ewb::CachedRegion> fill;
+    ewb::RegionCacheTag fillTag;
 
     for (;;) {
         bool leaving;   // the reader asked us to stop, or this client is too far behind
@@ -1809,17 +1857,28 @@ static void clientWriter(std::shared_ptr<ClientOut> o) {
         // blob shared across clients (`broadcastWorld`) is never copied at all,
         // not even here on the drain side.
         const std::string* buf = &bytes;
-        if (item.kind == ewb::OutItem::Kind::Frame) {
-            if (item.first) {
-                jobFrames = jobRecords = jobBytes = 0;
-                jobEncodeUs = 0;
-                jobStart = t0;
+        const bool isFrame = item.kind == ewb::OutItem::Kind::Frame ||
+                             item.kind == ewb::OutItem::Kind::CachedFrame;
+        if (isFrame && item.first) {
+            jobFrames = jobRecords = jobBytes = 0;
+            jobEncodeUs = 0;
+            jobStart = t0;
+            jobCached = item.kind == ewb::OutItem::Kind::CachedFrame;
+            fill.reset();
+            if (item.cacheable) {
+                fill = std::make_shared<ewb::CachedRegion>();
+                fill->stamp = item.cache_tag.stamp;
+                fillTag = item.cache_tag;
             }
+        }
+        if (item.kind == ewb::OutItem::Kind::Frame) {
             try {
-                bytes = ewb::encode_item(item);
+                if (!enc) enc = std::make_unique<ewb::SnapzEncoder>(g_regionDeflateLevel);
+                bytes = ewb::encode_item(item, *enc);
                 g_encodeSlots.release();
             } catch (const std::exception& e) {
                 g_encodeSlots.release();
+                fill.reset();   // a reply with a frame missing must never be cached
                 // A deflate failure must not take the server down: this thread is
                 // joined, not caught, and an escaping exception is std::terminate.
                 // Abandoning the rest of the burst is safe now — the client sees a
@@ -1832,7 +1891,8 @@ static void clientWriter(std::shared_ptr<ClientOut> o) {
                 o->drained.notify_all();
                 continue;
             }
-        } else if (item.kind == ewb::OutItem::Kind::SharedBytes) {
+        } else if (item.kind == ewb::OutItem::Kind::SharedBytes ||
+                   item.kind == ewb::OutItem::Kind::CachedFrame) {
             buf = item.shared_bytes.get();
             if (!buf) buf = &bytes;   // defensive; push_world never queues a null/empty shared blob
         } else {
@@ -1841,13 +1901,28 @@ static void clientWriter(std::shared_ptr<ClientOut> o) {
         const auto t1 = std::chrono::steady_clock::now();
 
         const bool ok = writeAll(*o, *buf, lastProgress, leaving);
+        const size_t wrote = buf->size();   // `bytes` may be moved into the cache fill below
 
-        if (item.kind == ewb::OutItem::Kind::Frame) {
+        if (isFrame) {
             ++jobFrames;
             jobRecords  += item.count;
-            jobBytes    += bytes.size();
+            jobBytes    += buf->size();
             jobEncodeUs += (long)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-            g_rgnBytesOut.fetch_add(bytes.size(), std::memory_order_relaxed);
+            g_rgnBytesOut.fetch_add(buf->size(), std::memory_order_relaxed);
+            if (fill) {
+                if (!ok || fill->bytes + bytes.size() > g_regionCache.max_entry_bytes())
+                    fill.reset();   // the cache would refuse it anyway; don't hold it
+                else
+                    fill->add(std::move(bytes), item.count);
+                if (fill && ok && item.last) {
+                    // No world lock here: an edit since the scan makes this entry
+                    // stale, and every lookup checks that under g_worldMtx before
+                    // serving it (region_cache.h), so it can never go out.
+                    std::lock_guard<std::mutex> lk(g_regionCacheMtx);
+                    g_regionCache.insert(fillTag.key, std::move(fill));
+                }
+                if (item.last) fill.reset();
+            }
             if (ok && item.last) {
                 // The measurement 7.3 asked for: `encode N ms` used to span encode
                 // *and* send, because the two were interleaved in one loop, so an
@@ -1860,7 +1935,8 @@ static void clientWriter(std::shared_ptr<ClientOut> o) {
                 std::ostringstream drainLine;   // one flush instead of several (stage 7.12)
                 drainLine << "[Server] REGION drain " << who << ": " << jobFrames << " frame(s), "
                           << jobRecords << " records, " << jobBytes << " B wire, encode "
-                          << (jobEncodeUs / 1000) << " ms, drain " << drainMs << " ms";
+                          << (jobEncodeUs / 1000) << " ms, drain " << drainMs << " ms"
+                          << (jobCached ? " (from cache)" : "");
                 std::cout << drainLine.str() << std::endl;
             }
         }
@@ -1868,7 +1944,7 @@ static void clientWriter(std::shared_ptr<ClientOut> o) {
         {
             std::lock_guard<std::mutex> lk(o->m);
             o->writing = false;
-            o->sentBytes += buf->size();
+            o->sentBytes += wrote;
             if (!ok) o->dead = true;
         }
         o->drained.notify_all();
@@ -2077,9 +2153,10 @@ static void serveSigns(SOCKET clientSocket, const std::string& who, BurstLimiter
 // Answer one `REGION:<x>:<z>` with a burst of `SNAPZ` frames.
 //
 // ⚠️ **The world lock is held for the scan only.** Matching records are copied into
-// a local vector under `g_worldMtx`; sorting, deflate, base64 and send() all happen
-// after it is released. The real server appears to hold its world locked for the
-// full ~1 s a region takes — that is precisely the behaviour a reference test
+// a local vector under `g_worldMtx`; deflate, base64 and send() all happen after it
+// is released. There is no sort (stage 12.1a): the scan emits records in wire
+// order. The real server appears to hold its world locked for the full ~1 s a
+// region takes — that is precisely the behaviour a reference test
 // client's `net/region.rs` etiquette rules exist to avoid triggering, and reproducing it
 // would make every other player's edits queue behind one player's walk.
 //
@@ -2091,13 +2168,19 @@ static void serveSigns(SOCKET clientSocket, const std::string& who, BurstLimiter
 // if it ever climbs again, the next lever is emitting records per chunk instead of
 // into one vector.
 //
-// ⚠️ **This function no longer sends anything** (stage 7.3). It scans, sorts, and
-// hands the record vector to the client's writer thread, which encodes one frame
+// ⚠️ **This function no longer sends anything** (stage 7.3). It scans and hands
+// the record vector to the client's writer thread, which encodes one frame
 // per turn. Three things fall out: frames can no longer be spliced by another
 // thread's write; the per-region memory stays the record vector instead of gaining
 // a queue of encoded base64 on top of it (up to ~17 MB for a worst-case box); and
 // deflate moves off this thread, so a slow reader no longer blocks the client's own
 // recv loop — which is what kept a departing player's name taken for a minute (7.5).
+//
+// ⚠️ **A repeated box is answered from the region cache** (stage 12.1b,
+// region_cache.h) when nothing in it has changed since it was last encoded: no scan,
+// no deflate, the same bytes. The validity check runs under `g_worldMtx`, against
+// the column generations worldSet() bumps, so a stale reply cannot be served. A
+// miss is scanned as before and tagged, and the writer files its encoded lines.
 // A record vector that reports its own size to the global pending-record counter
 // for exactly as long as it is alive — queued, being encoded, or held by a producer
 // mid-hand-off. Making the accounting the vector's own deleter is what keeps it
@@ -2130,8 +2213,12 @@ static void serveRegion(SOCKET clientSocket, const std::string& who, int cx, int
         return;
 
     const ewb::RegionBox box = ewb::region_box(cx, cz, g_regionRadius);
+    const ewb::RegionCacheKey cacheKey = ewb::RegionCacheKey::of(box, g_regionEmptyFrame);
+    const bool cacheOn = g_regionCache.enabled();   // fixed after startup
 
     std::vector<ewb::SnapRec> recs;
+    std::shared_ptr<const ewb::CachedRegion> hit;
+    uint64_t stamp = 0;
     size_t scanned = 0, inBox = 0, worldCells = 0;
     ewb::WorldStore::BoxScan scan;
     clock::time_point tLock0;
@@ -2140,16 +2227,23 @@ static void serveRegion(SOCKET clientSocket, const std::string& who, int cx, int
         std::lock_guard<std::mutex> lock(g_worldMtx);
         tLock0 = clock::now();   // stage 7.6: hold, not wait-plus-hold
         worldCells = g_world.size();
+        stamp = g_colGens.now();
+        if (cacheOn) {
+            std::lock_guard<std::mutex> ck(g_regionCacheMtx);
+            hit = g_regionCache.find(cacheKey, g_colGens);
+        }
         // Stage 7.6: only the chunks whose x/z footprint meets the box. This used
         // to walk every cell in the world and filter — on a 13.9M-cell world that
         // was a 13.9M-iteration scan under the lock every ACTION needs, per
         // region, up to SV_MAX_REGIONS_PER_SESSION times a session.
-        scan = g_world.for_each_in_box(box.x0, box.x1, box.z0, box.z1,
-                                       [&](int x, int y, int z, unsigned char t, unsigned char c) {
-            ewb::emit_cell_records(x, y, z, t, c, recs);
-        });
-        scanned = scan.cells_visited;
-        inBox   = scan.cells_emitted;
+        if (!hit) {
+            scan = g_world.for_each_in_box(box.x0, box.x1, box.z0, box.z1,
+                                           [&](int x, int y, int z, unsigned char t, unsigned char c) {
+                ewb::emit_cell_records(x, y, z, t, c, recs);
+            });
+            scanned = scan.cells_visited;
+            inBox   = scan.cells_emitted;
+        }
     }   // <-- lock released here; nothing below re-takes it.
     const auto t1 = clock::now();
     {   // stage 7.6 step 1: how long every other player's ACTION waited on us.
@@ -2161,14 +2255,16 @@ static void serveRegion(SOCKET clientSocket, const std::string& who, int cx, int
 
     // Stage 12.0b: charge what this reply costs, now that the scan has counted it.
     // Over budget is refused like a full queue — silence, and the client asks again
-    // when it next moves — before the sort and the encode, which are the real cost.
-    if (!ewb::region_budget_admit(lim.records, monoSeconds(), (double)recs.size())) {
+    // when it next moves — before the encode, which is the real cost. A cache hit is
+    // charged too: it costs no CPU, but it is the same bytes on the wire.
+    const size_t records = hit ? hit->records : recs.size();
+    if (!ewb::region_budget_admit(lim.records, monoSeconds(), (double)records)) {
         g_rgnRefused.fetch_add(1, std::memory_order_relaxed);
         g_rgnBudgetRefused.fetch_add(1, std::memory_order_relaxed);
         if (lim.refuseLog.allow(monoSeconds())) {
             std::ostringstream refusedLine;
             refusedLine << "[Server] REGION #" << lim.served << " " << who << " refused: over this"
-                        << " client's record budget (" << recs.size() << " records; --region-record-burst "
+                        << " client's record budget (" << records << " records; --region-record-burst "
                         << (uint64_t)g_regionRecordBurst << ", --region-record-rate "
                         << (uint64_t)g_regionRecordRate << "/s). They will re-ask.";
             std::cerr << refusedLine.str() << std::endl;
@@ -2176,14 +2272,43 @@ static void serveRegion(SOCKET clientSocket, const std::string& who, int cx, int
         return;
     }
 
-    if (g_regionSort) ewb::sort_records(recs);
+    const long lockMs =
+        (long)(std::chrono::duration_cast<std::chrono::microseconds>(t1 - tLock0).count() / 1000);
+
+    if (hit) {
+        // Nothing to encode, and no record vector to count against the global
+        // backlog — only this client's region queue can refuse it.
+        if (!pushCachedRegion(outFor(clientSocket), hit)) {
+            g_rgnRefused.fetch_add(1, std::memory_order_relaxed);
+            std::ostringstream refusedLine;
+            refusedLine << "[Server] REGION #" << lim.served << " " << who << " refused: this client's"
+                        << " region queue is full (" << records << " records, from cache). They will re-ask.";
+            std::cerr << refusedLine.str() << std::endl;
+            return;
+        }
+        g_rgnRequests.fetch_add(1, std::memory_order_relaxed);
+        g_rgnRecords.fetch_add(records, std::memory_order_relaxed);
+        g_rgnCacheRecords.fetch_add(records, std::memory_order_relaxed);
+        g_rgnMicros.fetch_add(
+            (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
+            std::memory_order_relaxed);
+        std::ostringstream regionLine;
+        regionLine << "[Server] REGION #" << lim.served << " " << who << " (" << cx << "," << cz
+                   << ") box x[" << box.x0 << ".." << box.x1 << "] z[" << box.z0 << ".." << box.z1
+                   << "]: from cache -> " << records << " records, " << hit->frames.size()
+                   << " frame(s) queued, " << hit->bytes << " B (lock held " << lockMs << " ms)";
+        std::cout << regionLine.str() << std::endl;
+        return;
+    }
     const auto t2 = clock::now();
 
-    const size_t records = recs.size();
     const size_t frames  = records ? ewb::snapz_frame_count(records) : (g_regionEmptyFrame ? 1 : 0);
 
     ewb::RegionJob job;
     job.recs = makePendingRecs(std::move(recs));   // counts itself as pending from here
+    // Filed in the region cache by the writer once its last frame is out.
+    job.cacheable = cacheOn;
+    job.cache_tag = ewb::RegionCacheTag{cacheKey, stamp};
     // An unbuilt region has no records. We answer with an explicit `SNAPZ:0:`
     // (a well-formed frame that decodes to zero records) — 1.8 rung 2/3 showed
     // a reference test client needs a real frame back: it treats one as "answered" (resetting
@@ -2217,7 +2342,6 @@ static void serveRegion(SOCKET clientSocket, const std::string& who, int cx, int
     // building. ⚠️ Bytes out, encode time and drain time are the writer thread's to
     // report (the `REGION drain` line), because nothing has been encoded yet.
     const long scanMs = (long)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-    const long sortMs = (long)std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
 
     // Feed the `region-stats` control command (stage 3.2).
     g_rgnRequests.fetch_add(1, std::memory_order_relaxed);
@@ -2237,8 +2361,7 @@ static void serveRegion(SOCKET clientSocket, const std::string& who, int cx, int
                << scan.chunks_total << " chunks (" << scanned << " slots, world "
                << worldCells << " cells) -> " << records << " records, "
                << frames << " frame(s) queued, scan " << scanMs << " ms (lock held "
-               << (std::chrono::duration_cast<std::chrono::microseconds>(t1 - tLock0).count() / 1000)
-               << " ms), sort " << sortMs << " ms";
+               << lockMs << " ms)";
     std::cout << regionLine.str() << std::endl;
 }
 
@@ -2528,6 +2651,30 @@ static void revertThread() {
         sendRestore(job.target, job.payload, job.cells);
         lk.lock();
     }
+}
+
+// --verbose edit lines, folded to one per player per second (log_fold.h, stage 12.2).
+// Grief-relevant edits (any BURN, a BUILD of TNT / lava / fireworks) always log in full.
+static std::mutex       g_editLogMtx;
+static ewb::EditLogFold g_editLog;
+
+static void logEdit(const std::string& player, int mode, int type, const std::string& line) {
+    bool write;
+    {
+        std::lock_guard<std::mutex> lk(g_editLogMtx);
+        write = g_editLog.note(monoSeconds(), player, line, ewb::isGriefRelevantEdit(mode, type));
+    }
+    if (write) std::cout << line << std::endl;
+}
+
+// Write the summaries of closed windows. From the autosave tick, beside flushZoneAudit().
+static void flushEditLog() {
+    std::vector<std::string> lines;
+    {
+        std::lock_guard<std::mutex> lk(g_editLogMtx);
+        lines = g_editLog.flush(monoSeconds());
+    }
+    for (const auto& l : lines) std::cout << l << std::endl;
 }
 
 // Aggregated audit of refusals: one line per player per zone per 10 s (zone_guard.h).
@@ -3160,7 +3307,7 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
                                      << "  (chunk slots visited, not the whole world — stage 7.6)\n"
            << "  records emitted : " << g_rgnRecords.load(std::memory_order_relaxed) << "\n"
            << "  bytes out       : " << g_rgnBytesOut.load(std::memory_order_relaxed) << "\n"
-           << "  total time      : " << (us / 1000) << " ms  (scan + sort; encode and"
+           << "  total time      : " << (us / 1000) << " ms  (scan; encode and"
                                         " drain are the writer's)\n"
            << "  mean per region : " << (reqs ? (double)us / reqs / 1000.0 : 0.0) << " ms\n"
            << "world lock held (stage 7.6 — what every other player's ACTION waits on):\n"
@@ -3191,6 +3338,24 @@ static void handleControlLine(const std::string& line, std::string& reply, bool&
                                      << "  (a frame waited for a slot; movement kept flowing)\n"
            << "  budget refusals : " << g_rgnBudgetRefused.load(std::memory_order_relaxed)
                                      << "  (over a client's record budget; included in regions refused)\n";
+        // Stage 12.1. Appended, never reordered.
+        ewb::RegionCache::Stats cs;
+        size_t cacheBytes = 0, cacheEntries = 0;
+        {
+            std::lock_guard<std::mutex> ck(g_regionCacheMtx);
+            cs = g_regionCache.stats();
+            cacheBytes = g_regionCache.bytes();
+            cacheEntries = g_regionCache.entries();
+        }
+        ss << "REGION encoding (stage 12.1):\n"
+           << "  deflate level   : " << g_regionDeflateLevel << "\n"
+           << "  cache size      : " << cacheEntries << " repl(ies), " << cacheBytes << " B of "
+                                     << (g_regionCacheMb << 20) << " B (0 = off)\n"
+           << "  cache hits      : " << cs.hits << "  (" << g_rgnCacheRecords.load(std::memory_order_relaxed)
+                                     << " records sent with no scan and no deflate)\n"
+           << "  cache misses    : " << cs.misses << " new, " << cs.stale << " stale (edited since cached)\n"
+           << "  cache churn     : " << cs.inserts << " stored, " << cs.evictions << " evicted, "
+                                     << cs.oversize << " too big to keep\n";
         reply = ss.str();
         return;
     }
@@ -4691,26 +4856,26 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                             extra = rawExtra;
                             editSuffix   = coords + ":0:" + std::to_string(extra);
                             broadcastMsg = "ACTION:" + who + ":" + editSuffix + "\n";
-                            if(g_verbose) std::cout << "[" << username << "] BUILD at (" << x << "," << y << "," << z << ") type=" << extra << std::endl;
+                            if (g_verbose) logEdit(username, 0, extra, "[" + username + "] BUILD at (" + std::to_string(x) + "," + std::to_string(y) + "," + std::to_string(z) + ") type=" + std::to_string(extra));
                             break;
                         }
                         case 1: { // MINE
                             editSuffix   = coords + ":1";
                             broadcastMsg = "ACTION:" + who + ":" + editSuffix + "\n";
-                            if(g_verbose) std::cout << "[" << username << "] MINE at (" << x << "," << y << "," << z << ")" << std::endl;
+                            if (g_verbose) logEdit(username, 1, 0, "[" + username + "] MINE at (" + std::to_string(x) + "," + std::to_string(y) + "," + std::to_string(z) + ")");
                             break;
                         }
                         case 2: { // BURN
                             editSuffix   = coords + ":2";
                             broadcastMsg = "ACTION:" + who + ":" + editSuffix + "\n";
-                            if(g_verbose) std::cout << "[" << username << "] BURN at (" << x << "," << y << "," << z << ")" << std::endl;
+                            if (g_verbose) logEdit(username, 2, 0, "[" + username + "] BURN at (" + std::to_string(x) + "," + std::to_string(y) + "," + std::to_string(z) + ")");
                             break;
                         }
                         case 3: { // PAINT
                             extra = rawExtra;
                             editSuffix   = coords + ":3:" + std::to_string(extra);
                             broadcastMsg = "ACTION:" + who + ":" + editSuffix + "\n";
-                            if(g_verbose) std::cout << "[" << username << "] PAINT at (" << x << "," << y << "," << z << ") color=" << extra << std::endl;
+                            if (g_verbose) logEdit(username, 3, 0, "[" + username + "] PAINT at (" + std::to_string(x) + "," + std::to_string(y) + "," + std::to_string(z) + ") color=" + std::to_string(extra));
                             break;
                         }
                         default:
@@ -4944,7 +5109,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                 }
 
                 std::string broadcastMsg = "[" + username + " (T" + std::to_string(characterType) + ")] " + msgContent + "\n";
-                std::cout << broadcastMsg;
+                std::cout << broadcastMsg << std::flush;
                 broadcastMessage(broadcastMsg, clientSocket);
             }
             // JOIN:username:characterType[:password[:clientTag]]
@@ -5117,15 +5282,15 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                     if (sp && g_rejoinMode == RejoinMode::Last) {
                         sendLine(clientSocket, spawnLine(sp->x, sp->y, sp->z));
                         std::cout << "[Server] Restored " << username << " to ("
-                                  << sp->x << "," << sp->y << "," << sp->z << ")\n";
+                                  << sp->x << "," << sp->y << "," << sp->z << ")" << std::endl;
                     } else if (sp && g_rejoinMode == RejoinMode::Fixed) {
                         sendLine(clientSocket, spawnLine(g_rejoinFixed.x, g_rejoinFixed.y, g_rejoinFixed.z));
                         std::cout << "[Server] Rejoin " << username << " sent to ("
-                                  << g_rejoinFixed.x << "," << g_rejoinFixed.y << "," << g_rejoinFixed.z << ")\n";
+                                  << g_rejoinFixed.x << "," << g_rejoinFixed.y << "," << g_rejoinFixed.z << ")" << std::endl;
                     } else if (g_haveWorldSpawn) {
                         sendLine(clientSocket, spawnLine(g_worldSpawn.x, g_worldSpawn.y, g_worldSpawn.z));
                         std::cout << "[Server] Spawned " << username << " at world spawn ("
-                                  << g_worldSpawn.x << "," << g_worldSpawn.y << "," << g_worldSpawn.z << ")\n";
+                                  << g_worldSpawn.x << "," << g_worldSpawn.y << "," << g_worldSpawn.z << ")" << std::endl;
                     }
                 }
 
@@ -5135,7 +5300,7 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
                 if (g_legacySnapshot) sendWorldSnapshot(clientSocket);
 
                 std::string joinMsg = "[Server] " + username + " (Type " + std::to_string(characterType) + ") has joined.\n";
-                std::cout << joinMsg;
+                std::cout << joinMsg << std::flush;
                 broadcastMessage(joinMsg, clientSocket);
             }
             // REGION:x:z — the client asks for the world around a point; we answer
@@ -5247,10 +5412,14 @@ void handleClient(SOCKET clientSocket, int clientId, std::string clientIP) {
     // that thinks it still belongs to this player (stage 7.3).
     closeOut(clientSocket);
     close(clientSocket);
+    g_ipConns.release(clientIP);   // stage 12.3: the slot frees only once the fd is gone
 }
 
 int main(int argc, char* argv[]) {
-    std::cout << std::unitbuf;   // auto-flush so logs appear live under systemd/journald
+    // Logs must appear live under systemd/journald, but `unitbuf` flushes on every `<<`,
+    // so one log line was several write()s (journald then sees fragments). Every log
+    // statement ends in std::endl, which flushes: one line, one write (stage 12.2).
+    std::cerr << std::nounitbuf;
     int port = DEFAULT_PORT;
 
     // Args: [port] and/or flags:
@@ -5261,12 +5430,13 @@ int main(int argc, char* argv[]) {
     //   --matchmaker HOST[:PORT]
     //   --region-radius N  --no-region-sort  --no-region-empty-frame
     //   --region-encoders N  (-1 = auto, 0 = unlimited)  --region-record-burst N  --region-record-rate N  (0 = off)
+    //   --region-deflate-level 0..9  (default 1)  --region-cache-mb N  (0 = off)
     //   --action-rate N  --action-burst N   (0 = unlimited)
     //   --burn-max-cells N  (cells one TNT chain may read before it is truncated)
     //   --tnt-radius N  (blast radius in cells; default 5, the game's)
     //   --tnt on|off  --fire on|off  (default on; off refuses TNT / every burn)
     //   --move-rate N  --move-burst N   --chat-rate N  --chat-burst N   (0 = unlimited)
-    //   --legacy-snapshot  --connect-limit N  --tcp-nodelay 0|1  (1 = default, disables Nagle)
+    //   --legacy-snapshot  --connect-limit N  --max-conns-per-ip N  --tcp-nodelay 0|1  (1 = default, disables Nagle)
     //   --auth-fail-limit N  --handshake-timeout N  --idle-timeout-conn N  (0 = off)
     //   --stale-session-secs N  (0 = never evict a same-address duplicate name)
     //   --control-rate N  --control-burst N  --control-max-conns N  --audit-file FILE
@@ -5334,6 +5504,7 @@ int main(int argc, char* argv[]) {
         // bring-up fallback — see sendWorldSnapshot().
         else if (a == "--legacy-snapshot") g_legacySnapshot = true;
         else if (a == "--connect-limit") g_connectLimit = std::atoi(next("10").c_str());
+        else if (a == "--max-conns-per-ip") g_maxConnsPerIp = std::atoi(next("6").c_str());
         else if (a == "--tcp-nodelay") g_tcpNodelay = std::atoi(next("1").c_str()) != 0;
         // Connection-lifecycle hardening (stage 1.10).
         else if (a == "--auth-fail-limit")   g_authFailLimit    = std::atoi(next("5").c_str());
@@ -5384,7 +5555,7 @@ int main(int argc, char* argv[]) {
         // burning someone else's CPU (plan §1.1); leave it alone for normal hosting,
         // since the reference test client's coverage lattice is built around 224.
         else if (a == "--region-radius") g_regionRadius = std::atoi(next("224").c_str());
-        else if (a == "--no-region-sort") g_regionSort = false;
+        else if (a == "--no-region-sort") {}   // no-op since 12.1a: records are emitted in wire order
         // Empty regions are answered with a well-formed `SNAPZ:0:` by default (1.8
         // rung 2/3: the reference test client counts a real frame as "answered" and resets its
         // consecutive-empty abort; with silence it hangs on "waiting for the world
@@ -5402,6 +5573,8 @@ int main(int argc, char* argv[]) {
         else if (a == "--region-encoders")       g_regionEncoders    = std::atoi(next("-1").c_str());
         else if (a == "--region-record-burst")   g_regionRecordBurst = std::atof(next("8000000").c_str());
         else if (a == "--region-record-rate")    g_regionRecordRate  = std::atof(next("1000000").c_str());
+        else if (a == "--region-deflate-level")  g_regionDeflateLevel = std::atoi(next("1").c_str());
+        else if (a == "--region-cache-mb")       g_regionCacheMb     = (size_t)std::max(0LL, std::atoll(next("64").c_str()));
         else if (a == "--client-write-timeout")  g_writeTimeout  = std::atoi(next("60").c_str());
         else if (a == "--action-rate")  SV_ACTION_RATE  = std::atof(next("512").c_str());
         else if (a == "--action-burst") SV_ACTION_BURST = std::atof(next("1024").c_str());
@@ -5527,6 +5700,12 @@ int main(int argc, char* argv[]) {
         std::cerr << "[Server] --region-record-rate must be >= 0; using 1000000." << std::endl;
         g_regionRecordRate = 1000000;
     }
+    if (g_regionDeflateLevel < 0 || g_regionDeflateLevel > 9) {
+        std::cerr << "[Server] --region-deflate-level must be 0..9; using 1." << std::endl;
+        g_regionDeflateLevel = 1;
+    }
+    if (g_regionCacheMb > 1048576) g_regionCacheMb = 1048576;   // 1 TB: keeps << 20 from overflowing
+    g_regionCache.set_max_bytes(g_regionCacheMb << 20);
     {
         std::ostringstream rl;
         rl << "[Server] REGION limits: " << g_regionEncoders << " encoder slot(s)"
@@ -5536,7 +5715,10 @@ int main(int argc, char* argv[]) {
                << "/s per client";
         else
             rl << "off";
-        rl << " (--region-record-burst / --region-record-rate).";
+        rl << " (--region-record-burst / --region-record-rate); deflate level "
+           << g_regionDeflateLevel << " (--region-deflate-level); cache ";
+        if (g_regionCacheMb) rl << g_regionCacheMb << " MB"; else rl << "off";
+        rl << " (--region-cache-mb).";
         std::cout << rl.str() << std::endl;
     }
 
@@ -5584,13 +5766,15 @@ int main(int argc, char* argv[]) {
         const size_t perClient = g_outboxMax + g_worldboxMax + (size_t)g_ctlFillCap * 105u;
         const double outboxGB  = (double)perClient * SV_MAX_CLIENTS / 1073741824.0;
         const double regionGB  = (double)g_regionPending * sizeof(ewb::SnapRec) / 1073741824.0;
-        if (outboxGB + regionGB > 4.0)
+        const double cacheGB   = (double)(g_regionCacheMb << 20) / 1073741824.0;
+        if (outboxGB + regionGB + cacheGB > 4.0)
             std::cerr << "[Server] note: with every one of " << SV_MAX_CLIENTS
                       << " clients stalled at once the output queues could hold up to "
                       << outboxGB << " GB, plus " << regionGB
-                      << " GB of queued REGION records. Lower --client-world-max or"
-                         " --region-pending-records if that is more than this host has."
-                      << std::endl;
+                      << " GB of queued REGION records and " << cacheGB
+                      << " GB of REGION cache. Lower --client-world-max,"
+                         " --region-pending-records or --region-cache-mb if that is more than"
+                         " this host has." << std::endl;
     }
 
     // Control-socket flood guard. A rate of 0 turns the pacing off (an operator
@@ -5706,7 +5890,13 @@ int main(int argc, char* argv[]) {
     }
 
     // Load the saved world model + player positions, and periodically persist them.
-    loadWorld();
+    const bool loadedText = loadWorld();
+    // A text world (pushed or imported) costs ~2.5x the RAM of its EDMB form to parse, on
+    // every restart, until something saves it. Save once now so the next start reads EDMB.
+    if (loadedText && !g_saveText && g_world.size() > 0) {
+        editsDirty = true;
+        saveWorld("startup: text -> EDMB");
+    }
     // A world loaded at (not just over) its cap refuses every new block players
     // place while edits to existing cells still save — the partial, silent loss the
     // first public server shipped with. Say it loudly, with the number to use.
@@ -5767,6 +5957,9 @@ int main(int argc, char* argv[]) {
     if (g_legacySnapshot)
         std::cout << "[Server] --legacy-snapshot: pushing the plaintext ACTION world dump on JOIN."
                   << std::endl;
+    g_ipConns.set_max((size_t)std::max(g_maxConnsPerIp, 0));
+    if (g_maxConnsPerIp <= 0)
+        std::cout << "[Server] --max-conns-per-ip 0: per-IP concurrent cap disabled." << std::endl;
     if (g_connectLimit <= 0)
         std::cout << "[Server] --connect-limit 0: per-IP connect pacing disabled." << std::endl;
     g_authFail.set_threshold((size_t)std::max(g_authFailLimit, 0));
@@ -5880,6 +6073,7 @@ int main(int argc, char* argv[]) {
             savePlayerPos();
             saveSigns();
             if (why != ewb::SaveReason::Autosave) { lk.lock(); continue; }
+            flushEditLog();
             flushZoneAudit();   // denial counts folded into closed windows (stage 8.2)
             // Self-shutdown for on-demand hosted worlds: exit once we've had no
             // clients for --idle-timeout seconds (covers both "nobody ever joined"
@@ -6044,6 +6238,23 @@ int main(int argc, char* argv[]) {
             send(clientSocket, full, strlen(full), 0);
             close(clientSocket);
             std::cerr << "[Server] Rejected " << clientIP << " (server full)." << std::endl;
+            continue;
+        }
+
+        // Per-IP concurrent cap (stage 12.3). Reuses the "Server full" line: it is
+        // already in the client's vocabulary and says nothing exploitable. Acquired
+        // only after every other refusal, so a refused socket never holds a count;
+        // released in handleClient's single exit path.
+        if (!g_ipConns.try_acquire(clientIP)) {
+            const char* full = "[Server] Server full.\n";
+            send(clientSocket, full, strlen(full), 0);   // direct send: see the one above
+            close(clientSocket);
+            const double now = monoSeconds();
+            if (now - lastConnectRefusalLog >= 1.0) {
+                std::cerr << "[Server] Rejected " << clientIP << " (too many connections from this address)."
+                          << std::endl;
+                lastConnectRefusalLog = now;
+            }
             continue;
         }
 

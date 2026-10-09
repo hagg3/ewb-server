@@ -70,10 +70,18 @@ echo "Built ./edenmatch  —  run with: ./edenmatch [--port 27020]"
 echo "Built ./snapz_codec_test  —  SNAPZ raw-DEFLATE/base64 round-trip"
 
 # Offline REGION query checks: reply geometry, Cell -> record table, frame split
-# (ROADMAP-SERVER stage 1.1).
+# (ROADMAP-SERVER stage 1.1), and the store's scan already in wire order (12.1a).
 "$CXX" -std=c++17 -O2 -Wall region_test.cpp -lz -o region_test
 ./region_test
 echo "Built ./region_test  —  REGION box / encoding / framing"
+
+# Offline encoded-region cache checks: the key, column-generation invalidation
+# (inside / on / just outside each box edge, the tile fold), the scan-vs-insert
+# stamp race, LRU by bytes, the oversize rule, and a hit byte-identical to a fresh
+# scan + encode against a real store (ROADMAP-SERVER stage 12.1b).
+"$CXX" -std=c++17 -O2 -Wall region_cache_test.cpp -lz -o region_cache_test
+./region_cache_test
+echo "Built ./region_cache_test  —  REGION cache key / invalidation / LRU / byte-identical hits"
 
 # Offline chunked-world-store checks: the absent / mined / typed invariant and its
 # CELL_MINED sentinel, a differential against the sparse map it replaces (cells and
@@ -99,6 +107,12 @@ echo "Built ./out_queue_test  —  output queue priority / overflow / frame inte
 "$CXX" -std=c++17 -O2 -Wall save_sched_test.cpp -o save_sched_test
 ./save_sched_test
 echo "Built ./save_sched_test  —  autosave / coalesced departure saves"
+
+# Offline --verbose edit-line folding (ROADMAP-SERVER stage 12.2): one line per
+# player per window, grief-relevant edits never folded.
+"$CXX" -std=c++17 -O2 -Wall log_fold_test.cpp -o log_fold_test
+./log_fold_test
+echo "Built ./log_fold_test  —  verbose edit-line folding"
 
 # Offline sign + spawn + MOTD + hardening checks: eden_signs.txt / eden_spawn.txt
 # / eden_motd.txt parsing, SIGNP formatting, username/ACTION validation, token

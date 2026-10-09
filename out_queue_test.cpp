@@ -19,6 +19,10 @@
 //   * drop_lo() releases world state and its accounting but keeps hi
 //   * requeue_front() (stage 12.0b) restores a frame exactly: same records, same
 //     first/last flags, world-state FIFO intact, hi still drained first
+//   * a cache-filled job's tag rides every frame and survives a requeue (12.1b)
+//   * a cached reply (12.1b) drains to exactly its lines, in order, sharing the
+//     reply's storage; it is admitted and counted like a region job, keeps the
+//     world-state FIFO, and its bytes reconstruct a fresh encode of the same job
 
 #include <cstdio>
 #include <cstdlib>
@@ -400,6 +404,84 @@ static void test_requeue_front() {
     }
 }
 
+static void test_cache_tag_rides_frames() {
+    OutQueue q(OutQueue::Limits{1 << 20, 1 << 20, 2});
+    RegionJob j = job_of(6500, 3000);
+    j.cacheable = true;
+    j.cache_tag.key = ewb::RegionCacheKey{10, 20, 30, 40, true};
+    j.cache_tag.stamp = 77;
+    q.push_region(std::move(j));
+    OutItem it;
+    bool allTagged = true;
+    int n = 0;
+    while (q.take(it)) {
+        allTagged = allTagged && it.cacheable && it.cache_tag.stamp == 77 &&
+                    it.cache_tag.key == ewb::RegionCacheKey{10, 20, 30, 40, true};
+        if (++n == 3) break;   // the last frame
+        if (n == 1) {          // hand the first back: the tag must survive
+            CHECK(q.requeue_front(std::move(it)), "requeued");
+            CHECK(q.take(it) && it.cacheable && it.cache_tag.stamp == 77, "tag survives a mid-job requeue");
+        }
+    }
+    CHECK(allTagged && n == 3, "every frame carries the job's cache tag");
+    CHECK(q.requeue_front(std::move(it)) && q.take(it) && it.last && it.cacheable &&
+              it.cache_tag.stamp == 77, "...and the last frame's survives a requeue too");
+    // An untagged job's frames say so.
+    q.push_region(job_of(10, 3000));
+    CHECK(q.take(it) && !it.cacheable, "an untagged job is not cacheable");
+}
+
+static void test_cached_reply_drains() {
+    // Build a cached reply by encoding a job the way the writer does.
+    const size_t N = 7001;
+    RegionJob src = job_of(N, 3000);
+    auto reply = std::make_shared<ewb::CachedRegion>();
+    {
+        OutQueue enc(OutQueue::Limits{1 << 20, 1 << 20, 2});
+        enc.push_region(src);
+        OutItem it;
+        while (enc.take(it)) reply->add(ewb::encode_item(it), it.count);
+    }
+    CHECK(reply->frames.size() == 3 && reply->records == N, "reply built from 3 frames");
+    std::shared_ptr<const ewb::CachedRegion> shared = reply;
+
+    OutQueue q(OutQueue::Limits{1 << 20, 1 << 20, 2});
+    q.push_world("ACTION:before\n");
+    CHECK(q.push_cached_region(shared), "admitted");
+    CHECK(q.region_jobs() == 1, "counted as a region in flight");
+    CHECK(q.lo_bytes() == 14, "not charged against the world-state byte budget (like a job)");
+    q.push_world("ACTION:after\n");
+    OutItem it;
+    CHECK(q.take(it) && it.bytes == "ACTION:before\n", "FIFO: the earlier relay first");
+    std::string wire;
+    size_t recs = 0, firsts = 0, lasts = 0, frames = 0;
+    bool aliased = true;
+    while (q.take(it) && it.kind == OutItem::Kind::CachedFrame) {
+        aliased = aliased && it.shared_bytes.get() == &shared->frames[frames].line;
+        wire += *it.shared_bytes;
+        recs += it.count; firsts += it.first; lasts += it.last; ++frames;
+        q.push_hi("POS:x\n");   // hi still interleaves
+        OutItem h;
+        CHECK(q.take(h) && h.kind == OutItem::Kind::Bytes, "hi drains between cached frames");
+    }
+    CHECK(it.kind == OutItem::Kind::Bytes && it.bytes == "ACTION:after\n", "FIFO: the later relay after");
+    CHECK(frames == 3 && recs == N && firsts == 1 && lasts == 1, "every frame once, first/last flagged");
+    CHECK(aliased, "frames point into the shared reply (no copy)");
+    std::string fresh;
+    for (size_t off = 0; off < N; off += 3000)
+        fresh += ewb::encode_snapz(src.recs->data() + off, std::min<size_t>(3000, N - off));
+    CHECK(wire == fresh, "a cached reply is byte-identical to a fresh encode");
+    CHECK(q.region_jobs() == 0 && q.idle(), "drained");
+
+    // Admission: shares the region-job count with fresh jobs.
+    OutQueue a(OutQueue::Limits{1 << 20, 1 << 20, 2});
+    CHECK(a.push_region(job_of(10)) && a.push_cached_region(shared), "two in flight");
+    CHECK(!a.push_cached_region(shared) && !a.push_region(job_of(10)), "a third of either is refused");
+    a.drop_lo();
+    CHECK(a.idle() && a.region_jobs() == 0, "drop_lo releases a cached reply too");
+    CHECK(a.push_cached_region(nullptr) && a.idle(), "a null reply is nothing to say");
+}
+
 int main() {
     test_priority_and_whole_items();
     test_hi_never_reorders_world_state();
@@ -411,6 +493,8 @@ int main() {
     test_region_interleaves_with_hi();
     test_drop_lo_keeps_hi();
     test_requeue_front();
+    test_cache_tag_rides_frames();
+    test_cached_reply_drains();
     if (g_fail) {
         std::fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;

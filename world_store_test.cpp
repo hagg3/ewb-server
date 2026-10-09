@@ -308,6 +308,24 @@ static void test_edmb_rejections() {
 
 // --- the legacy text reader --------------------------------------------------
 
+// The in-place parser must accept exactly what the stream parser accepts.
+static void test_text_buf_matches_stream() {
+    const std::string text =
+        "100:40:200:5:0\n101:40:200:0:0\r\n 102 : 40:200:255:7\n103:40:200:9\n\n"
+        "garbage\n1:2:3\n104:40:200:11:2:99\n-5:40:200:3:3\n+7:+8:+9:4:4\n"
+        "300:300:300:3:3\n99999999999:1:1:1:1\n::::\n1:2:3:4:5\n"
+        "105:41:200:6:1";   // no trailing newline
+    ewb::WorldStore a, b;
+    std::istringstream in(text);
+    const size_t na = ewb::world_load_text(in, a);
+    const size_t nb = ewb::world_load_text_buf(text.data(), text.size(), b);
+    CHECK(na == nb, "same number of rows stored");
+    CHECK(a.size() == b.size() && a.out_of_range() == b.out_of_range(), "same size and rejects");
+    CHECK(a.to_edmb() == b.to_edmb(), "byte-identical EDMB from both parsers");
+    ewb::WorldStore e;
+    CHECK(ewb::world_load_text_buf("", 0, e) == 0 && e.size() == 0, "empty buffer loads nothing");
+}
+
 static void test_legacy_text() {
     const std::string text =
         "100:40:200:5:0\n"
@@ -457,6 +475,7 @@ int main() {
     test_edmb_round_trip();
     test_edmb_rejections();
     test_legacy_text();
+    test_text_buf_matches_stream();
     test_out_of_world();
     test_shipped_world("testdata/carved_64z.model");
     test_shipped_world("worlds/ari/eden_world.model");

@@ -114,7 +114,7 @@ Unicast to one client:
 | `[Server] Invalid name (<reason>).` | `JOIN` refused; connection closed. |
 | `[Server] Wrong password.` | `JOIN` refused; connection closed. |
 | `[Server] The name <name> is already in use; you are <name>-N.` ⚠️ our wording | Sent right after the welcome line when a duplicate `JOIN` was renamed. See [Duplicate names](#duplicate-names). |
-| `[Server] Server full.` | Refused at accept; connection closed. |
+| `[Server] Server full.` | Refused at accept (all 64 slots used, or `--max-conns-per-ip` reached for this address); connection closed. |
 
 ⚠️ The **peer-relay `ACTION`** shape (`ACTION:<user>:<type>:x:y:z:mode[:extra]`) has not been
 confirmed against two retail clients; it was validated against a second independent client
@@ -397,7 +397,10 @@ region legitimately produces zero records.
   one is short. The split is **not** aligned to world chunks.
 - The payload is **standard-alphabet base64 with no `=` padding** (`A-Za-z0-9+/`).
 - Decoded, it is **raw DEFLATE** — zlib with `windowBits = -15`, no zlib or gzip header and no
-  trailing checksum. This server deflates at level 6.
+  trailing checksum. Any compression level inflates to the same bytes, so the level is the
+  server's choice: this server deflates at level 1 by default (`--region-deflate-level`, 0–9). Level
+  1 takes 4.6–5.5× less CPU than level 6 for 8–17 % more bytes on real worlds. The retail server
+  and the reference implementations use 6.
 - Inflated length is exactly `count * 20`.
 - Each 20-byte record is **five little-endian signed int32**: `x, y, z, flag, type`.
 
@@ -421,12 +424,16 @@ Note that air on the wire is `-1`, never `0` and never `255`. A paint value outs
 with no valid colour describes no edit at all and is omitted entirely.
 
 A client must merge a cell's `flag 0` and `flag 3` records in either order — that part of the
-order is not significant. Sequencing *between* cells is: this server sorts records by chunk
-(`cx, cz, cy` — 16^3 chunks, ascending), then within a chunk by `x, z, y, flag`, before deflating.
+order is not significant. Sequencing *between* cells is: this server sends records by chunk
+(`cx, cz, cy` — 16^3 chunks, ascending), then within a chunk by `x, z, y, flag`.
 That is the retail server's own order, recovered byte-exactly from a capture: it hands the client
 every chunk as one contiguous run. It also compresses ~3.7% better than a flat `(z, x, y, flag)`
 sort, since coordinates within a chunk vary over 16 values instead of the full region span.
-`--no-region-sort` disables sorting entirely (hash-map order) for A/B comparison.
+The world is stored in 16^3 chunks, so the scan reads records in this order and no sort is
+needed. `--no-region-sort` is still accepted and does nothing.
+
+The same box with the same world inside it always produces the **same bytes**. The server uses
+this to keep recent replies (see [Pacing](#pacing)).
 
 An **empty region is answered with `SNAPZ:0:<b64>`** — a well-formed frame decoding to zero
 records. A real frame tells a client "answered, nothing here", where silence leaves it waiting
@@ -457,6 +464,14 @@ limited. The default is sized well above what a join and fast flight over a dens
 for. The refusal is silence, the same as the other refusals. Separately,
 the server compresses at most `--region-encoders` frames at once across all clients. That only
 delays frames and never refuses a request.
+
+A box asked for again with nothing in it changed since it was last sent is **answered from a
+cache** (`--region-cache-mb`) with the bytes it was sent as. A cache hit is byte-identical to a
+fresh reply, so a client cannot tell the difference. Every block edit marks the 16×16 column it
+is in, and a cached reply whose box covers a marked column is never sent again. Joins at a
+shared spawn and players working in one area then cost one compression, not one each. A cached
+reply counts against the record budget and the client's region queue the same way a fresh one
+does.
 
 (Silence is the status quo rather than a decision to keep forever: a new "throttled"
 line the retail client has never been observed receiving is a protocol risk, so it has not been

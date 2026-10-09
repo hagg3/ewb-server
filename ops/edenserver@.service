@@ -90,7 +90,7 @@ EnvironmentFile=-/etc/eden/instances/%i.conf
 # Braced ${VAR} for the always-set keys; bare $EDEN_EXTRA_ARGS for the optional
 # spaceless tail. Edit /etc/eden/instances/%i.conf, not this line. See the conf
 # header and the note block above for why the split matters.
-ExecStart=/usr/local/bin/edenserver --port ${EDEN_PORT} --name ${EDEN_NAME} --world ${EDEN_WORLD_DIR}/eden_world.model --signs ${EDEN_WORLD_DIR}/eden_signs.txt --spawn-file ${EDEN_WORLD_DIR}/eden_spawn.txt --motd-file ${EDEN_WORLD_DIR}/eden_motd.txt --ban-file ${EDEN_WORLD_DIR}/eden_bans.txt --ops-file ${EDEN_WORLD_DIR}/eden_ops.txt --control-socket ${EDEN_WORLD_DIR}/edenserver.sock --max-world-cells ${EDEN_MAX_WORLD_CELLS} $EDEN_EXTRA_ARGS
+ExecStart=/usr/local/bin/edenserver --port ${EDEN_PORT} --name ${EDEN_NAME} --world ${EDEN_WORLD_DIR}/eden_world.model --signs ${EDEN_WORLD_DIR}/eden_signs.txt --spawn-file ${EDEN_WORLD_DIR}/eden_spawn.txt --motd-file ${EDEN_WORLD_DIR}/eden_motd.txt --ban-file ${EDEN_WORLD_DIR}/eden_bans.txt --ops-file ${EDEN_WORLD_DIR}/eden_ops.txt --control-socket ${EDEN_WORLD_DIR}/edenserver.sock --audit-file ${EDEN_WORLD_DIR}/audit.log --max-world-cells ${EDEN_MAX_WORLD_CELLS} $EDEN_EXTRA_ARGS
 
 Restart=on-failure
 RestartSec=2s
@@ -105,6 +105,31 @@ TimeoutStopSec=20
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=edenserver-%i
+
+# --- Multi-world containment (stage 12.2) ---
+# Several worlds share one box, so one world must not starve the others.
+#   CPUWeight   equal share under contention (100 is the default; raise it for a
+#               busier world with a drop-in, see below).
+#   OOMPolicy   if the kernel OOM-kills a process in this unit, stop the unit and
+#               let Restart=on-failure bring it back, instead of limping on.
+#   Log limits  journald's per-service default (10000 lines / 30 s) is tuned for
+#               chatty daemons; this keeps a --verbose flood from dropping the
+#               [Audit] lines around it. The audit channel is also written to
+#               ${EDEN_WORLD_DIR}/audit.log (--audit-file above), which journald
+#               suppression cannot touch.
+CPUWeight=100
+OOMPolicy=stop
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=20000
+# MemoryHigh / MemoryMax are deliberately NOT set here: systemd does not expand
+# ${VAR} from the EnvironmentFile in resource directives, and a hard cap picked
+# without measuring would OOM-kill a live world at its load-time peak. Set them
+# per instance with a drop-in once you have its MemoryPeak (ops/INSTALL.md
+# § Multi-world containment):
+#     systemctl edit edenserver@<name>
+#         [Service]
+#         MemoryHigh=1G
+#         MemoryMax=1500M
 
 # --- Sandboxing (defence in depth; the server is network-facing) ---
 NoNewPrivileges=true

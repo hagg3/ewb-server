@@ -9,6 +9,10 @@
 //   * inflated length == count * 20   (the stage 1.2 exit criterion)
 //   * every 5xLE-i32 record survives byte-for-byte, including negatives (air = -1)
 //   * base64 output carries no '=' padding
+//   * every deflate level 0..9 inflates to the same records (stage 12.1a: the level
+//     is the server's choice), and level 1 is the cheaper, larger one
+//   * SnapzEncoder (one z_stream, deflateReset per frame) is byte-identical to a
+//     fresh encode_snapz at the same level, frame after frame, including empty ones
 //
 // The produced frame is additionally cross-checked against a reference Rust
 // SNAPZ decoder (`decode_frame`) in a companion test client's own test suite
@@ -17,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -141,11 +146,86 @@ static void run_bounded_inflate() {
           "garbage throws");
 }
 
+// Decode a SNAPZ line back to its records.
+static std::vector<SnapRec> decode_line(const std::string& line) {
+    const std::string body = line.substr(0, line.size() - 1);
+    const size_t c1 = body.find(':');
+    const size_t c2 = body.find(':', c1 + 1);
+    const std::vector<uint8_t> z = ewb::b64_decode(body.substr(c2 + 1));
+    std::vector<uint8_t> raw;
+    try { raw = ewb::raw_inflate(z.data(), z.size()); } catch (const std::exception&) { raw.clear(); }
+    std::vector<SnapRec> out;
+    for (size_t i = 0; i + 20 <= raw.size(); i += 20) {
+        const uint8_t* p = raw.data() + i;
+        out.push_back({ewb::get_le_i32(p), ewb::get_le_i32(p + 4), ewb::get_le_i32(p + 8),
+                       ewb::get_le_i32(p + 12), ewb::get_le_i32(p + 16)});
+    }
+    return out;
+}
+
+static bool same_records(const std::vector<SnapRec>& a, const SnapRec* b, size_t n) {
+    if (a.size() != n) return false;
+    for (size_t i = 0; i < n; ++i)
+        if (a[i].x != b[i].x || a[i].y != b[i].y || a[i].z != b[i].z || a[i].flag != b[i].flag ||
+            a[i].type != b[i].type)
+            return false;
+    return true;
+}
+
+// A frame-sized burst shaped like real terrain: chunk-major runs of columns.
+static std::vector<SnapRec> terrain_records(size_t n, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> t(1, 12), skip(0, 9);
+    std::vector<SnapRec> v;
+    int x = 65536, z = 65536, y = 0;
+    while (v.size() < n) {
+        if (skip(rng) == 0) v.push_back({x, y, z, 1, -1});
+        else v.push_back({x, y, z, 0, t(rng)});
+        if (skip(rng) == 0 && v.size() < n) v.push_back({x, y, z, 3, skip(rng)});
+        if (++y == 40) { y = 0; if (++z % 16 == 0) { z -= 16; ++x; } }
+    }
+    v.resize(n);
+    return v;
+}
+
+static void run_levels_and_reuse() {
+    const std::vector<SnapRec> recs = terrain_records(3000, 7);
+    size_t size1 = 0, size6 = 0;
+    for (int level = 0; level <= 9; ++level) {
+        const std::string line = ewb::encode_snapz(recs, level);
+        CHECK(same_records(decode_line(line), recs.data(), recs.size()),
+              "every level inflates to the same records");
+        if (level == 1) size1 = line.size();
+        if (level == 6) size6 = line.size();
+    }
+    CHECK(ewb::encode_snapz(recs) == ewb::encode_snapz(recs, 6), "the default level is still 6");
+    CHECK(size1 >= size6, "level 1 is not smaller than level 6 (it trades bytes for CPU)");
+    std::printf("  3000-record frame: level 1 %zu B, level 6 %zu B (+%.1f%%)\n", size1, size6,
+                100.0 * ((double)size1 - (double)size6) / (double)size6);
+
+    // One encoder, many frames of varying size: byte-identical to fresh encodes.
+    for (int level : {1, 6, 9}) {
+        ewb::SnapzEncoder enc(level);
+        CHECK(enc.level() == level, "encoder keeps its level");
+        bool same = true;
+        for (unsigned f = 0; f < 40; ++f) {
+            const std::vector<SnapRec> v = terrain_records(f % 7 == 0 ? 0 : 1 + (f * 977) % 3000, f);
+            const std::string reused = enc.encode(v.data(), v.size());
+            same = same && reused == ewb::encode_snapz(v.data(), v.size(), level);
+        }
+        CHECK(same, "a reused z_stream is byte-identical to a fresh one, frame after frame");
+        CHECK(enc.encode(nullptr, 0) == ewb::encode_snapz(nullptr, 0, level), "and so is SNAPZ:0:");
+    }
+    CHECK(ewb::deflate_level_clamp(-3) == 0 && ewb::deflate_level_clamp(12) == 9 &&
+              ewb::deflate_level_clamp(4) == 4, "levels clamp into 0..9");
+}
+
 int main(int argc, char** argv) {
     const bool emit = argc > 1 && std::strcmp(argv[1], "--emit") == 0;
     run_round_trip(emit);
     if (!emit) run_empty();
     if (!emit) run_bounded_inflate();
+    if (!emit) run_levels_and_reuse();
     if (g_fail) {
         std::fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;

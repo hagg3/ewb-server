@@ -249,7 +249,7 @@ Each client has two queues ([out_queue.h](../out_queue.h) has the full rationale
   past its budget is refused and re-asked, and a broadcast relay past `--client-world-max`
   disconnects that client, which resyncs properly on rejoin.
 
-A `REGION` reply is queued as a **job** — the scanned, sorted record vector plus a cursor — and
+A `REGION` reply is queued as a **job** — the scanned record vector plus a cursor — and
 the writer encodes one frame per turn. The client's own thread therefore returns as soon as the
 scan is done, deflate runs off it, and the memory an in-flight region costs stays the record
 vector instead of gaining up to ~17 MB of encoded base64 on top. `--region-pending-records`
@@ -264,10 +264,34 @@ and goes round again. Because `take()` serves the latency-sensitive queue first,
 movement and chat keep draining while the frame waits. Before the cap, one client re-asking for a
 dense box every 760 ms kept a core busy, and four kept four busy. The per-connection **record
 budget** (`--region-record-burst` / `--region-record-rate`) is charged in `serveRegion()` after
-the scan and before the sort. A request over it is refused like any other `REGION` refusal.
+the scan and before anything is queued. A request over it is refused like any other `REGION`
+refusal.
 
-The split also separates two numbers that used to be one: the `REGION` log line reports scan and
-sort from the client's thread, and the writer reports encode and drain when the burst completes.
+**Encoding.** Each writer keeps one deflate stream (`SnapzEncoder`, made on its first frame) and
+resets it between frames instead of creating and destroying one per frame. A dense box is
+hundreds of frames. The level is `--region-deflate-level`, 1 by default. There is no sort: the
+store's box scan already visits chunks in `(cx, cz, cy)` order and cells within a chunk in
+`x, z, y` order, which is the wire order. `region_test` holds the scan equal to `sort_records`.
+
+**Region cache** (`region_cache.h`). A finished reply is kept as the `SNAPZ` lines it was sent
+as, keyed by its box, in an LRU bounded by `--region-cache-mb`. A miss is scanned as usual, and
+the job carries a tag (the key, and the edit generation at scan time). Its writer collects each
+encoded line as it is sent and files the reply after the last frame. On a hit, `serveRegion()`
+queues the shared reply as a *cached* slot. The writer hands it out one frame per turn like a
+job's frames, with no encoder slot and no copy. Hits and fresh jobs share the client's
+`--client-region-queue` count.
+
+Invalidation is exact. `worldSet()`, the only live writer of the world, bumps a counter and stamps
+it on the edited 16×16 column (`ColumnGens`, a fixed 256×256 table the world folds onto, under
+`g_worldMtx`). A lookup, also under `g_worldMtx`, serves an entry only if no column its box covers
+is newer than the entry's stamp. A stale entry is dropped there. The writer files its reply with
+no world lock, so an edit can land between the scan and the filing. That entry is filed but
+fails its first lookup, so it is never sent. Columns 4096 blocks apart share a table slot: an
+edit there causes a spurious miss, never a stale hit.
+
+The split also separates two numbers that used to be one: the `REGION` log line reports the scan
+from the client's thread (or `from cache` for a hit), and the writer reports encode and drain
+when the burst completes (`(from cache)` on a hit's `REGION drain` line).
 Before, `encode N ms` silently spanned encode *and* send, so an operator could not see
 backpressure as backpressure.
 
@@ -277,7 +301,8 @@ backpressure as backpressure.
 |---|---|
 | `clientsMutex` | the socket list and `playerInfoMap` |
 | `g_zonesMtx` | the pointer to the current protected-zone set, and nothing else. Taken and **released** before `g_worldMtx`: an edit copies the (immutable) set's `shared_ptr` out, then locks the world, and reads the zones with no lock held. Never held across any other lock |
-| `g_worldMtx` | the world cell map |
+| `g_worldMtx` | the world cell map, and the region cache's column generations (`g_colGens`) |
+| `g_regionCacheMtx` | the region cache. Taken inside `g_worldMtx` (a lookup) or with no lock held (a writer filing a reply, `region-stats`). Takes no other lock |
 | `g_posMtx` | saved player positions |
 | `g_signMtx` | the sign list, the pre-formatted `SIGNP` burst, the index of signed blocks and the queue of sign-removal audit lines. Taken after `g_worldMtx` when an edit turns a signed block to air, so nothing holding it may take `g_worldMtx` |
 | `g_signSaveMtx` | spans `saveSigns()`' snapshot and write, so of two racing sign saves the newer list is the one left on disk. Taken before `g_signMtx`, never after it |
@@ -319,8 +344,8 @@ Both tiers emit through the same `emitEditWire()`, so there is one `ACTION:serve
 right rather than two that can drift.
 
 **The world lock is held for the scan only.** Answering a `REGION` copies matching records into
-a local vector under `g_worldMtx`, then releases it — sorting happens unlocked, and encoding and
-sending happen later, on the client's writer thread. Holding the world lock across a
+a local vector under `g_worldMtx`, then releases it. Encoding and sending happen later, on the
+client's writer thread. A cache hit holds the lock for the lookup only. Holding the world lock across a
 multi-hundred-millisecond region reply would queue every other player's edits behind one
 player's walk.
 

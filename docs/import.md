@@ -154,6 +154,17 @@ For scale, on a lightly-built 39-chunk world: `diff` â‰ˆ 3,500 cells, `solid` â‰
 
 ---
 
+## Memory
+
+`eden_import` holds the input and the projected world at once, so it peaks at about **twice the
+size of the `.eden`** (a 1 GB file needs ~1.8 GB of RAM). On a small host that is also serving a
+world, import on a larger machine and copy the resulting world directory over.
+
+The server reads the text form it writes without copying it, and rewrites the world as `EDMB` once
+at startup, so a freshly imported world pays the text-parse memory cost on its first start only.
+
+---
+
 ## The two budget numbers
 
 `eden_import` prints two projections before it writes anything, and refuses rather than write a

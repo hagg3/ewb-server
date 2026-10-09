@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Live socket test for ROADMAP-SERVER stage 12.0 (the perf hotfix): coalesced
 departure saves (12.0a) and the REGION encoder cap + per-connection record budget
-(12.0b).
+(12.0b); and stage 12.1: deflate level 1 (12.1a) and the encoded-region cache
+(12.1b).
 
     ./build_server.sh && python3 phase12_live_test.py [path/to/edenserver]
 
-`save_sched_test`, `out_queue_test` and `protocol_test` prove the policies. This
-proves the server runs them over real sockets.
+`save_sched_test`, `out_queue_test`, `protocol_test`, `region_test` and
+`region_cache_test` prove the policies. This proves the server runs them over
+real sockets.
 
 Covers:
   1  12.0a — one player builds while 20 bare TCP connect/close (no JOIN) arrive in
@@ -23,10 +25,16 @@ Covers:
          joining mid-flood gets its whole burst.
   5  12.0b — over the record budget a REGION is refused with silence, logged once,
          and the client stays connected and is served again once the budget refills.
+  6  12.1b — a second client asking for the same box is answered from the cache
+         with the same bytes; an ACTION in the box makes the next answer fresh, and
+         it carries the edit; the one after that is cached again. Eight joiners at
+         one spawn cost one encode.
+  7  12.1a — the same box served at --region-deflate-level 1 (the default) and 6
+         decodes to the same records in the same order; level 1 is the larger wire.
 
-The whole pass is ~1 min.
+The whole pass is ~1.5 min.
 """
-import os, re, shutil, socket, subprocess, sys, tempfile, threading, time
+import base64, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -253,7 +261,9 @@ def group4_flood():
     print("\n[4] 12.0b — four clients flood a dense box with --region-encoders 1")
     d = fresh_world(dense=True)
     ctl = os.path.join(d, "ctl.sock")
-    srv = Server(d, "--region-encoders", "1", ctl=ctl)
+    # The cache off: with it, a flooder's repeats are hits and never reach an
+    # encoder, which is 12.1b's point but not what this group measures.
+    srv = Server(d, "--region-encoders", "1", "--region-cache-mb", "0", ctl=ctl)
     try:
         flooders = [join("flood%d" % i) for i in range(4)]
         readers = [Reader(s) for s in flooders]
@@ -373,6 +383,142 @@ def group5_budget():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# --- helpers for 12.1 ------------------------------------------------------------
+
+def snapz_lines(buf):
+    """Every complete SNAPZ line a client received, as bytes."""
+    return [l for l in bytes(buf).split(b"\n")[:-1] if l.startswith(b"SNAPZ:")]
+
+
+def decode_records(lines):
+    """The concatenated raw 20-byte records of some SNAPZ lines."""
+    out = bytearray()
+    for l in lines:
+        b64 = l.split(b":", 2)[2]
+        z = base64.b64decode(b64 + b"=" * (-len(b64) % 4))
+        out += zlib.decompress(z, -15)
+    return bytes(out)
+
+
+def has_record(raw, x, y, z, flag, type_):
+    import struct
+    want = struct.pack("<5i", x, y, z, flag, type_)
+    return any(raw[i:i + 20] == want for i in range(0, len(raw), 20))
+
+
+def wait_records(reader, n, timeout=30.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if len(decode_records(snapz_lines(reader.buf))) >= n * 20:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+# --- group 6: the encoded-region cache ------------------------------------------
+
+def group6_cache():
+    print("\n[6] 12.1b — the same box twice: cached, same bytes; an edit makes it fresh")
+    d = fresh_world(dense=True)
+    ctl = os.path.join(d, "ctl.sock")
+    srv = Server(d, ctl=ctl)
+    try:
+        a = join("cacheA")
+        ra = Reader(a)
+        m = srv.mark()
+        a.sendall(b"REGION:65500:65500\n")
+        check(wait_records(ra, DENSE_RECORDS), "first request: the whole burst arrived")
+        log = srv.since(m, settle=0.5)
+        check(any("frame(s) queued" in l and "from cache" not in l for l in log), "...as a fresh scan")
+
+        b = join("cacheB")
+        rb = Reader(b)
+        m = srv.mark()
+        b.sendall(b"REGION:65500:65500\n")
+        check(wait_records(rb, DENSE_RECORDS), "second client, same box: the whole burst arrived")
+        log = srv.since(m, settle=0.5)
+        check(any("from cache ->" in l for l in log), "...answered from the cache")
+        check(snapz_lines(rb.buf) == snapz_lines(ra.buf), "...byte-identical to the fresh reply")
+
+        # An edit inside the box, then B asks again: fresh, and it has the edit.
+        a.sendall(b"ACTION:65500:50:65500:0:9\n")
+        time.sleep(1.0)                          # also clears B's 750 ms request gap
+        n0 = len(snapz_lines(rb.buf))
+        m = srv.mark()
+        b.sendall(b"REGION:65500:65500\n")
+        check(wait_records(rb, 2 * DENSE_RECORDS + 1), "after an edit in the box: the whole burst again")
+        log = srv.since(m, settle=0.5)
+        check(any("frame(s) queued" in l and "from cache" not in l for l in log), "...as a fresh scan")
+        second = decode_records(snapz_lines(rb.buf)[n0:])
+        check(has_record(second, 65500, 50, 65500, 0, 9), "...carrying the edit")
+
+        # And the re-filed reply serves the next asker.
+        c = join("cacheC")
+        rc = Reader(c)
+        m = srv.mark()
+        c.sendall(b"REGION:65500:65500\n")
+        check(wait_records(rc, DENSE_RECORDS + 1), "a third client: the whole burst")
+        log = srv.since(m, settle=0.5)
+        check(any("from cache ->" in l for l in log), "...from the re-filed cache entry")
+        check(snapz_lines(rc.buf) == snapz_lines(rb.buf)[n0:], "...the same bytes B got fresh")
+
+        # Eight joiners at one spawn: one more encode at most, the rest hits.
+        joiners = [join("spawn%d" % i) for i in range(8)]
+        jr = [Reader(s) for s in joiners]
+        m = srv.mark()
+        for s in joiners:
+            s.sendall(b"REGION:65500:65500\n")
+        check(all(wait_records(r, DENSE_RECORDS + 1) for r in jr), "eight joiners each got the whole burst")
+        log = srv.since(m, settle=0.5)
+        hits = sum(1 for l in log if "from cache ->" in l)
+        print("       8 joiners: %d from cache" % hits)
+        check(hits == 8, "all eight answered from the cache (no encode)")
+        stats = ctl_cmd(ctl, "region-stats")
+        hm = re.search(r"cache hits\s*:\s*(\d+)", stats)
+        print("       region-stats: cache hits %s" % (hm.group(1) if hm else "?"))
+        check(hm is not None and int(hm.group(1)) >= 10, "region-stats counts the hits")
+
+        for r in [ra, rb, rc] + jr:
+            r.stop.set()
+        for s in [a, b, c] + joiners:
+            s.close()
+        check(srv.alive(), "server alive")
+    finally:
+        srv.stop()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# --- group 7: deflate level ---------------------------------------------------------
+
+def group7_level():
+    print("\n[7] 12.1a — level 1 and level 6 decode to the same records")
+    d = fresh_world(dense=True)
+    got = {}
+    try:
+        for level in ("1", "6"):
+            srv = Server(d, "--region-deflate-level", level)
+            try:
+                start = "\n".join(srv.since(0, settle=0))
+                check(("deflate level %s" % level) in start, "startup line says level %s" % level)
+                c = join("level%s" % level)
+                r = Reader(c)
+                c.sendall(b"REGION:65500:65500\n")
+                check(wait_records(r, DENSE_RECORDS), "level %s: the whole burst" % level)
+                lines = snapz_lines(r.buf)
+                got[level] = (decode_records(lines), sum(len(l) + 1 for l in lines), len(lines))
+                r.stop.set()
+                c.close()
+            finally:
+                srv.stop()
+        (r1, b1, f1), (r6, b6, f6) = got["1"], got["6"]
+        print("       level 1: %d B in %d frames; level 6: %d B in %d frames" % (b1, f1, b6, f6))
+        check(r1 == r6, "same records, same order")
+        check(f1 == f6, "same frame split")
+        check(b1 >= b6, "level 1 is the larger wire")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     if not os.path.exists(SERVER):
         print("no %s — run ./build_server.sh first" % SERVER)
@@ -382,6 +528,8 @@ def main():
     group3_kill_after_leave()
     group4_flood()
     group5_budget()
+    group6_cache()
+    group7_level()
     print()
     if fails:
         print("phase12_live_test: %d check(s) FAILED" % len(fails))

@@ -169,6 +169,15 @@ the flag is what it starts with.
 | `--verbose` | off | Log every terrain edit, every throttled or rejected request, and the first sighting of each unrecognised verb (capped at 256 distinct verbs). Chatty on a busy server. |
 | `--audit-file FILE` | none | Keep a second copy of the audit channel in `FILE`, appended to. stdout always gets it; this survives independently of the journal. |
 
+Each log line is written with a single `write()` (the server flushes at the end of a line rather
+than after every piece of it), so journald sees whole lines.
+
+With `--verbose`, a player's edits are folded: the first edit in each second is logged as
+`[name] BUILD at (x,y,z) type=N` (or `MINE`, `PAINT`), and the rest of that second become one
+`[name] N more edit(s) in the last window (last: MINE at (x,y,z))` line. Never folded, so
+`scripts/grief.sh`-style review sees all of them: every `BURN`, and a `BUILD` of TNT (9, 87),
+lava (23, 62–64, 108) or fireworks (65, 109).
+
 One line per served `REGION` is logged regardless of `--verbose` (cells scanned, records,
 frames, wire bytes, compression ratio, scan and encode milliseconds) — it is the measurement
 that tells you whether region serving is keeping up.
@@ -228,6 +237,7 @@ keeping a copy that outlives `journalctl --vacuum`.
 | `--burn-max-cells N` | `1048576` | Cells one TNT/expansion chain from a single `ACTION:...:2` may read before it is cut short. This is a **world-lock** budget, not a world-size one: `simAction()` holds the world lock for the whole chain, so it is the one thing one packet can make every other player wait for. The default is ~1 750 blasts at the default radius (~1 M cell reads, measured ~7 ms; the 4 096-blast bound it replaced was ~23 ms) and finishes a solid 5×5×5 block of TNT. Values below one blast (595 cells at radius 5; it follows `--tnt-radius`) are raised to it. Raise it if players report TNT surviving a big detonation and reappearing on rejoin; see [protocol.md](protocol.md). Expansion blocks set off by the chain (or lit directly) spend what is left of it, one ~850-cell fill at a time. It also bounds the dry run behind a refused burn (`--tnt off` / `--fire off`). |
 | `--tnt-radius N` | `5` | Blast radius, in cells, of a TNT burn (a firework takes only its own cell) (`1..16`; out of range falls back to `5` with a warning, a non-default value is logged at startup). `5` is the game's own `EXPLOSION_RADIUS`; the server used to copy an older public server's `6`, which dug a bigger crater than the client drew, visible on rejoin. If your players' clients run a different radius, match it here. The per-blast read cost, the `--burn-max-cells` blast count, the zone-reach box and the zone-restore footprint all follow it. |
 | `--connect-limit N` | `10` | New connections allowed per source IP per 10 s window. `0` disables. ⚠️ It is per *source address*, so a whole LAN behind one NAT address shares the allowance — as does a test harness on loopback. |
+| `--max-conns-per-ip N` | `6` | Concurrent connections allowed per source IP; the next gets `[Server] Server full.` and is closed. `0` disables. Stops a few addresses parking pre-`JOIN` sockets in all 64 slots. ⚠️ Per source address like `--connect-limit`: a LAN behind one NAT shares it, so raise it for a big shared network. |
 | `--auth-fail-limit N` | `5` | Wrong-password `JOIN` attempts allowed per source IP inside a 60 s window before that IP is locked out at `accept()`. The same count, in a separate table, applies to wrong `/login` PINs (that lockout refuses `/login` only, never the connection). The lockout starts at 60 s and **doubles** on every further failure, up to 1 h; an IP that stops guessing for an hour has its escalation reset. `0` disables. Per-IP only — a distributed guesser is not stopped by this (see below). |
 
 The defaults accommodate bulk editing by a scripted client draining a queue at several hundred
@@ -284,15 +294,25 @@ re-ask for disconnects it, which resyncs properly on rejoin.
 | `--region-encoders N` | half the CPU cores, at least 1 | `SNAPZ` frames being compressed at once, across **all** clients. This bounds the CPU that region replies can take, however many players ask at once. A frame that has to wait does not hold up that client's movement and chat lines, which keep arriving. `0` = unlimited (the behaviour before this flag); a negative value means the default. The value in use is logged at startup. |
 | `--region-record-burst N` | `8000000` | Records of `REGION` replies one client may receive at once, before the rate below applies. The default covers a join plus several dense hops. A single reply bigger than the burst is still sent once the client's budget is full, and is then repaid at the rate. `0` turns the budget off. |
 | `--region-record-rate N` | `1000000` | Records per second that a client's budget refills at. A client asking for more is refused the same way as a full queue: no reply, and the client asks again when it next moves. A refusal is logged at most once per 30 s per client (`over this client's record budget`). `0` turns the budget off. |
+| `--region-deflate-level N` | `1` | Compression level for `SNAPZ` frames, `0`–`9`. Every level decodes to the same records, so clients see no difference. Level 1 costs 4.6–5.5× less CPU than level 6 for 8–17 % more bytes; `6` is what the retail server uses. Out-of-range values fall back to 1 with a warning. Logged at startup. |
+| `--region-cache-mb N` | `64` | Megabytes of recently sent `REGION` replies kept, already compressed, so a repeated box (joins at one spawn, players in one area, travel back and forth) is answered with no scan and no compression. A block edit makes every cached reply whose box covers it stale, so a stale reply is never sent. Least recently used replies are dropped first. A reply bigger than a quarter of this is never kept. `0` turns the cache off. Logged at startup. |
 | `--client-write-timeout N` | `60` | Seconds a client's writer may make **no** progress at all before the connection is closed. `0` waits forever (not recommended: a peer that vanishes without a FIN parks a thread on TCP retransmit timeouts). |
 
-The server prints a startup note if the all-clients-stalled worst case for these settings would
-exceed ~4 GB, which only happens if you have raised one of them. `region-stats` reports refusals,
-records currently queued, and clients dropped for falling behind. It also reports the encoder
-slots, how often a frame waited for one, and how many requests the record budget refused.
+The server prints a startup note if the all-clients-stalled worst case for these settings
+(including the region cache) would exceed ~4 GB, which only happens if you have raised one of
+them. `region-stats` reports refusals, records currently queued, and clients dropped for falling
+behind. It also reports the encoder slots, how often a frame waited for one, and how many
+requests the record budget refused. Last come the deflate level and the cache: replies held,
+hits, misses (new or stale), and replies stored, evicted or too big to keep.
 
-⚠️ The server ignores flags it does not recognise. If you add `--region-encoders` or the
-record-budget flags to a service's arguments, deploy the binary that knows them first.
+The cache's memory is on top of everything else here: plan for `--region-cache-mb` of RAM per
+running world. While a reply is being sent for the first time, its compressed lines are also
+held by that client's writer so they can be cached. That is at most a quarter of
+`--region-cache-mb` per client, and only for replies that small.
+
+⚠️ The server ignores flags it does not recognise. If you add `--region-encoders`, the
+record-budget flags, `--region-deflate-level` or `--region-cache-mb` to a service's arguments,
+deploy the binary that knows them first.
 
 ### Region tuning
 
@@ -301,7 +321,7 @@ These exist for protocol experimentation. Leave them alone for normal hosting.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--region-radius N` | `224` | Blocks a `REGION` reply covers around the request point. Clamped to `16..4096`; out-of-range values fall back to 224 with a warning. A non-default value is logged at startup, because client-side coverage patterns assume 224. |
-| `--no-region-sort` | sorting on | Skip sorting records before deflate. Sorting costs a little CPU and buys a materially better compression ratio. |
+| `--no-region-sort` | — | Accepted and does nothing. Records are read from the world already in wire order, so there is no sort to skip. |
 | `--no-region-empty-frame` | frame on | Answer an empty region with silence instead of `SNAPZ:0:`. For A/B comparison against the retail server only; silence can leave a client waiting forever. |
 | `--region-empty-frame` | — | Accepted and does nothing; the behaviour it names is now the default. |
 
@@ -319,6 +339,7 @@ in `server_posix.cpp` (and its headers) if you must.
 | Limit | Value |
 |---|---|
 | Max concurrent clients | 64 (further connections get `[Server] Server full.`) |
+| Max concurrent clients per IP | 6 by default (`--max-conns-per-ip`; same refusal line) |
 | Max bytes buffered without a newline | 8192 |
 | Max chat message length | 256 bytes |
 | Max username length | 20 bytes |
@@ -387,6 +408,16 @@ expand to empty and the server exits with a flag error in the journal, so create
 | `EDEN_MAX_WORLD_CELLS` | `--max-world-cells ${EDEN_MAX_WORLD_CELLS}` | `4000000` | `--max-world-cells` |
 | `EDEN_PASSWORD` | *(none — read by the server from its environment)* | *(empty)* | the world password; empty is an open server. Not on the command line, so `ps` does not show it |
 | `EDEN_EXTRA_ARGS` | a bare `$EDEN_EXTRA_ARGS` tail | *(absent)* | any spaceless optional flags: `--matchmaker HOST:PORT`, `--spawn x:y:z`, `--audit-file PATH`, `--default-level N`, … |
+
+### Multi-world resource limits
+
+The `edenserver@.service` template sets `CPUWeight=100`, `OOMPolicy=stop`, a journald rate limit
+(`LogRateLimitIntervalSec=30s`, `LogRateLimitBurst=20000`) and passes
+`--audit-file ${EDEN_WORLD_DIR}/audit.log`. It sets no `MemoryHigh=` / `MemoryMax=`: systemd does
+not expand `EnvironmentFile` variables in resource directives, so those are per-instance drop-ins
+sized from the instance's measured `MemoryPeak`. The procedure and a sizing table for
+`--client-world-max`, `--region-pending-records` and `--region-cache-mb` are in
+[ops/INSTALL.md § Multi-world containment and logging](../ops/INSTALL.md).
 
 ### The `${VAR}` vs `$VAR` rule
 
@@ -607,8 +638,9 @@ ever needs a migration step:
 | `EDMB` (binary, 16³ chunks) | the server's save, since stage 7.6 | the server |
 | text, one cell per line | [`eden_import`](import.md); the server with `--world-format text`; every build before 7.6 | the server |
 
-A world loaded from text is written back as `EDMB` on the first save unless `--world-format text`
-is given. Convert deliberately by starting the server on the world and asking the control socket
+A world loaded from text is written back as `EDMB` once, at startup, right after the load (unless
+`--world-format text` is given), so a pushed or imported world pays the text parse only on its first
+start; the text form needs roughly 2.5x the RAM of its `EDMB` form while it loads. Convert deliberately by starting the server on the world and asking the control socket
 to `save`.
 
 ⚠️ `wc -l eden_world.model` is the cell count **only for a text world**. For an `EDMB` world use

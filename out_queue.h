@@ -36,11 +36,13 @@
 // multi-megabyte region burst costs nothing and is what keeps other players
 // moving while one of them downloads terrain.
 //
-// Region replies sit in `lo` as *jobs* — the scanned, sorted record vector plus a
-// cursor — and are encoded one frame at a time by the writer. That keeps the
+// Region replies sit in `lo` as *jobs* — the scanned record vector (in wire order
+// since 12.1a) plus a cursor — and are encoded one frame at a time by the writer. That keeps the
 // memory cost of an in-flight region at what it already was (the record vector)
 // instead of adding a queue of encoded base64 on top, and it moves deflate off
-// the client's own thread.
+// the client's own thread. A reply answered from the encoded-region cache (stage
+// 12.1b, `region_cache.h`) sits in `lo` as a *cached* slot instead: the shared,
+// already-encoded lines plus a cursor, handed out one frame per turn the same way.
 //
 // ## Overflow
 //
@@ -68,13 +70,14 @@
 #include <utility>
 #include <vector>
 
+#include "region_cache.h"   // CachedRegion, RegionCacheTag
 #include "region_query.h"   // SnapRec, SNAPZ_FRAME_RECORDS, encode_snapz
 
 namespace ewb {
 
 // --- region jobs -------------------------------------------------------------
 
-/// A `REGION` reply that has been scanned and sorted but not yet encoded.
+/// A `REGION` reply that has been scanned but not yet encoded.
 ///
 /// `recs` is shared rather than owned so the client thread can hand it off and
 /// return; the server gives it a deleter that maintains the global pending-record
@@ -86,6 +89,10 @@ struct RegionJob {
     /// Emit one `SNAPZ:0:` frame when `recs` is empty. An unbuilt region is
     /// answered with a real frame by default — see serveRegion()'s note.
     bool   empty_frame   = false;
+    /// File the encoded reply in the region cache once its last frame is sent
+    /// (stage 12.1b). Travels with every frame, so the writer knows where it goes.
+    bool           cacheable = false;
+    RegionCacheTag cache_tag;
 
     size_t total()     const { return recs ? recs->size() : 0; }
     size_t remaining() const { return total() - cursor; }
@@ -95,8 +102,10 @@ struct RegionJob {
 
 /// One unit of work. Either bytes that are already formatted (`Bytes`), a
 /// **shared** formatted blob one broadcast handed to several clients (`SharedBytes`
-/// — see `push_world`'s `shared_ptr` overload, stage 7.13), or a slice of a region
-/// job the writer still has to deflate (`Frame`). `Frame` is deliberately not a
+/// — see `push_world`'s `shared_ptr` overload, stage 7.13), a slice of a region
+/// job the writer still has to deflate (`Frame`), or one already-encoded frame of
+/// a reply answered from the region cache (`CachedFrame`, stage 12.1b: written
+/// like `SharedBytes`, accounted like `Frame`). `Frame` is deliberately not a
 /// `std::string`: encoding a frame costs milliseconds and must happen *outside*
 /// the client's queue lock. `SharedBytes` is the same idea applied to a broadcast
 /// blob: a `//set` burst is megabytes, and copying it once per target client in
@@ -104,23 +113,25 @@ struct RegionJob {
 /// client's own writer thread touch it once, when it is actually ready to send)
 /// was stage 7.13's finding.
 struct OutItem {
-    enum class Kind { None, Bytes, SharedBytes, Frame };
+    enum class Kind { None, Bytes, SharedBytes, Frame, CachedFrame };
 
     Kind kind = Kind::None;
 
     std::string bytes;                                  ///< Kind::Bytes — write as-is
-    std::shared_ptr<const std::string> shared_bytes;    ///< Kind::SharedBytes — write *shared_bytes
+    std::shared_ptr<const std::string> shared_bytes;    ///< Kind::SharedBytes / CachedFrame — write *shared_bytes
 
     std::shared_ptr<const std::vector<SnapRec>> recs;   ///< Kind::Frame — encode [off, off+count)
     size_t off   = 0;
-    size_t count = 0;
+    size_t count = 0;       ///< records in this frame (Frame and CachedFrame)
     bool   first = false;   ///< first frame of its job (start the drain timer)
     bool   last  = false;   ///< last frame of its job (log the completed reply)
+    bool           cacheable = false;   ///< Kind::Frame — the job's `cacheable`
+    RegionCacheTag cache_tag;           ///< ...and where its reply is filed
 
     bool empty() const { return kind == Kind::None; }
     void reset() {
         kind = Kind::None; bytes.clear(); shared_bytes.reset(); recs.reset();
-        off = count = 0; first = last = false;
+        off = count = 0; first = last = false; cacheable = false; cache_tag = RegionCacheTag{};
     }
 };
 
@@ -130,6 +141,13 @@ inline std::string encode_item(const OutItem& it) {
     if (it.kind != OutItem::Kind::Frame) return std::string();
     if (!it.recs || it.count == 0) return encode_snapz(nullptr, 0);   // the `SNAPZ:0:` answer
     return encode_snapz(it.recs->data() + it.off, it.count);
+}
+
+/// The same, through a writer's reusable encoder (its level, its z_stream).
+inline std::string encode_item(const OutItem& it, SnapzEncoder& enc) {
+    if (it.kind != OutItem::Kind::Frame) return std::string();
+    if (!it.recs || it.count == 0) return enc.encode(nullptr, 0);
+    return enc.encode(it.recs->data() + it.off, it.count);
 }
 
 // --- the queue ---------------------------------------------------------------
@@ -259,6 +277,19 @@ public:
         return true;
     }
 
+    /// Queue a `REGION` reply answered from the region cache (stage 12.1b). Same
+    /// admission as `push_region` — it is a region in flight, counted against
+    /// `max_region_jobs` and not against `lo_max_bytes` — so a hit and a miss are
+    /// refused in exactly the same circumstances.
+    bool push_cached_region(std::shared_ptr<const CachedRegion> reply) {
+        if (region_jobs_ >= lim_.max_region_jobs) return false;
+        if (!reply || reply->frames.empty()) return true;   // nothing to say
+        ++region_jobs_;
+        Slot s; s.kind = Slot::Kind::Cached; s.cached = std::move(reply);
+        lo_.push_back(std::move(s));
+        return true;
+    }
+
     // --- the writer -----------------------------------------------------------
 
     /// Hand the writer the next thing to send. False when nothing is pending.
@@ -291,6 +322,18 @@ public:
                 lo_.pop_front();
                 return true;
             }
+            if (s.kind == Slot::Kind::Cached) {
+                const CachedFrame& f = s.cached->frames[s.cached_cursor];
+                out.kind  = OutItem::Kind::CachedFrame;
+                // Aliasing pointer: the line, kept alive by the whole reply.
+                out.shared_bytes = std::shared_ptr<const std::string>(s.cached, &f.line);
+                out.count = f.records;
+                out.first = (s.cached_cursor == 0);
+                ++s.cached_cursor;
+                out.last  = (s.cached_cursor == s.cached->frames.size());
+                if (out.last) pop_region();
+                return true;
+            }
             RegionJob& j = s.job;
             if (j.total() == 0) {
                 // An unbuilt region, answered with one explicit `SNAPZ:0:` frame.
@@ -300,6 +343,8 @@ public:
                 out.count = 0;
                 out.first = true;
                 out.last  = true;
+                out.cacheable = j.cacheable;
+                out.cache_tag = j.cache_tag;
                 pop_region();
                 return true;
             }
@@ -311,6 +356,8 @@ public:
             out.off   = j.cursor;
             out.count = n;
             out.first = (j.cursor == 0);
+            out.cacheable = j.cacheable;
+            out.cache_tag = j.cache_tag;
             j.cursor += n;
             out.last  = (j.remaining() == 0);
             if (out.last) pop_region();
@@ -343,6 +390,8 @@ public:
             s.job.cursor        = it.off;
             s.job.frame_records = it.count ? it.count : SNAPZ_FRAME_RECORDS;
             s.job.empty_frame   = (it.count == 0);
+            s.job.cacheable     = it.cacheable;
+            s.job.cache_tag     = it.cache_tag;
             lo_.push_front(std::move(s));
             ++region_jobs_;
         }
@@ -382,12 +431,14 @@ private:
         /// Which member is live. Not inferred from emptiness any more (stage
         /// 7.13 added `Shared`, whose `shared_blob` can't double as an
         /// "is this slot a blob" flag the way `!blob.empty()` used to).
-        enum class Kind { String, Shared, Job };
+        enum class Kind { String, Shared, Job, Cached };
         Kind kind = Kind::String;
 
         std::string blob;                              ///< Kind::String
         std::shared_ptr<const std::string> shared_blob; ///< Kind::Shared
         RegionJob   job;                                ///< Kind::Job
+        std::shared_ptr<const CachedRegion> cached;     ///< Kind::Cached
+        size_t      cached_cursor = 0;                  ///< ...frames already handed out
     };
 
     void pop_region() {

@@ -1101,6 +1101,27 @@ static void test_connect_limiter() {
     CHECK(small.tracked() <= 4, "and is not tracked");
 }
 
+// --- per-IP concurrent cap (stage 12.3) --------------------------------------
+
+static void test_ip_conn_counter() {
+    ewb::IpConnCounter c(2);
+    CHECK(c.try_acquire("10.0.0.1"), "first slot");
+    CHECK(c.try_acquire("10.0.0.1"), "second slot");
+    CHECK(!c.try_acquire("10.0.0.1"), "third is refused");
+    CHECK(c.count("10.0.0.1") == 2, "a refusal does not count");
+    CHECK(c.try_acquire("10.0.0.2"), "another IP is independent");
+    c.release("10.0.0.1");
+    CHECK(c.try_acquire("10.0.0.1"), "a released slot is reusable");
+    c.release("10.0.0.1"); c.release("10.0.0.1"); c.release("10.0.0.2");
+    CHECK(c.tracked() == 0, "zeroed entries are erased");
+    c.release("10.0.0.9");   // unknown IP: harmless
+    CHECK(c.tracked() == 0, "release of an unknown IP adds nothing");
+
+    ewb::IpConnCounter off(0);
+    for (int i = 0; i < 100; ++i) CHECK(off.try_acquire("10.0.0.1"), "0 disables the cap");
+    CHECK(off.tracked() == 0, "and tracks nothing");
+}
+
 // --- constant-time compare + auth throttle (stage 1.10) --------------------
 
 // Stage 7.28: the password can come from a file or the environment, not only argv.
@@ -1447,6 +1468,7 @@ int main() {
     test_token_bucket();
     test_region_budget();
     test_connect_limiter();
+    test_ip_conn_counter();
     test_const_time_eq();
     test_auth_failure_limiter();
     test_sanitize_text();

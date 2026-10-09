@@ -39,6 +39,7 @@
 #include <cerrno>
 #include <iterator>
 #include <list>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -504,6 +505,52 @@ inline PasswordChoice choose_password(const std::string& argv_pw, const std::str
 }
 
 // --- per-IP failed-auth limiter --------------------------------------------
+
+/// Per-IP *concurrent* connection counter (stage 12.3, PERF-011). `ConnectLimiter`
+/// bounds how fast sessions are created; this bounds how many one address may hold
+/// open at once, so a handful of IPs cannot park pre-`JOIN` sockets in every
+/// `SV_MAX_CLIENTS` slot. `try_acquire` runs in the accept loop, `release` on the
+/// session thread's exit, so it carries its own lock.
+///
+/// `max_per_ip == 0` disables it. Entries are erased when they reach zero, so the
+/// table is bounded by the number of live sessions.
+class IpConnCounter {
+  public:
+    explicit IpConnCounter(size_t max_per_ip = 0) : max_(max_per_ip) {}
+
+    /// Startup only (before the accept loop runs): the flag is parsed after globals exist.
+    void set_max(size_t max_per_ip) { max_ = max_per_ip; }
+
+    bool try_acquire(const std::string& ip) {
+        if (max_ == 0) return true;
+        std::lock_guard<std::mutex> lock(m_);
+        size_t& n = counts_[ip];
+        if (n >= max_) { if (n == 0) counts_.erase(ip); return false; }
+        ++n;
+        return true;
+    }
+
+    void release(const std::string& ip) {
+        if (max_ == 0) return;
+        std::lock_guard<std::mutex> lock(m_);
+        auto it = counts_.find(ip);
+        if (it == counts_.end()) return;
+        if (it->second <= 1) counts_.erase(it); else --it->second;
+    }
+
+    size_t count(const std::string& ip) const {
+        std::lock_guard<std::mutex> lock(m_);
+        auto it = counts_.find(ip);
+        return it == counts_.end() ? 0 : it->second;
+    }
+
+    size_t tracked() const { std::lock_guard<std::mutex> lock(m_); return counts_.size(); }
+
+  private:
+    size_t max_;
+    mutable std::mutex m_;
+    std::unordered_map<std::string, size_t> counts_;
+};
 
 /// Per-IP wrong-password throttle (stage 1.10). Mirrors ConnectLimiter — pure,
 /// `now`-injected (seconds, monotonic), sliding window, capped tracking — but

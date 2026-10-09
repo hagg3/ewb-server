@@ -258,6 +258,12 @@ public:
     /// stage on a world whose chunk count dwarfs one box's footprint — fixed
     /// before shipping.) y has no equivalent box bound (`REGION` wants a full
     /// height column), so the sweep uses `WS_MAX_CY` instead.
+    ///
+    /// **Order is the wire order** (stage 12.1a): chunks by `(cx, cz, cy)`, and
+    /// within a chunk by `x, z, y` — exactly `region_query.h`'s `sort_records` key
+    /// once `emit_cell_records` has put a cell's `flag 0` before its `flag 3`. So a
+    /// `REGION` reply needs no sort; `region_test.cpp` holds the two equal. Keep it
+    /// that way: the walk below is `lx` outer, `ly` inner on purpose.
     template <class F>
     BoxScan for_each_in_box(int x0, int x1, int z0, int z1, F&& fn) const {
         BoxScan st;
@@ -275,14 +281,21 @@ public:
                     ++st.chunks_visited;
                     st.cells_visited += WS_CHUNK_CELLS;
                     const WChunk& c = it->second;
-                    for (int i = 0; i < WS_CHUNK_CELLS; ++i) {
-                        const unsigned char t = c.type[i];
-                        if (t == 0) continue;
-                        const int lx = i & 15, lz = (i >> 4) & 15, ly = (i >> 8) & 15;
-                        const int x = bx0 + lx, z = bz0 + lz;
-                        if (!whole && (x < x0 || x > x1 || z < z0 || z > z1)) continue;
-                        ++st.cells_emitted;
-                        fn(x, cy * WS_CHUNK + ly, z, ws_decode_type(t), c.color[i]);
+                    for (int lx = 0; lx < WS_CHUNK; ++lx) {
+                        const int x = bx0 + lx;
+                        if (!whole && (x < x0 || x > x1)) continue;
+                        for (int lz = 0; lz < WS_CHUNK; ++lz) {
+                            const int z = bz0 + lz;
+                            if (!whole && (z < z0 || z > z1)) continue;
+                            const int col = (lz << 4) | lx;
+                            for (int ly = 0; ly < WS_CHUNK; ++ly) {
+                                const int i = (ly << 8) | col;
+                                const unsigned char t = c.type[i];
+                                if (t == 0) continue;
+                                ++st.cells_emitted;
+                                fn(x, cy * WS_CHUNK + ly, z, ws_decode_type(t), c.color[i]);
+                            }
+                        }
                     }
                 }
             }
@@ -479,6 +492,51 @@ inline size_t world_load_text(std::istream& in, WorldStore& store) {
         int x, y, z; unsigned char t, c;
         if (!world_parse_text_line(line, x, y, z, t, c)) continue;
         if (store.set(x, y, z, t, c)) ++n;   // out-of-world rows: counted by the store
+    }
+    return n;
+}
+
+/// `world_load_text` over a buffer already in memory, with no copy of it. The
+/// stream form needs an `istringstream`, which duplicates the whole file (a
+/// 1.3 GB peak on a world whose EDMB form is 456 MB); this walks the bytes where
+/// they are. Acceptance is byte-for-byte `world_parse_text_line`'s: fields split
+/// on ':', at most five read, `atoi` semantics per field (leading whitespace, a
+/// sign, digits, overflow clamped like `strtol` then truncated), a trailing
+/// '\r' dropped, fewer than four fields skips the row. `world_store_test.cpp`
+/// checks the two against each other.
+inline size_t world_load_text_buf(const char* data, size_t len, WorldStore& store) {
+    auto field = [](const char* p, const char* e) -> int {
+        while (p < e && (*p == ' ' || (*p >= '\t' && *p <= '\r'))) ++p;
+        bool neg = false;
+        if (p < e && (*p == '-' || *p == '+')) { neg = (*p == '-'); ++p; }
+        long long v = 0;
+        for (; p < e && *p >= '0' && *p <= '9'; ++p)
+            if (v < (1LL << 40)) v = v * 10 + (*p - '0');
+        if (neg) v = -v;
+        if (v > 0x7fffffffffffffffLL / 2) v = 0x7fffffffffffffffLL / 2;
+        return (int)(long)v;
+    };
+    size_t n = 0;
+    const char* p = data;
+    const char* const end = data + len;
+    while (p < end) {
+        const char* nl = (const char*)std::memchr(p, '\n', (size_t)(end - p));
+        const char* le = nl ? nl : end;
+        const char* next = nl ? nl + 1 : end;
+        if (le > p && le[-1] == '\r') --le;
+        if (le > p) {
+            int v[5] = {0, 0, 0, 0, 0};
+            int cnt = 0;
+            const char* fs = p;
+            while (cnt < 5) {
+                const char* sep = (const char*)std::memchr(fs, ':', (size_t)(le - fs));
+                v[cnt++] = field(fs, sep ? sep : le);
+                if (!sep) break;
+                fs = sep + 1;
+            }
+            if (cnt >= 4 && store.set(v[0], v[1], v[2], (unsigned char)v[3], (unsigned char)v[4])) ++n;
+        }
+        p = next;
     }
     return n;
 }

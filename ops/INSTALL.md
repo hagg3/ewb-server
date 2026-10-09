@@ -226,6 +226,38 @@ edenserver-backup@<name>.timer`.
 
 See the `edenserver@.service` file's comments for more detail on the template unit and per-instance variables.
 
+### Multi-world containment and logging
+
+The template unit sets `CPUWeight=100`, `OOMPolicy=stop` and a journald rate limit of 20 000 lines
+per 30 s per instance, and writes each world's audit channel to `<world dir>/audit.log`
+(`--audit-file`) so `[Audit]` lines survive journald suppression. Memory limits are per instance
+and set by hand, because systemd does not expand the conf file's variables in `MemoryHigh=` /
+`MemoryMax=`, and a cap chosen blind can kill a world while it loads.
+
+Measure first, on the box:
+
+```sh
+nproc; free -m
+systemctl show edenserver@myworld -p MemoryPeak -p MemoryCurrent   # after a normal busy day
+journalctl -u edenserver@myworld --since -1d | grep -c Suppressed  # >0: raise LogRateLimitBurst
+```
+
+Then cap each instance with a drop-in (`sudo systemctl edit edenserver@myworld`): `MemoryHigh=`
+about 1.25 × its `MemoryPeak` (the kernel throttles it past that) and `MemoryMax=` about 1.6 ×
+(the OOM-kill line), with the sum of every `MemoryMax=` under the box's RAM minus ~512 MB.
+A world's load-time peak is the figure to size against: a text-format `eden_world.model` peaks at
+about 2.7× an EDMB one while loading, and one start rewrites it as EDMB.
+
+On a small box, shrink the per-world worst cases through `EDEN_EXTRA_ARGS` in each instance's conf:
+
+| Box RAM / worlds | Suggested `EDEN_EXTRA_ARGS` |
+|---|---|
+| 2 GB, 2–3 worlds | `--client-world-max 4194304 --region-pending-records 4000000 --region-cache-mb 16` |
+| 4 GB, 3–5 worlds | `--client-world-max 8388608 --region-pending-records 8000000 --region-cache-mb 32` |
+
+Those are starting points, not measured values; see
+[docs/configuration.md § Logging](../docs/configuration.md#logging).
+
 ---
 
 ## 7. Backups

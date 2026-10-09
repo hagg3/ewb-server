@@ -14,8 +14,10 @@ LatestREF/
 /edenmatch
 /snapz_codec_test
 /region_test
+/region_cache_test
 /out_queue_test
 /save_sched_test
+/log_fold_test
 /protocol_test
 /matchmaker_test
 /durable_write_test

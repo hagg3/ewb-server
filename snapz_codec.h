@@ -15,7 +15,14 @@
 //   - a companion Rust test client's SNAPZ decoder :: decode_frame
 //   - a matching mock-server encoder :: encode_snapz
 // both of which use flate2's DeflateEncoder at Compression::new(6) == zlib level 6,
-// headerless. Hence deflateInit2(&s, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY).
+// headerless. Hence deflateInit2(&s, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) is
+// this header's default.
+//
+// The level is the encoder's choice, not part of the contract (stage 12.1a): a raw
+// DEFLATE stream inflates to the same bytes whatever level made it. The server
+// deflates at `--region-deflate-level` (default 1: 4.6–5.5x less CPU than 6 for
+// 8–17 % more bytes on real worlds) through a `SnapzEncoder`, which also reuses one
+// z_stream per writer thread instead of a deflateInit2/deflateEnd pair per frame.
 //
 // Header-only, C++17, links against -lz.
 
@@ -31,12 +38,20 @@
 
 namespace ewb {
 
-// --- raw DEFLATE (headerless stream, level 6) --------------------------------
+// --- raw DEFLATE (headerless stream) -----------------------------------------
 
-inline std::vector<uint8_t> raw_deflate(const uint8_t* data, size_t len) {
+/// The reference implementations' level, and the default for every caller that
+/// does not choose one. The server's own default is 1 (`--region-deflate-level`).
+constexpr int SNAPZ_REFERENCE_LEVEL = 6;
+
+/// Clamp a requested level into zlib's 0..9 (0 = stored blocks, still valid DEFLATE).
+inline int deflate_level_clamp(int level) { return level < 0 ? 0 : (level > 9 ? 9 : level); }
+
+inline std::vector<uint8_t> raw_deflate(const uint8_t* data, size_t len,
+                                        int level = SNAPZ_REFERENCE_LEVEL) {
     z_stream s{};
     // windowBits = -15 -> raw deflate, no header, no trailing Adler-32.
-    if (deflateInit2(&s, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+    if (deflateInit2(&s, deflate_level_clamp(level), Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK)
         throw std::runtime_error("deflateInit2 failed");
 
     std::vector<uint8_t> out(deflateBound(&s, static_cast<uLong>(len)));
@@ -55,8 +70,9 @@ inline std::vector<uint8_t> raw_deflate(const uint8_t* data, size_t len) {
     return out;
 }
 
-inline std::vector<uint8_t> raw_deflate(const std::vector<uint8_t>& in) {
-    return raw_deflate(in.data(), in.size());
+inline std::vector<uint8_t> raw_deflate(const std::vector<uint8_t>& in,
+                                        int level = SNAPZ_REFERENCE_LEVEL) {
+    return raw_deflate(in.data(), in.size(), level);
 }
 
 // --- raw INFLATE (for the round-trip test / debugging) ----------------------
@@ -190,12 +206,8 @@ inline int32_t get_le_i32(const uint8_t* p) {
                    (uint32_t(p[3]) << 24));
 }
 
-// Returns the full wire line, terminating '\n' included.
-//
-// The (pointer, count) form lets a large burst be framed in place — stage 1.1
-// splits at SNAPZ_FRAME_RECORDS without copying each slice into its own vector.
-inline std::string encode_snapz(const SnapRec* recs, size_t n) {
-    std::vector<uint8_t> raw;
+inline void pack_records(const SnapRec* recs, size_t n, std::vector<uint8_t>& raw) {
+    raw.clear();
     raw.reserve(n * 20);
     for (size_t i = 0; i < n; ++i) {
         const SnapRec& r = recs[i];
@@ -205,12 +217,62 @@ inline std::string encode_snapz(const SnapRec* recs, size_t n) {
         put_le_i32(raw, r.flag);
         put_le_i32(raw, r.type);
     }
-    const std::vector<uint8_t> z = raw_deflate(raw);
+}
+
+inline std::string snapz_line(size_t n, const std::vector<uint8_t>& z) {
     return "SNAPZ:" + std::to_string(n) + ":" + b64_encode(z) + "\n";
 }
 
-inline std::string encode_snapz(const std::vector<SnapRec>& recs) {
-    return encode_snapz(recs.data(), recs.size());
+// Returns the full wire line, terminating '\n' included.
+//
+// The (pointer, count) form lets a large burst be framed in place — stage 1.1
+// splits at SNAPZ_FRAME_RECORDS without copying each slice into its own vector.
+inline std::string encode_snapz(const SnapRec* recs, size_t n, int level = SNAPZ_REFERENCE_LEVEL) {
+    std::vector<uint8_t> raw;
+    pack_records(recs, n, raw);
+    return snapz_line(n, raw_deflate(raw, level));
 }
+
+inline std::string encode_snapz(const std::vector<SnapRec>& recs, int level = SNAPZ_REFERENCE_LEVEL) {
+    return encode_snapz(recs.data(), recs.size(), level);
+}
+
+/// `encode_snapz` with one z_stream kept for the encoder's lifetime (stage 12.1a).
+/// `deflateReset` between frames instead of `deflateInit2`/`deflateEnd` per frame —
+/// a dense box is hundreds of frames — and the pack/output buffers are reused too.
+/// The output is byte-identical to `encode_snapz(recs, n, level)`: zlib is
+/// deterministic for a given level, window and strategy, and a reset stream is a
+/// fresh one. One per thread; not thread-safe.
+class SnapzEncoder {
+public:
+    explicit SnapzEncoder(int level = SNAPZ_REFERENCE_LEVEL) : level_(deflate_level_clamp(level)) {
+        if (deflateInit2(&s_, level_, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+            throw std::runtime_error("deflateInit2 failed");
+    }
+    ~SnapzEncoder() { deflateEnd(&s_); }
+    SnapzEncoder(const SnapzEncoder&) = delete;
+    SnapzEncoder& operator=(const SnapzEncoder&) = delete;
+
+    int level() const { return level_; }
+
+    std::string encode(const SnapRec* recs, size_t n) {
+        pack_records(recs, n, raw_);
+        if (deflateReset(&s_) != Z_OK) throw std::runtime_error("deflateReset failed");
+        z_.resize(deflateBound(&s_, static_cast<uLong>(raw_.size())));
+        s_.next_in   = raw_.data();
+        s_.avail_in  = static_cast<uInt>(raw_.size());
+        s_.next_out  = z_.data();
+        s_.avail_out = static_cast<uInt>(z_.size());
+        if (deflate(&s_, Z_FINISH) != Z_STREAM_END)
+            throw std::runtime_error("deflate did not reach Z_STREAM_END");
+        z_.resize(z_.size() - s_.avail_out);
+        return snapz_line(n, z_);
+    }
+
+private:
+    z_stream s_{};
+    int level_;
+    std::vector<uint8_t> raw_, z_;
+};
 
 }  // namespace ewb

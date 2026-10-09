@@ -158,7 +158,7 @@ Your position is remembered by username. By default a returning player starts at
 | Client connects but the world never appears | The client did not get a `REGION` answered. Run with `--verbose` and check for a `REGION` line; if none arrives, the client never sent one. |
 | `[Server] Invalid name (…)` | The username breaks a rule — see [protocol.md § Usernames](protocol.md#usernames). |
 | `[Server] The name X is already in use; you are X-2.` | That username is already connected, so you were given the next free `X-N`. If it was your own dropped session from the same address, it is evicted after `--stale-session-secs` of silence and you keep `X`. See [protocol.md § Duplicate names](protocol.md#duplicate-names). |
-| `[Server] Server full.` | 64 clients already connected. |
+| `[Server] Server full.` | 64 clients already connected, or 6 from your address (`--max-conns-per-ip`). |
 | `[Server] Rejected <ip> (connect rate limit).` | More than 10 connections from one address in 10 s. Raise or disable with `--connect-limit`. |
 | `[Server] Rejected <ip> (auth lockout).` | That address sent too many wrong passwords and is in an escalating cooldown. Tune or disable with `--auth-fail-limit`. |
 | `[Server] client #N (<ip>) sent no JOIN within 15s; dropping.` | A connection opened but never sent `JOIN` inside the handshake window. Usually a port scanner. Tune with `--handshake-timeout`. |

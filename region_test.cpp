@@ -12,6 +12,10 @@
 //   * sorted output groups every chunk into exactly one contiguous run (stage 7.8)
 //   * chunk-major order compresses at least as well as the flat order it replaced
 //   * a whole simulated region round-tripping back through the decode path
+//   * the store's box scan emitting records already in `sort_records` order, on
+//     random worlds (mined, painted-base, painted solid, bogus paint), on boxes
+//     that cut chunks, and on the committed + shipped worlds (stage 12.1a: the
+//     server no longer sorts, so this equality *is* the wire order)
 //
 // The socket, the lock discipline and the rate limiter live in server_posix.cpp and
 // are exercised by the stage 1.8 verification ladder, not here.
@@ -23,11 +27,16 @@
 #include <cstring>
 #include <map>
 #include <random>
+#include <set>
 #include <string>
 #include <tuple>
 #include <vector>
 
+#include <fstream>
+#include <sstream>
+
 #include "region_query.h"
+#include "world_store.h"
 
 using ewb::SnapRec;
 
@@ -373,6 +382,92 @@ static void test_frame_split_and_round_trip() {
     CHECK(sorted.size() < unsorted.size(), "sorting before deflate compresses better");
 }
 
+// --- ordered emission (stage 12.1a) -------------------------------------------
+
+static std::vector<SnapRec> scan_box(const ewb::WorldStore& w, int x0, int x1, int z0, int z1) {
+    std::vector<SnapRec> out;
+    w.for_each_in_box(x0, x1, z0, z1, [&](int x, int y, int z, unsigned char t, unsigned char c) {
+        ewb::emit_cell_records(x, y, z, t, c, out);
+    });
+    return out;
+}
+
+static bool scan_is_sorted(const ewb::WorldStore& w, int x0, int x1, int z0, int z1, size_t* n = nullptr) {
+    const std::vector<SnapRec> got = scan_box(w, x0, x1, z0, z1);
+    std::vector<SnapRec> want = got;
+    ewb::sort_records(want);
+    if (n) *n = got.size();
+    return got.size() == want.size() &&
+           std::equal(got.begin(), got.end(), want.begin(), [](const SnapRec& a, const SnapRec& b) {
+               return a.x == b.x && a.y == b.y && a.z == b.z && a.flag == b.flag && a.type == b.type;
+           });
+}
+
+static void test_ordered_emission_random() {
+    std::mt19937 rng(1201);
+    for (int world = 0; world < 6; ++world) {
+        ewb::WorldStore w;
+        const int base = 65536 - 200;
+        std::uniform_int_distribution<int> xz(0, 400), y(0, 255), kind(0, 5), blk(1, 127), col(0, 70);
+        const int cells = 2000 + world * 6000;
+        for (int i = 0; i < cells; ++i) {
+            unsigned char t = 0, c = 0;
+            switch (kind(rng)) {
+                case 0: t = 0; break;                                  // mined
+                case 1: t = 255; c = (unsigned char)col(rng); break;   // painted base (some bogus)
+                case 2: t = (unsigned char)blk(rng); c = (unsigned char)col(rng); break;
+                default: t = (unsigned char)blk(rng); break;
+            }
+            w.set(base + xz(rng), y(rng), base + xz(rng), t, c);
+        }
+        const ewb::RegionBox b = ewb::region_box(65536, 65536);
+        size_t n = 0;
+        CHECK(scan_is_sorted(w, b.x0, b.x1, b.z0, b.z1, &n), "region box scan is already in wire order");
+        CHECK(n > 0, "and it emitted something");
+        // Boxes whose edges cut chunks (not a REGION shape, but the scan allows it).
+        CHECK(scan_is_sorted(w, base + 7, base + 301, base + 3, base + 250), "a box cutting chunks too");
+        CHECK(scan_is_sorted(w, base + 17, base + 17, base, base + 400), "a one-block-wide strip too");
+    }
+}
+
+static bool load_text_world(const char* path, ewb::WorldStore& w) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::stringstream ss;
+    ss << f.rdbuf();
+    std::istringstream in(ss.str());
+    ewb::world_load_text(in, w);
+    return w.size() > 0;
+}
+
+static void test_ordered_emission_real_worlds() {
+    for (const char* path : {"testdata/carved_64z.model", "worlds/example/eden_world.model",
+                             "worlds/ari/eden_world.model"}) {
+        ewb::WorldStore w;
+        if (!load_text_world(path, w)) {
+            std::fprintf(stderr, "FAIL: could not load %s\n", path);
+            ++g_fail;
+            continue;
+        }
+        // One REGION box centred on every chunk column the world has cells in —
+        // every box that meets the world, without sweeping its (sparse) extent.
+        std::set<std::pair<int, int>> cols;
+        w.for_each([&](int x, int, int z, unsigned char, unsigned char) { cols.insert({x >> 4, z >> 4}); });
+        bool all = true;
+        size_t boxes = 0, recs = 0;
+        for (const auto& c : cols) {
+            const ewb::RegionBox b = ewb::region_box(c.first * 16 + 8, c.second * 16 + 8);
+            size_t n = 0;
+            all = all && scan_is_sorted(w, b.x0, b.x1, b.z0, b.z1, &n);
+            ++boxes; recs += n;
+        }
+        std::printf("  %s: %zu cells, %zu boxes, %zu records, all in wire order: %s\n", path, w.size(),
+                    boxes, recs, all ? "yes" : "NO");
+        CHECK(all, "a real world's boxes scan in wire order");
+        CHECK(recs > 0, "and the boxes met the world");
+    }
+}
+
 int main() {
     test_region_box();
     test_point_validation();
@@ -381,6 +476,8 @@ int main() {
     test_sort_groups_chunks();
     test_sort_compression_not_worse();
     test_frame_split_and_round_trip();
+    test_ordered_emission_random();
+    test_ordered_emission_real_worlds();
     if (g_fail) {
         std::fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;
