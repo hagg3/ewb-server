@@ -319,6 +319,37 @@ public:
         return false;
     }
 
+    /// Hand a `Frame` the writer took back, unencoded (stage 12.0b). The writer
+    /// does this when no encoder slot frees up in time: the frame goes back to the
+    /// front of `lo` exactly as it was, so the world-state FIFO is unchanged, and
+    /// the next `take()` serves any `hi` lines first — movement keeps flowing while
+    /// the frame waits for a slot. Returns false (and does nothing) for any other
+    /// kind of item.
+    ///
+    /// Must be called before anything else is taken from `lo`. Producers may have
+    /// pushed meanwhile; they push to the back, so restoring the front is safe.
+    bool requeue_front(OutItem&& it) {
+        if (it.kind != OutItem::Kind::Frame) return false;
+        if (!lo_.empty() && lo_.front().kind == Slot::Kind::Job &&
+            it.recs && lo_.front().job.recs == it.recs &&
+            lo_.front().job.cursor == it.off + it.count) {
+            // A middle frame: its job is still at the front; rewind the cursor.
+            lo_.front().job.cursor = it.off;
+        } else {
+            // The job's last frame (or its only `SNAPZ:0:` frame): take() popped
+            // the job, so put it back holding just what is left.
+            Slot s; s.kind = Slot::Kind::Job;
+            s.job.recs          = std::move(it.recs);
+            s.job.cursor        = it.off;
+            s.job.frame_records = it.count ? it.count : SNAPZ_FRAME_RECORDS;
+            s.job.empty_frame   = (it.count == 0);
+            lo_.push_front(std::move(s));
+            ++region_jobs_;
+        }
+        it.reset();
+        return true;
+    }
+
     /// Nothing left to send.
     bool idle() const { return hi_.empty() && lo_.empty(); }
 

@@ -281,11 +281,18 @@ re-ask for disconnects it, which resyncs properly on rejoin.
 | `--client-world-max N` | `16777216` | Bytes of **world-state** backlog per client before that client is disconnected with `[Server] Connection too slow.` This bounds the *backlog*, not any single update: one indivisible relay can legitimately be larger (a full operator `fill` is ~27 MB of `ACTION` lines) and is always delivered, so the queue peaks at this plus one update. |
 | `--client-region-queue N` | `2` | `REGION` replies that may be queued at once for one client. Past this, further requests are refused — the same answer the 750 ms gap gives — and the client re-asks. Minimum 1. |
 | `--region-pending-records N` | `16000000` | Scanned-but-not-yet-encoded `REGION` records held across **all** clients, at 20 bytes each on the wire and `sizeof(SnapRec)` in memory. Past this, a `REGION` is refused. `0` disables the guard. This is the knob that stops several players walking into new terrain at once from exhausting a small VPS: one worst-case reply box is ~3.5 M records. |
+| `--region-encoders N` | half the CPU cores, at least 1 | `SNAPZ` frames being compressed at once, across **all** clients. This bounds the CPU that region replies can take, however many players ask at once. A frame that has to wait does not hold up that client's movement and chat lines, which keep arriving. `0` = unlimited (the behaviour before this flag); a negative value means the default. The value in use is logged at startup. |
+| `--region-record-burst N` | `8000000` | Records of `REGION` replies one client may receive at once, before the rate below applies. The default covers a join plus several dense hops. A single reply bigger than the burst is still sent once the client's budget is full, and is then repaid at the rate. `0` turns the budget off. |
+| `--region-record-rate N` | `1000000` | Records per second that a client's budget refills at. A client asking for more is refused the same way as a full queue: no reply, and the client asks again when it next moves. A refusal is logged at most once per 30 s per client (`over this client's record budget`). `0` turns the budget off. |
 | `--client-write-timeout N` | `60` | Seconds a client's writer may make **no** progress at all before the connection is closed. `0` waits forever (not recommended: a peer that vanishes without a FIN parks a thread on TCP retransmit timeouts). |
 
 The server prints a startup note if the all-clients-stalled worst case for these settings would
 exceed ~4 GB, which only happens if you have raised one of them. `region-stats` reports refusals,
-records currently queued, and clients dropped for falling behind.
+records currently queued, and clients dropped for falling behind. It also reports the encoder
+slots, how often a frame waited for one, and how many requests the record budget refused.
+
+⚠️ The server ignores flags it does not recognise. If you add `--region-encoders` or the
+record-budget flags to a service's arguments, deploy the binary that knows them first.
 
 ### Region tuning
 
@@ -323,6 +330,8 @@ in `server_posix.cpp` (and its headers) if you must.
 | Minimum gap between served `SIGNQ`s | 1000 ms |
 | `SIGNQ`s served per session | 32 |
 | Autosave interval | 15 s |
+| Shortest gap between two saves that departures ask for | 5 s (a leaving player's edits are saved within seconds, however many players leave) |
+| Wait for a `REGION` encoder slot before a frame goes back in the queue | 20 ms |
 | World height (`y`) | 0–255 |
 | Horizontal coordinate range (`x`, `z`) | 0–16777215 |
 | Accepted block types (build) | 0–127 |
@@ -869,5 +878,6 @@ Saves write `<file>.tmp` next to the real file, `fsync` it, rename over the real
 the directory, so a power loss leaves the old contents or the new, never a truncated file (see
 [architecture.md § Persistence](architecture.md)). Seeing a `.tmp` linger means a save failed —
 the server logs why, and retries at the next interval. The `Saved world` log line ends
-`write N ms, of which fsync M ms`; if `M` is large on your disk, that is the cost of the guarantee
-(it is paid outside the world lock, so it never delays a player's edit).
+`write N ms, of which fsync M ms) [reason]`, where the reason is `autosave`, `departure`,
+`control` or `shutdown`. If `M` is large on your disk, that is the cost of the guarantee (it is
+paid outside the world lock, so it never delays a player's edit).

@@ -15,6 +15,7 @@ LatestREF/
 /snapz_codec_test
 /region_test
 /out_queue_test
+/save_sched_test
 /protocol_test
 /matchmaker_test
 /durable_write_test

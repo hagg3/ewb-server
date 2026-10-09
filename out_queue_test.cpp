@@ -17,6 +17,8 @@
 //   * region-job admission, the empty-region `SNAPZ:0:` answer, first/last flags
 //   * a whole region drains to exactly its input records, in order, once each
 //   * drop_lo() releases world state and its accounting but keeps hi
+//   * requeue_front() (stage 12.0b) restores a frame exactly: same records, same
+//     first/last flags, world-state FIFO intact, hi still drained first
 
 #include <cstdio>
 #include <cstdlib>
@@ -329,6 +331,75 @@ static void test_drop_lo_keeps_hi() {
     CHECK(q.idle(), "the queue is drained");
 }
 
+// --- requeue_front: a frame handed back for want of an encoder slot (12.0b) ---
+
+static void test_requeue_front() {
+    // Middle and last frames: drain with every frame requeued once before it is
+    // accepted, and the result must equal a plain drain frame for frame.
+    {
+        OutQueue q(OutQueue::Limits{1 << 20, 1 << 20, 2});
+        RegionJob j = job_of(7001, 3000);
+        const auto recs = j.recs;
+        q.push_region(std::move(j));
+        q.push_world("ACTION:after\n");   // must still follow the whole region
+        OutItem it;
+        std::vector<std::pair<size_t, size_t>> seen;   // (off, count)
+        size_t firsts = 0, lasts = 0;
+        for (;;) {
+            CHECK(q.take(it), "something to take");
+            if (it.kind != OutItem::Kind::Frame) break;
+            const size_t off = it.off, n = it.count; const bool f = it.first, l = it.last;
+            q.push_hi("POS:mover\n");             // movement arrives while the frame waits
+            CHECK(q.requeue_front(std::move(it)), "frame handed back");
+            CHECK(it.empty(), "the handed-back item is reset");
+            CHECK(q.region_jobs() == 1, "the job counts as in flight again");
+            OutItem h;
+            CHECK(q.take(h) && h.kind == OutItem::Kind::Bytes && h.bytes == "POS:mover\n",
+                  "hi drains before the requeued frame");
+            CHECK(q.take(it) && it.kind == OutItem::Kind::Frame, "the frame comes back");
+            CHECK(it.off == off && it.count == n && it.first == f && it.last == l && it.recs == recs,
+                  "...unchanged: same slice, same flags");
+            seen.emplace_back(it.off, it.count);
+            firsts += it.first; lasts += it.last;
+        }
+        CHECK(it.kind == OutItem::Kind::Bytes && it.bytes == "ACTION:after\n",
+              "world-state FIFO intact: the relay follows the whole region");
+        CHECK(seen.size() == 3 && seen[0] == std::make_pair((size_t)0, (size_t)3000) &&
+              seen[1] == std::make_pair((size_t)3000, (size_t)3000) &&
+              seen[2] == std::make_pair((size_t)6000, (size_t)1001), "frames as a plain drain");
+        CHECK(firsts == 1 && lasts == 1, "one first, one last");
+        CHECK(q.region_jobs() == 0 && q.idle(), "drained");
+    }
+    // The empty-region answer (`SNAPZ:0:`) survives a requeue too.
+    {
+        OutQueue q(OutQueue::Limits{1024, 4096, 2});
+        q.push_region(job_of(0, 3000, true));
+        OutItem it;
+        CHECK(q.take(it) && it.kind == OutItem::Kind::Frame && it.count == 0, "empty frame");
+        CHECK(q.requeue_front(std::move(it)) && q.region_jobs() == 1, "empty frame handed back");
+        CHECK(q.take(it) && it.kind == OutItem::Kind::Frame && it.count == 0 && it.first && it.last,
+              "...and comes back as the same SNAPZ:0: answer");
+        CHECK(ewb::encode_item(it) == ewb::encode_snapz(nullptr, 0), "same bytes");
+        CHECK(q.idle() && q.region_jobs() == 0, "drained");
+    }
+    // Only frames can be handed back.
+    {
+        OutQueue q(OutQueue::Limits{1024, 4096, 2});
+        OutItem b; b.kind = OutItem::Kind::Bytes; b.bytes = "x";
+        CHECK(!q.requeue_front(std::move(b)) && q.idle(), "a byte item is refused");
+    }
+    // drop_lo after a requeue releases the job (the close path).
+    {
+        OutQueue q(OutQueue::Limits{1024, 4096, 2});
+        q.push_region(job_of(5000, 3000));
+        OutItem it;
+        q.take(it);
+        q.requeue_front(std::move(it));
+        q.drop_lo();
+        CHECK(q.idle() && q.region_jobs() == 0, "drop_lo clears a requeued job");
+    }
+}
+
 int main() {
     test_priority_and_whole_items();
     test_hi_never_reorders_world_state();
@@ -339,6 +410,7 @@ int main() {
     test_region_drains_exactly_once();
     test_region_interleaves_with_hi();
     test_drop_lo_keeps_hi();
+    test_requeue_front();
     if (g_fail) {
         std::fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;

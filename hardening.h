@@ -369,6 +369,28 @@ struct TokenBucket {
     }
 };
 
+// --- REGION record budget (stage 12.0b) --------------------------------------
+
+/// May a `REGION` reply of `records` records be sent now? Charges the bucket when
+/// it may. The pacing before this counted *requests* (one per 750 ms), so a client
+/// re-asking for a dense box every 760 ms kept a whole core deflating (PERF-002);
+/// this counts what a request costs. Called after the scan, when the record count
+/// is known, so a refused request has still paid one scan — the request gap bounds
+/// that.
+///
+/// A reply bigger than the whole burst is admitted once the bucket is full, and
+/// the overshoot is charged as debt (bounded by `TokenBucket::charge`), so a box no
+/// burst could ever cover is slowed down rather than refused forever. A bucket
+/// with no capacity or no refill is off: everything is admitted.
+inline bool region_budget_admit(TokenBucket& b, double now, double records) {
+    if (b.capacity <= 0.0 || b.refill_per_sec <= 0.0) return true;
+    if (records <= 0.0) return true;   // a `SNAPZ:0:` answer costs no encode
+    const double up_front = records < b.capacity ? records : b.capacity;
+    if (!b.allow(now, up_front)) return false;
+    if (records > up_front) b.charge(now, records - up_front);
+    return true;
+}
+
 // --- per-IP connect limiter --------------------------------------------------
 
 /// Sliding-window connect counter, keyed by peer IP string. Lives in the accept

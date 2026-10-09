@@ -1002,6 +1002,43 @@ static void test_spawn_format_cannot_over_read() {
 
 // --- token bucket (stage 1.7) ------------------------------------------------
 
+static void test_region_budget() {
+    // Stage 12.0b: the record budget, at the defaults (8 M burst, 1 M/s).
+    ewb::TokenBucket b(8e6, 1e6);
+    double t = 50.0;
+    CHECK(ewb::region_budget_admit(b, t, 481e3), "a join's spawn box fits");
+    CHECK(ewb::region_budget_admit(b, t + 0.8, 1.65e6), "a dense hop fits");
+    CHECK(ewb::region_budget_admit(b, t + 1.6, 1.65e6), "...and another");
+    // A flood of dense boxes every 760 ms runs dry, then is held to the refill.
+    ewb::TokenBucket f(8e6, 1e6);
+    int served = 0;
+    for (int i = 0; i < 40; ++i)
+        served += ewb::region_budget_admit(f, 100.0 + i * 0.76, 1.65e6) ? 1 : 0;
+    // 30.4 s of flooding: burst (8 M) + ~30 M refill = ~23 boxes of 1.65 M, not 40.
+    CHECK(served >= 20 && served <= 24, "a flood is held to ~1 M records/s");
+    // A refusal spends nothing: the next request after a refill succeeds.
+    ewb::TokenBucket r(2e6, 1e6);
+    CHECK(ewb::region_budget_admit(r, 0.0, 1.5e6), "first box");
+    CHECK(!ewb::region_budget_admit(r, 0.0, 1.5e6), "second box refused (0.5 M left)");
+    CHECK(ewb::region_budget_admit(r, 1.0, 1.5e6), "refill of 1 M covers it a second later");
+    // A box bigger than the whole burst is admitted from a full bucket, then charged as debt.
+    ewb::TokenBucket big(8e6, 1e6);
+    CHECK(ewb::region_budget_admit(big, 0.0, 9e6), "an oversize box is not refused forever");
+    CHECK(big.tokens < 0.0, "...it leaves the bucket in debt");
+    CHECK(!ewb::region_budget_admit(big, 1.0, 1.0), "...which is repaid before the next");
+    CHECK(ewb::region_budget_admit(big, 9.5, 1e6), "...and then the budget is back");
+    // Off: a zero burst or a zero rate admits everything.
+    ewb::TokenBucket off1(0.0, 1e6), off2(8e6, 0.0);
+    for (int i = 0; i < 100; ++i) {
+        CHECK(ewb::region_budget_admit(off1, 0.0, 1e7), "burst 0 = off");
+        CHECK(ewb::region_budget_admit(off2, 0.0, 1e7), "rate 0 = off");
+    }
+    // An empty region (zero records) is always admitted.
+    ewb::TokenBucket e(8e6, 1e6);
+    e.charge(0.0, 8e6);
+    CHECK(ewb::region_budget_admit(e, 0.0, 0.0), "a SNAPZ:0: answer costs nothing");
+}
+
 static void test_token_bucket() {
     ewb::TokenBucket b(4.0, 2.0);   // burst 4, 2/sec
 
@@ -1408,6 +1445,7 @@ int main() {
     test_parse_move_triples();
     test_spawn_format_cannot_over_read();
     test_token_bucket();
+    test_region_budget();
     test_connect_limiter();
     test_const_time_eq();
     test_auth_failure_limiter();

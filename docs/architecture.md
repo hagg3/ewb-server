@@ -208,7 +208,7 @@ height. If you change one side of such a pair, the build fails until you change 
 | main | process start | `accept()` loop: IP ban check, auth lockout check, connect rate limit, client cap, spawn a handler |
 | client handler | one per accepted socket, **detached** | the whole session: recv, line framing, dispatch, and its own cleanup |
 | client writer | one per accepted socket, **joined** by its own handler | the only thread that ever writes that socket: drains the client's output queue, encodes `SNAPZ` frames, enforces the write timeout |
-| autosave | at startup, detached | every 15 s: `saveWorld()`, `savePlayerPos()`, `saveSigns()`, the zone-refusal audit counts folded into closed windows, and the `--idle-timeout` check |
+| autosave | at startup, detached | every 15 s: `saveWorld()`, `savePlayerPos()`, `saveSigns()`, the zone-refusal audit counts folded into closed windows, and the `--idle-timeout` check. Also wakes when a joined player leaves and runs the same three saves, at most once per 5 s however many leave ([save_sched.h](../save_sched.h)) |
 | matchmaker | at startup **iff** `--matchmaker` was given, detached | keeps one TCP registration open, heartbeats a player count every ~15 s, reconnects on failure |
 | control listener | at startup unless `--no-control-socket`, detached | `accept()` loop on the `0600` unix domain socket |
 | control handler | one per control connection, **detached** | reads `\n`-framed command lines, runs each, replies; `stop` saves and exits the process |
@@ -255,6 +255,16 @@ scan is done, deflate runs off it, and the memory an in-flight region costs stay
 vector instead of gaining up to ~17 MB of encoded base64 on top. `--region-pending-records`
 bounds those vectors across all clients; the accounting rides on the vector's own deleter, so it
 stays correct however a job ends.
+
+**Encoder cap.** At most `--region-encoders` frames are deflated at once across all clients, so
+the CPU region replies can take is bounded per process, not per client. A writer takes a slot
+around the encode only, with no other lock held. If no slot frees up within 20 ms it hands the
+frame back to the front of its queue (`OutQueue::requeue_front`, which restores the job exactly)
+and goes round again. Because `take()` serves the latency-sensitive queue first, that client's
+movement and chat keep draining while the frame waits. Before the cap, one client re-asking for a
+dense box every 760 ms kept a core busy, and four kept four busy. The per-connection **record
+budget** (`--region-record-burst` / `--region-record-rate`) is charged in `serveRegion()` after
+the scan and before the sort. A request over it is refused like any other `REGION` refusal.
 
 The split also separates two numbers that used to be one: the `REGION` log line reports scan and
 sort from the client's thread, and the writer reports encode and drain when the burst completes.
@@ -466,9 +476,9 @@ magic bytes and falls back to the legacy `x:y:z:type:color` reader, so every wor
 
 | File | Written | Notes |
 |---|---|---|
-| `eden_world.model` | autosave, and when a client disconnects | only when the dirty flag is set. Written as `EDMB` (binary chunks) unless `--world-format text`; read as either |
+| `eden_world.model` | autosave, and within seconds after a player leaves | only when the dirty flag is set. Written as `EDMB` (binary chunks) unless `--world-format text`; read as either |
 | `eden_players.txt` | same | last known position per username |
-| `eden_signs.txt` | autosave, disconnect and control `save`/`stop` after a player's sign write or an edit that removed signs with their block; at once on control `signs add`/`rm`, and at startup or `signs reload` when signs on blocks stored as air were dropped | only when the sign list changed |
+| `eden_signs.txt` | autosave, a player leaving, and control `save`/`stop` after a player's sign write or an edit that removed signs with their block; at once on control `signs add`/`rm`, and at startup or `signs reload` when signs on blocks stored as air were dropped | only when the sign list changed |
 | `eden_spawn.txt` | never | read-only; the default spawn for a player with no `eden_players.txt` row. `--spawn`/`--spawn-file` override. Malformed → one warning, ignored |
 | `eden_motd.txt` | never | read-only; the welcome message sent on join (`--motd-file`). Re-read on control `motd reload`, so it is the one sidecar an operator can safely hand-edit while the server runs |
 | `eden_zones.txt` | never | read-only, at startup; protected zones (`--zones-file`). All-or-nothing: a malformed file stops the server from starting rather than leaving its zones unprotected |
@@ -480,8 +490,8 @@ the "snapshot" is the **serialised `EDMB` blob**, not a copy of the model — on
 13.9 M-cell world, copying the old hash map held `g_worldMtx` for 1.24 s per save while
 serialising holds it for 0.18 s, and the write that follows went from 5.8 s / 276 MB of text to
 0.11 s / 56 MB. A crash or
-kill mid-write can therefore never leave a truncated world, and a disconnect-save racing the
-autosave cannot interleave. If any step fails, the dirty flag is set again so the next save
+kill mid-write can therefore never leave a truncated world, and a control-socket `save` racing
+the autosave cannot interleave. If any step fails, the dirty flag is set again so the next save
 retries.
 
 **Durability.** `flush()` alone only hands bytes to the kernel: after a power loss or hard VM reset
@@ -497,6 +507,16 @@ operator can see what it costs on their disk. Measured on a 56 MB world on an SS
 1–2 ms (about 50–80 ms with `F_FULLFSYNC`); a slow VPS disk will show up in that number.
 
 Autosave runs every 15 s, so the worst case for an unclean stop is losing one interval.
+
+**Departures don't save inline.** A client handler that ends no longer saves anything itself. If
+the session had joined, it asks the autosave thread for a save, and the thread runs one at most
+every 5 s however many players leave ([save_sched.h](../save_sched.h)). A connection that never
+joined asks for nothing: it cannot have edited, and before this a bare TCP connect and close
+forced a full world save (a world-lock stall plus a whole-file rewrite) whenever anyone was
+building. A request that arrives during a save is kept and served by the next one, so a leaving
+player's last edits are on disk within about 5 s. Shutdown and the control socket's `save` and
+`stop` still save at once. The `Saved world` line ends with the reason: `[autosave]`,
+`[departure]`, `[control]` or `[shutdown]`.
 
 Signs are parsed at startup and the entire `SIGNP` burst is formatted into a single buffer;
 every `SIGNQ` re-sends that buffer verbatim. Nothing is rebuilt per request: the burst is

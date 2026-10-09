@@ -447,7 +447,18 @@ A request can also be refused for **backpressure**: a client that already has
 backlog is at `--region-pending-records`, answers nothing rather than starting a burst it cannot
 finish. A refused request is silence, exactly like one inside the gap — a partially delivered
 region is the failure this is here to avoid, so refusing is the honest answer and the client
-re-asks. (Silence is the status quo rather than a decision to keep forever: a new "throttled"
+re-asks.
+
+A request is also refused when it would take a client past its **record budget**
+(`--region-record-burst`, refilled at `--region-record-rate`). The 750 ms gap limits how often a
+client can ask, not how much an answer costs. A client re-asking for a dense box every 760 ms
+used to keep a whole CPU core compressing. The budget counts records, so the cost is what is
+limited. The default is sized well above what a join and fast flight over a dense build ask
+for. The refusal is silence, the same as the other refusals. Separately,
+the server compresses at most `--region-encoders` frames at once across all clients. That only
+delays frames and never refuses a request.
+
+(Silence is the status quo rather than a decision to keep forever: a new "throttled"
 line the retail client has never been observed receiving is a protocol risk, so it has not been
 invented. A client cannot currently distinguish "throttled" from "empty region", and
 `--no-region-empty-frame` makes that worse rather than better.)

@@ -93,6 +93,13 @@ echo "Built ./world_store_test  —  chunk store / mined sentinel / EDMB / legac
 ./out_queue_test
 echo "Built ./out_queue_test  —  output queue priority / overflow / frame integrity"
 
+# Offline save-scheduling checks: departure saves coalesced to one per min gap,
+# the periodic save with no requests, a request during a save kept, a session
+# that never joined requesting nothing (ROADMAP-SERVER stage 12.0a).
+"$CXX" -std=c++17 -O2 -Wall save_sched_test.cpp -o save_sched_test
+./save_sched_test
+echo "Built ./save_sched_test  —  autosave / coalesced departure saves"
+
 # Offline sign + spawn + MOTD + hardening checks: eden_signs.txt / eden_spawn.txt
 # / eden_motd.txt parsing, SIGNP formatting, username/ACTION validation, token
 # bucket, connect limiter, constant-time password compare + failed-auth limiter
